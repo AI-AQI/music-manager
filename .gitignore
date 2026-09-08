@@ -1,0 +1,20 @@
+# Rust / Tauri build outputs
+/src-tauri/target/
+
+# macOS and editor metadata
+.DS_Store
+.idea/
+.vscode/
+.claude/
+
+# Local environment and application data
+.env
+.env.*
+!.env.example
+*.db
+*.db-shm
+*.db-wal
+
+# Tauri mobile generated directories
+/src-tauri/gen/android/
+/src-tauri/gen/apple/

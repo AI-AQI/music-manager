@@ -1,0 +1,6525 @@
+/* =========================================================
+   剪辑音乐库
+   Tauri 桌面应用 + SQLite
+========================================================= */
+
+const __TAURI__ = window.__TAURI__;
+
+const invoke = __TAURI__.core.invoke;
+const convertFileSrc = __TAURI__.core.convertFileSrc;
+
+let state = {
+    currentView: "all",
+    search: "",
+    layout: "list",
+    tagResultTab: null,
+    tagManagerOpen: false,
+    editingTagId: null,
+    tagAction: null,
+    activeTags: [],
+    selectionMode: false,
+    selectedMusicIds: new Set(),
+
+    catalogSelection: null,
+
+    selectedMusic: null,
+    clipsPanelMusic: null,
+    playOnRowClick: true,
+
+    importFiles: [],
+    importAlbumSource: "metadata",
+    importSelectedAlbum: null,
+
+    editTags: [],
+    clipTags: [],
+
+    clipMusic: null,
+    editingClip: null,
+    clipPreviewing: false,
+    clipDuration: 0,
+    clipStart: 0,
+    clipEnd: 0,
+    clipInitialState: null,
+
+    draggingHandle: null,
+    draggingTagId: null,
+    tagPointerDrag: null,
+    suppressTagClick: false,
+
+    player: {
+        queue: [],
+        queueSource: "view",
+        index: -1,
+        music: null,
+        segment: null,
+        playing: false,
+        loading: false,
+        seeking: false,
+        audio: null,
+        currentUrl: "",
+        candidates: []
+    }
+};
+
+const RECOMMENDED_TAGS = {
+    "情绪": ["治愈", "温暖", "激昂", "紧张", "悬疑", "悲伤", "浪漫"],
+    "节奏": ["舒缓", "中速", "快节奏"],
+    "用途": ["Vlog", "纪录片", "剧情", "广告", "转场", "片头", "片尾"],
+    "人声": ["纯音乐", "人声", "旁白友好"]
+};
+const TAG_CATEGORIES = ["情绪", "节奏", "用途", "人声", "自定义"];
+
+/* 最近一次内容渲染展示的、可播放、按显示顺序的音乐数组 */
+let visibleQueueMusic = [];
+
+
+/* =========================================================
+   DOM
+========================================================= */
+
+const $ = id => document.getElementById(id);
+
+/* =========================================================
+   主题
+   新主题只需在 THEMES 中注册名称，并在 CSS 里对应 data-theme 添加变量即可。
+========================================================= */
+
+const THEME_STORAGE_KEY = "music-library-theme";
+const THEMES = {
+    archive: { label: "档案室" },
+    sky: { label: "云雾" }
+};
+
+function getSavedTheme() {
+    try {
+        const saved = localStorage.getItem(THEME_STORAGE_KEY);
+        return THEMES[saved] ? saved : "archive";
+    } catch (_) {
+        return "archive";
+    }
+}
+
+function applyTheme(themeName, { persist = true } = {}) {
+    const theme = THEMES[themeName] ? themeName : "archive";
+    document.body.dataset.theme = theme;
+    $("themeToggleLabel").textContent = THEMES[theme].label;
+
+    document.querySelectorAll(".theme-option[data-theme]").forEach(option => {
+        const selected = option.dataset.theme === theme;
+        option.setAttribute("aria-checked", String(selected));
+        option.classList.toggle("active", selected);
+    });
+
+    if (persist) {
+        try {
+            localStorage.setItem(THEME_STORAGE_KEY, theme);
+        } catch (_) {
+            // 主题仍可在当前次运行中正常切换。
+        }
+    }
+}
+
+function setupThemeSwitcher() {
+    const toggle = $("themeToggleBtn");
+    const menu = $("themeMenu");
+
+    applyTheme(getSavedTheme(), { persist: false });
+
+    toggle.addEventListener("click", event => {
+        event.stopPropagation();
+        const opening = menu.classList.contains("hidden");
+        menu.classList.toggle("hidden", !opening);
+        toggle.setAttribute("aria-expanded", String(opening));
+    });
+
+    menu.addEventListener("click", event => {
+        const option = event.target.closest("[data-theme]");
+        if (!option) return;
+        applyTheme(option.dataset.theme);
+        menu.classList.add("hidden");
+        toggle.setAttribute("aria-expanded", "false");
+    });
+
+    document.addEventListener("click", event => {
+        if (!event.target.closest(".theme-switcher")) {
+            menu.classList.add("hidden");
+            toggle.setAttribute("aria-expanded", "false");
+        }
+    });
+}
+
+const importModal = $("importModal");
+const editModal = $("editModal");
+const clipEditorPanel = $("clipEditorPanel");
+
+
+/* =========================================================
+   初始化
+========================================================= */
+
+function ensureTauri() {
+
+    if (!window.__TAURI__) {
+
+        alert(
+            "请使用「剪辑音乐库」桌面应用打开，而不是浏览器。"
+        );
+
+        throw new Error("not running in Tauri");
+    }
+}
+
+
+/* =========================================================
+   数据访问层（Tauri command 封装）
+========================================================= */
+
+const dbGetAll = async storeName =>
+    storeName === "music"
+        ? invoke("list_music")
+        : invoke("list_clips");
+
+const dbGet = async (storeName, id) =>
+    storeName === "music"
+        ? invoke("get_music", { id })
+        : invoke("get_clip", { id });
+
+const dbAdd = async (storeName, value) =>
+    storeName === "music"
+        ? invoke("create_music", { music: value })
+        : invoke("create_clip", { clip: value });
+
+const dbPut = async (storeName, value) =>
+    storeName === "music"
+        ? invoke("update_music", { music: value })
+        : invoke("update_clip", { clip: value });
+
+const dbDelete = async (storeName, id) =>
+    storeName === "music"
+        ? invoke("delete_music", { id })
+        : invoke("delete_clip", { id });
+
+async function initDB() {
+
+    await invoke("init_db");
+}
+
+
+/* =========================================================
+   ID
+========================================================= */
+
+function createId(prefix = "") {
+
+    return (
+        prefix +
+        Date.now().toString(36) +
+        "_" +
+        Math.random()
+            .toString(36)
+            .substring(2, 10)
+    );
+}
+
+
+/* =========================================================
+   工具
+========================================================= */
+
+function escapeHTML(value) {
+
+    if (value === undefined || value === null) {
+        return "";
+    }
+
+    return String(value)
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;")
+        .replaceAll('"', "&quot;")
+        .replaceAll("'", "&#039;");
+}
+
+
+function formatTime(seconds) {
+
+    if (!Number.isFinite(seconds)) {
+        return "00:00";
+    }
+
+    seconds = Math.max(0, seconds);
+
+    const h = Math.floor(seconds / 3600);
+
+    const m = Math.floor(
+        (seconds % 3600) / 60
+    );
+
+    const s = Math.floor(
+        seconds % 60
+    );
+
+    if (h > 0) {
+
+        return (
+            String(h).padStart(2, "0") +
+            ":" +
+            String(m).padStart(2, "0") +
+            ":" +
+            String(s).padStart(2, "0")
+        );
+    }
+
+    return (
+        String(m).padStart(2, "0") +
+        ":" +
+        String(s).padStart(2, "0")
+    );
+}
+
+function parseTime(value) {
+    const text = String(value || "").trim();
+    if (!text) return NaN;
+    const parts = text.split(":").map(Number);
+    if (parts.some(part => !Number.isFinite(part))) return NaN;
+    if (parts.length === 1) return parts[0];
+    if (parts.length === 2) return parts[0] * 60 + parts[1];
+    if (parts.length === 3) return parts[0] * 3600 + parts[1] * 60 + parts[2];
+    return NaN;
+}
+
+function normalizeTag(value) {
+    return String(value || "").trim().replace(/\s+/g, " ");
+}
+
+function closeTagAction() {
+    state.tagAction = null;
+    $("tagActionModal").classList.add("hidden");
+}
+
+async function openTagAction(action) {
+    state.tagAction = action;
+    const isCategory = action.type === "create-category";
+    const isEditing = action.type === "edit-tag";
+    $("tagActionTitle").textContent = isCategory ? "新增分类" : action.type === "edit-tag" ? "编辑 Tag" : "新增 Tag";
+    $("tagActionNameText").textContent = isCategory ? "分类名称" : "Tag 名称";
+    $("tagActionName").value = action.tag?.name || "";
+    $("tagActionCategoryLabel").classList.toggle("hidden", !isEditing);
+    if (isEditing) {
+        const categories = await invoke("list_tag_categories");
+        $("tagActionCategory").innerHTML = categories.map(category =>
+            `<option value="${escapeHTML(category)}">${escapeHTML(category)}</option>`
+        ).join("");
+        $("tagActionCategory").value = action.tag.category;
+    }
+    $("tagActionHint").textContent = isCategory ? "分类创建后，可以把 Tag 拖入这一列。" : isEditing ? "修改名称或选择新的分类。" : `将保存到「${action.category}」分类`;
+    $("tagActionModal").classList.remove("hidden");
+    requestAnimationFrame(() => $("tagActionName").focus());
+}
+
+
+function formatFileSize(bytes) {
+
+    if (bytes < 1024) {
+        return bytes + " B";
+    }
+
+    if (bytes < 1024 * 1024) {
+        return (
+            (bytes / 1024).toFixed(1) +
+            " KB"
+        );
+    }
+
+    if (bytes < 1024 * 1024 * 1024) {
+        return (
+            (bytes / 1024 / 1024).toFixed(1) +
+            " MB"
+        );
+    }
+
+    return (
+        (bytes / 1024 / 1024 / 1024).toFixed(2) +
+        " GB"
+    );
+}
+
+
+async function confirm(message, title = "确认") {
+
+    const result =
+        await __TAURI__.dialog.ask(
+            message,
+            { title, kind: "warning" }
+        );
+
+    return result === true;
+}
+
+
+function showToast(message) {
+
+    const toast = $("toast");
+
+    toast.textContent = message;
+
+    toast.classList.add("show");
+
+    setTimeout(() => {
+
+        toast.classList.remove("show");
+
+    }, 2200);
+}
+
+
+/* =========================================================
+   获取所有 Tag
+========================================================= */
+
+async function getAllTags() {
+    const tags = await invoke("list_tags");
+    return tags.map(tag => tag.name);
+}
+
+async function getAllTagRecords() {
+    return invoke("list_tags");
+}
+
+
+/* =========================================================
+   侧边 Tag
+========================================================= */
+
+async function renderSidebarTags() {
+
+    const container = $("sidebarTags");
+
+    const tags = await getAllTagRecords();
+
+    if (!tags.length) {
+
+        container.innerHTML =
+            `<div class="empty-small">暂无 Tag</div>`;
+
+        return;
+    }
+
+    container.innerHTML = tags
+        .sort((a, b) =>
+            (b.musicCount ?? 0) - (a.musicCount ?? 0) ||
+            a.name.localeCompare(b.name, "zh-Hans-CN")
+        )
+        .slice(0, 30)
+        .map(tag => {
+
+            return `
+                <button
+                    class="sidebar-tag"
+                    data-tag="${escapeHTML(tag.name)}"
+                >
+                    <span class="sidebar-tag-name"># ${escapeHTML(tag.name)}</span>
+                    <span class="nav-count sidebar-tag-count">${tag.musicCount ?? 0}</span>
+                </button>
+            `;
+
+        })
+        .join("");
+}
+
+async function renderFilterPanel() {
+    if (state.tagPointerDrag) {
+        const drag = state.tagPointerDrag;
+        drag.tagElement?.classList.remove("is-dragging");
+        drag.ghost?.remove();
+        state.draggingTagId = null;
+        state.tagPointerDrag = null;
+        showToast("拖拽已取消");
+    }
+    const active = $("activeFilterTags");
+    const suggested = $("recommendedTags");
+    active.innerHTML = state.activeTags.map(tag =>
+        `<button class="active-filter-tag" data-filter-tag="${escapeHTML(tag)}">#${escapeHTML(tag)} ×</button>`
+    ).join("");
+    const records = await getAllTagRecords();
+    const categories = await invoke("list_tag_categories");
+    const groups = new Map();
+    categories.forEach(category => groups.set(category, []));
+    records.forEach(tag => groups.get(tag.category || "自定义")?.push(tag));
+    suggested.innerHTML = (state.tagManagerOpen ? `<button class="add-category-btn" data-add-category>＋ 添加分类</button>` : "") + [...groups.entries()].map(([group, tags]) => `
+        <div class="recommended-tag-group ${state.tagManagerOpen ? "is-managing" : ""}" data-tag-category="${escapeHTML(group)}">
+            <span class="recommended-tag-title">${escapeHTML(group)}</span>
+            <div class="recommended-tag-list">${tags.map(tag =>
+                `<span class="tag-manage-item"><button class="recommended-tag ${state.activeTags.includes(tag.name) ? "active" : ""}" data-recommended-tag="${escapeHTML(tag.name)}" data-tag-id="${tag.id}" data-tag-name="${escapeHTML(tag.name)}">#${escapeHTML(tag.name)}</button>${state.tagManagerOpen ? `<button class="tag-inline-edit" data-tag-edit="${tag.id}" title="编辑 Tag">✎</button><button class="tag-inline-delete" data-tag-delete="${tag.id}" data-tag-name="${escapeHTML(tag.name)}" title="删除 Tag">×</button>` : ""}</span>`
+            ).join("")}${state.tagManagerOpen ? `<button class="category-add-btn" data-category-add="${escapeHTML(group)}" title="新增 Tag 到此分类">＋</button><button class="tag-drop-zone" data-tag-category="${escapeHTML(group)}" type="button">拖到这里更改分类</button>` : ""}</div>
+            ${state.tagManagerOpen && !tags.length ? `<span class="empty-small">拖入 Tag 或点击 ＋ 新建</span>` : ""}
+        </div>
+    `).join("");
+    $("tagManager").classList.add("hidden");
+}
+
+function renderTagManager(records) {
+    const manager = $("tagManager");
+    manager.classList.toggle("hidden", !state.tagManagerOpen);
+    const categories = [...new Set([...TAG_CATEGORIES, ...records.map(tag => tag.category)])];
+    const options = selected => categories.map(category => `<option value="${escapeHTML(category)}" ${category === selected ? "selected" : ""}>${escapeHTML(category)}</option>`).join("") + `<option value="__custom__">＋ 新建分类…</option>`;
+    const editing = records.find(tag => tag.id === state.editingTagId);
+    $("newTagName").value = editing?.name || "";
+    $("newTagCategory").innerHTML = options(editing?.category || "自定义");
+    $("newTagCustomCategory").classList.add("hidden");
+    $("createTagBtn").textContent = editing ? "保存修改" : "新建 Tag";
+    $("resetTagEditorBtn").classList.toggle("hidden", !editing);
+    $("deleteEditingTagBtn").classList.toggle("hidden", !editing);
+    const grouped = new Map();
+    records.forEach(tag => {
+        if (!grouped.has(tag.category)) grouped.set(tag.category, []);
+        grouped.get(tag.category).push(tag);
+    });
+    $("tagManagerList").innerHTML = [...grouped.entries()].map(([category, tags]) => `
+        <div class="tag-manager-group"><span>${escapeHTML(category)}</span><div>${tags.map(tag =>
+            `<button class="tag-manager-chip ${tag.id === state.editingTagId ? "active" : ""}" data-manage-tag-id="${tag.id}">#${escapeHTML(tag.name)}</button>`
+        ).join("")}</div></div>`).join("");
+}
+
+function setActiveTag(tag) {
+    tag = normalizeTag(tag);
+    if (!tag) return;
+    state.activeTags = state.activeTags.includes(tag)
+        ? state.activeTags.filter(item => item !== tag)
+        : [...state.activeTags, tag];
+    renderFilterPanel();
+    render();
+}
+
+function matchesActiveTags(music, clips) {
+    return state.activeTags.every(tag =>
+        (music.tags || []).includes(tag) || clips.some(clip => (clip.tags || []).includes(tag))
+    );
+}
+
+function renderSelectionToolbar() {
+    const toolbar = $("bulkToolbar");
+    toolbar.classList.toggle("hidden", !state.selectionMode);
+    $("selectionCount").textContent = `已选择 ${state.selectedMusicIds.size} 首`;
+    $("selectionToggleBtn").textContent = state.selectionMode ? "取消选择" : "选择";
+}
+
+
+/* =========================================================
+   统计
+========================================================= */
+
+async function updateCounts() {
+
+    const music = await dbGetAll("music");
+    const clips = await dbGetAll("clips");
+
+    $("allCount").textContent = music.length;
+    $("clipCount").textContent = clips.length;
+}
+
+
+/* =========================================================
+   获取音乐片段
+========================================================= */
+
+async function getMusicClips(musicId) {
+
+    const clips = await dbGetAll("clips");
+
+    return clips.filter(
+        clip => clip.musicId === musicId
+    );
+}
+
+async function openMusicClipsPanel(musicId) {
+    const music = await dbGet("music", musicId);
+    if (!music) return;
+    state.clipsPanelMusic = music;
+    $("detailPanel").classList.add("hidden");
+    $("musicClipsPanel").classList.remove("hidden");
+    $("musicClipsSource").textContent = music.name;
+    const clips = (await getMusicClips(music.id)).sort((a, b) => a.start - b.start);
+    $("musicClipsBody").innerHTML = `
+        <div class="clip-section-heading"><strong>${escapeHTML(music.name)}</strong><button class="primary-btn" data-clips-panel-action="create">＋ 新建片段</button></div>
+        <div class="clip-list">${clips.length ? clips.map(clip => `
+            <div class="clip-item" data-panel-clip-id="${clip.id}">
+                <div class="clip-item-header"><div class="clip-item-name">${escapeHTML(clip.name || "未命名片段")}</div><div class="clip-time">${formatTime(clip.start)} - ${formatTime(clip.end)}</div></div>
+                <div class="clip-tags">${(clip.tags || []).map(tag => `<span class="tag">#${escapeHTML(tag)}</span>`).join("")}</div>
+                <div class="clip-item-actions">
+                    <button class="icon-action" data-panel-clip-action="play" data-panel-clip-id="${clip.id}" title="试听">▶</button>
+                    <button class="icon-action" data-panel-clip-action="edit" data-panel-clip-id="${clip.id}" title="编辑">✎</button>
+                    <button class="icon-action ${isClipCandidate(clip.id) ? "is-candidate" : ""}" data-panel-clip-action="candidate" data-panel-clip-id="${clip.id}" title="候选">${isClipCandidate(clip.id) ? "★" : "☆"}</button>
+                    <button class="icon-action" data-panel-clip-action="delete" data-panel-clip-id="${clip.id}" title="删除">🗑</button>
+                </div>
+            </div>`).join("") : `<div class="detail-value">暂无片段，创建一个开始标记。</div>`}</div>`;
+}
+
+
+/* =========================================================
+   搜索
+========================================================= */
+
+function matchesSearch(music, clips, query) {
+
+    if (!query) {
+        return true;
+    }
+
+    query = query.toLowerCase();
+
+    const musicText = [
+
+        music.name,
+        music.album,
+        music.path,
+        ...(music.tags || [])
+
+    ]
+        .join(" ")
+        .toLowerCase();
+
+
+    if (musicText.includes(query)) {
+        return true;
+    }
+
+
+    for (const clip of clips) {
+
+        const clipText = [
+
+            clip.name,
+            ...(clip.tags || [])
+
+        ]
+            .join(" ")
+            .toLowerCase();
+
+        if (clipText.includes(query)) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+
+/* =========================================================
+   获取当前音乐
+========================================================= */
+
+async function getCurrentMusicList() {
+
+    let music = await dbGetAll("music");
+    const clips = await dbGetAll("clips");
+
+
+    if (state.currentView === "recent") {
+
+        music.sort(
+            (a, b) => b.createdAt - a.createdAt
+        );
+
+        music = music.slice(0, 100);
+    }
+
+
+    if (state.currentView === "clips") {
+
+        const musicIds = new Set(
+            clips.map(c => c.musicId)
+        );
+
+        music = music.filter(
+            m => musicIds.has(m.id)
+        );
+    }
+
+
+    if (state.currentView === "albums") {
+
+        // 仍显示音乐，下面会按照 album 排序
+        music.sort(
+            (a, b) =>
+                (a.album || "")
+                    .localeCompare(
+                        b.album || "",
+                        "zh-CN"
+                    )
+        );
+    }
+
+
+    if (state.currentView.startsWith("tag:")) {
+
+        const tag =
+            state.currentView.substring(4);
+
+        music = music.filter(m => {
+
+            const musicHas =
+                (m.tags || []).includes(tag);
+
+            const musicClips =
+                clips.filter(
+                    c => c.musicId === m.id
+                );
+
+            const clipHas =
+                musicClips.some(
+                    c =>
+                        (c.tags || []).includes(tag)
+                );
+
+            return musicHas || clipHas;
+        });
+    }
+
+
+    const result = [];
+
+    for (const m of music) {
+
+        const mClips =
+            clips.filter(
+                c => c.musicId === m.id
+            );
+
+        if (
+            matchesSearch(
+                m,
+                mClips,
+                state.search
+            ) && matchesActiveTags(m, mClips)
+        ) {
+            result.push(m);
+        }
+    }
+
+    return result;
+}
+
+
+/* =========================================================
+   页面标题
+========================================================= */
+
+function updatePageHeader() {
+
+    let title = "全部音乐";
+    let description = "你的本地音乐素材";
+
+
+    if (state.currentView === "clips") {
+
+        title = "音乐片段";
+        description =
+            "所有已经标记过时间轴的音乐片段";
+    }
+
+
+    if (state.currentView === "recent") {
+
+        title = "最近添加";
+        description =
+            "最近导入的音乐";
+    }
+
+
+    if (state.currentView === "albums") {
+
+        title = "专辑";
+        description =
+            "按照专辑查看音乐";
+    }
+
+
+    if (state.currentView === "tags") {
+
+        title = "Tags";
+        description =
+            "按照 Tag 管理音乐素材";
+    }
+
+
+    if (state.currentView.startsWith("tag:")) {
+
+        const tag =
+            state.currentView.substring(4);
+
+        title = "#" + tag;
+
+        description =
+            "包含这个 Tag 的音乐和片段";
+    }
+
+
+    $("pageTitle").textContent = title;
+    $("pageDescription").textContent = description;
+}
+
+
+/* =========================================================
+   渲染主列表
+========================================================= */
+
+async function render() {
+
+    updatePageHeader();
+
+    const music = await dbGetAll("music");
+
+    const clips = await dbGetAll("clips");
+
+    if (state.currentView === "clips") {
+
+        renderClipLibrary(music, clips);
+
+        return;
+    }
+
+
+    /* 分类视图:专辑 / Tags */
+
+    if (state.currentView === "albums") {
+
+        renderCatalogView(
+            music,
+            clips,
+            "album"
+        );
+
+        return;
+    }
+
+    if (state.currentView === "tags") {
+
+        renderCatalogView(
+            music,
+            clips,
+            "tag"
+        );
+
+        return;
+    }
+
+
+    /* 其他视图(全部 / 片段 / 最近 / tag 过滤) */
+
+    const list =
+        await getCurrentMusicList();
+
+    $("resultInfo").textContent = `${list.length} 个音乐`;
+
+    if (state.currentView.startsWith("tag:")) {
+        renderTagResults(list, clips, state.currentView.substring(4));
+        return;
+    }
+
+    if (!list.length) {
+
+        $("contentArea").innerHTML = `
+
+            <div class="empty-state">
+
+                <div class="empty-icon">
+                    ♫
+                </div>
+
+                <div class="empty-title">
+                    还没有音乐
+                </div>
+
+                <div class="empty-description">
+                    点击右上角「导入音乐」开始建立音乐库
+                </div>
+
+            </div>
+
+        `;
+
+        return;
+    }
+
+
+    visibleQueueMusic = list;
+
+    if (state.layout === "grid") {
+
+        renderGrid(
+            list,
+            clips
+        );
+
+    } else {
+
+        renderList(
+            list,
+            clips
+        );
+    }
+
+    syncPlayerQueue();
+}
+
+function renderTagResults(music, clips, tag) {
+    const musicById = new Map(music.map(item => [item.id, item]));
+    const matchingMusic = music.filter(item => (item.tags || []).includes(tag));
+    const matchingClips = clips
+        .filter(clip => (clip.tags || []).includes(tag) && musicById.has(clip.musicId))
+        .map(clip => ({ clip, music: musicById.get(clip.musicId) }));
+
+    $("resultInfo").textContent = `${matchingMusic.length} 首音乐 · ${matchingClips.length} 个片段`;
+    visibleQueueMusic = matchingMusic;
+    syncPlayerQueue();
+    if (!state.tagResultTab || (state.tagResultTab === "clips" && !matchingClips.length)) {
+        state.tagResultTab = matchingClips.length ? "clips" : "music";
+    }
+
+    const musicRows = matchingMusic.map(item => `
+        <div class="music-row" data-music-id="${item.id}">
+            <div class="music-icon">♫</div>
+            <div class="music-main"><div class="music-name">${escapeHTML(item.name)}</div><div class="music-meta"><span>${formatTime(item.duration)}</span>${item.album ? `<span>专辑：${escapeHTML(item.album)}</span>` : ""}</div><div class="music-tags">${(item.tags || []).map(value => `<span class="tag">#${escapeHTML(value)}</span>`).join("")}</div></div>
+            <div class="music-actions"><button class="icon-action" data-action="play" data-id="${item.id}" title="试听">▶</button><button class="icon-action info-strong" data-action="info" data-id="${item.id}" title="详情">ⓘ</button></div>
+        </div>`).join("");
+    const clipRows = matchingClips.map(({ clip, music: parent }) => `
+        <div class="clip-library-row" data-clip-id="${clip.id}">
+            <div class="clip-library-icon">◈</div>
+            <div class="clip-library-main"><div class="clip-library-name">${escapeHTML(clip.name || "未命名片段")}</div><div class="clip-library-source-name">${escapeHTML(parent.name)}</div><div class="clip-library-meta"><span>${formatTime(clip.start)} – ${formatTime(clip.end)}</span><span>${formatTime(clip.end - clip.start)}</span>${(clip.tags || []).map(value => `<span class="tag">#${escapeHTML(value)}</span>`).join("")}</div></div>
+            <div class="clip-library-actions"><button class="icon-action" data-clip-action="play" data-clip-id="${clip.id}" title="试听片段">▶</button><button class="icon-action" data-clip-action="edit" data-clip-id="${clip.id}" title="编辑片段">✎</button><button class="icon-action" data-clip-action="candidate" data-clip-id="${clip.id}" title="加入候选">☆</button></div>
+        </div>`).join("");
+
+    $("contentArea").innerHTML = `
+        <div class="tag-result-groups">
+            <div class="tag-result-tabs">
+                <button class="tag-result-tab ${state.tagResultTab === "music" ? "active" : ""}" data-tag-result-tab="music">音乐 <span>${matchingMusic.length}</span></button>
+                <button class="tag-result-tab ${state.tagResultTab === "clips" ? "active" : ""}" data-tag-result-tab="clips">音乐片段 <span>${matchingClips.length}</span></button>
+            </div>
+            ${state.tagResultTab === "music" ? (musicRows ? `<div class="music-list">${musicRows}</div>` : `<div class="detail-value">没有直接标记 #${escapeHTML(tag)} 的音乐</div>`) : (clipRows ? `<div class="clip-library">${clipRows}</div>` : `<div class="detail-value">没有直接标记 #${escapeHTML(tag)} 的片段</div>`)}
+        </div>`;
+}
+
+
+/* =========================================================
+   目录视图（专辑 / Tags）
+   左侧分类列表 + 右侧对应音乐
+========================================================= */
+
+function renderCatalogView(music, clips, type) {
+
+    music = music.filter(item => {
+        const itemClips = clips.filter(clip => clip.musicId === item.id);
+        return matchesSearch(item, itemClips, state.search) && matchesActiveTags(item, itemClips);
+    });
+
+    $("resultInfo").textContent = `${music.length} 个音乐`;
+
+    const cand =
+        new Set(
+            state.player.candidates
+                .map(c => c.id)
+        );
+
+
+    /* 构建分组 */
+
+    let entries = [];
+
+    if (type === "tag") {
+
+        const musicById =
+            new Map(
+                music.map(m => [m.id, m])
+            );
+
+        const map = new Map();
+
+        const pushTag = (tag, m) => {
+
+            if (!map.has(tag)) {
+                map.set(tag, new Set());
+            }
+
+            map.get(tag).add(m.id);
+        };
+
+        music.forEach(m => {
+
+            (m.tags || []).forEach(
+                tag => pushTag(tag, m)
+            );
+        });
+
+        clips.forEach(c => {
+
+            const m = musicById.get(c.musicId);
+
+            if (!m) {
+                return;
+            }
+
+            (c.tags || []).forEach(
+                tag => pushTag(tag, m)
+            );
+        });
+
+        entries = [...map.entries()].map(
+            ([tag, idSet]) => ({
+
+                key: tag,
+                items: [...idSet]
+                    .map(id => musicById.get(id))
+                    .filter(Boolean)
+            })
+        );
+
+    } else {
+
+        const emptyLabel = "未设置专辑";
+
+        const map = new Map();
+
+        music.forEach(m => {
+
+            const key =
+                (m.album || "").trim() ||
+                emptyLabel;
+
+            if (!map.has(key)) {
+                map.set(key, []);
+            }
+
+            map.get(key).push(m);
+        });
+
+        entries = [...map.entries()].map(
+            ([key, items]) => ({ key, items })
+        );
+    }
+
+
+    entries.sort(
+        (a, b) =>
+            a.key.localeCompare(
+                b.key,
+                "zh-CN"
+            )
+    );
+
+
+    if (!entries.length) {
+
+        $("contentArea").innerHTML = `
+            <div class="empty-state">
+                <div class="empty-icon">
+                    ${type === "tag" ? "#" : "♫"}
+                </div>
+                <div class="empty-title">
+                    ${
+                        type === "tag"
+                            ? "还没有 Tag"
+                            : "还没有专辑"
+                    }
+                </div>
+                <div class="empty-description">
+                    ${
+                        type === "tag"
+                            ? "在音乐详情或片段里给音乐添加 Tag"
+                            : "导入音乐后填写专辑信息即可归档"
+                    }
+                </div>
+            </div>
+        `;
+
+        visibleQueueMusic = [];
+        syncPlayerQueue();
+
+        return;
+    }
+
+
+    /* 选中项 */
+
+    let selected = state.catalogSelection;
+
+    if (
+        !selected ||
+        !entries.some(e => e.key === selected)
+    ) {
+
+        selected = entries[0].key;
+    }
+
+    state.catalogSelection = selected;
+
+    const current =
+        entries.find(e => e.key === selected);
+
+
+    /* 左侧目录 */
+
+    const listHTML = entries
+        .map(e => `
+
+            <button
+                class="catalog-item ${
+                    e.key === selected ? "active" : ""
+                }"
+                data-catalog-key="${escapeHTML(e.key)}"
+            >
+
+                <span class="catalog-item-icon">
+                    ${
+                        type === "tag"
+                            ? "#"
+                            : type === "album"
+                                ? "▣"
+                                : "▤"
+                    }
+                </span>
+
+                <span class="catalog-item-name">
+                    ${escapeHTML(e.key)}
+                </span>
+
+                <span class="catalog-item-count">
+                    ${e.items.length}
+                </span>
+
+            </button>
+        `)
+        .join("");
+
+
+    /* 右侧音乐列表 */
+
+    const rowsHTML = current.items
+        .map(item => {
+
+            const itemClips =
+                clips.filter(
+                    c => c.musicId === item.id
+                );
+
+            const tags =
+                item.tags || [];
+
+            return `
+
+                <div
+                    class="music-row ${state.selectedMusicIds.has(item.id) ? "is-selected" : ""}"
+                    data-music-id="${item.id}"
+                >
+
+                    ${state.selectionMode ? `<label class="music-select"><input type="checkbox" data-select-music="${item.id}" ${state.selectedMusicIds.has(item.id) ? "checked" : ""}><span></span></label>` : ""}
+
+                    <div class="music-icon">
+                        ♫
+                    </div>
+
+                    <div class="music-main">
+
+                        <div class="music-name">
+                            ${escapeHTML(item.name)}
+                        </div>
+
+                        <div class="music-meta">
+
+                            ${
+                                type !== "album" &&
+                                item.album
+                                    ? `<span>专辑：${escapeHTML(item.album)}</span>`
+                                    : ""
+                            }
+
+                            <span>
+                                ${formatTime(item.duration)}
+                            </span>
+
+                            ${
+                                itemClips.length
+                                    ? `<span>◈ ${itemClips.length} 个片段</span>`
+                                    : ""
+                            }
+
+                        </div>
+
+                        <div class="music-tags">
+
+                            ${tags
+                                .map(
+                                    tag =>
+                                        `<span class="tag">#${escapeHTML(tag)}</span>`
+                                )
+                                .join("")
+                            }
+
+                        </div>
+
+                    </div>
+
+                    <div class="music-actions">
+
+                        <button
+                            class="icon-action ${state.player.music?.id === item.id && state.player.playing ? "is-playing" : ""}"
+                            data-action="play"
+                            data-id="${item.id}"
+                            title="${state.player.music?.id === item.id && state.player.playing ? "暂停试听" : "试听"}"
+                        >
+                            ${state.player.music?.id === item.id && state.player.playing ? "Ⅱ" : "▶"}
+                        </button>
+
+                        <button
+                            class="icon-action ${
+                                cand.has(item.id)
+                                    ? "is-candidate"
+                                    : ""
+                            }"
+                            data-action="candidate"
+                            data-id="${item.id}"
+                            title="${
+                                cand.has(item.id)
+                                    ? "移出候选"
+                                    : "加入候选"
+                            }"
+                        >
+                            ${
+                                cand.has(item.id)
+                                    ? "★"
+                                    : "☆"
+                            }
+                        </button>
+
+                        <button
+                            class="icon-action info-strong"
+                            data-action="info"
+                            data-id="${item.id}"
+                            title="详情"
+                        >
+                            ⓘ
+                        </button>
+
+                        <button
+                            class="icon-action"
+                            data-action="delete"
+                            data-id="${item.id}"
+                            title="删除"
+                        >
+                            🗑
+                        </button>
+
+                    </div>
+
+                </div>
+            `;
+
+        })
+        .join("");
+
+
+    $("contentArea").innerHTML = `
+        <div class="catalog-view">
+
+            <div class="catalog-list">
+                ${listHTML}
+            </div>
+
+            <div class="catalog-detail">
+
+                <div class="catalog-detail-header">
+                    <span class="catalog-detail-title">
+                        ${escapeHTML(current.key)}
+                    </span>
+                    <span class="catalog-detail-count">
+                        ${current.items.length} 首
+                    </span>
+                </div>
+
+                <div class="music-list">
+                    ${rowsHTML}
+                </div>
+
+            </div>
+
+        </div>
+    `;
+
+    visibleQueueMusic = current.items;
+
+    syncPlayerQueue();
+}
+
+
+/* =========================================================
+   片段库
+========================================================= */
+
+function renderClipLibrary(music, clips) {
+
+    const musicMap =
+        new Map(music.map(item => [item.id, item]));
+
+    const query = state.search.toLowerCase();
+
+    const visibleClips = clips
+        .map(clip => ({
+            clip,
+            music: musicMap.get(clip.musicId)
+        }))
+        .filter(({ clip, music: parent }) => {
+            if (!parent) {
+                return false;
+            }
+
+            const matchesText = !query || [
+                clip.name,
+                parent.name,
+                parent.album,
+                ...(clip.tags || [])
+            ]
+                .filter(Boolean)
+                .join(" ")
+                .toLowerCase()
+                .includes(query);
+            return matchesText && matchesActiveTags(parent, [clip]);
+        })
+        .sort((a, b) => {
+            const musicOrder =
+                a.music.name.localeCompare(b.music.name, "zh-CN");
+
+            return musicOrder || a.clip.start - b.clip.start;
+        });
+
+    if (!visibleClips.length) {
+        $("resultInfo").textContent = "0 个片段";
+        $("contentArea").innerHTML = `
+            <div class="empty-state">
+                <div class="empty-icon">◈</div>
+                <div class="empty-title">还没有找到音乐片段</div>
+                <div class="empty-description">
+                    ${query ? "试试其他搜索关键词" : "在音乐详情中创建你的第一个片段"}
+                </div>
+            </div>
+        `;
+        visibleQueueMusic = [];
+        syncPlayerQueue();
+        return;
+    }
+
+    $("resultInfo").textContent = `${visibleClips.length} 个片段`;
+
+    const candidateIds =
+        new Set(state.player.candidates.map(item => item.id));
+
+    $("contentArea").innerHTML = `
+        <div class="clip-library">
+            ${visibleClips.map(({ clip, music: parent }) => `
+                <div class="clip-library-row" data-clip-id="${clip.id}">
+                    <div class="clip-library-icon">◈</div>
+                    <div class="clip-library-main">
+                        <div class="clip-library-name">
+                            ${escapeHTML(clip.name || "未命名片段")}
+                        </div>
+                        <div class="clip-library-source-name">
+                            ${escapeHTML(parent.name)}
+                        </div>
+                        <div class="clip-library-meta">
+                            <span>${formatTime(clip.start)} – ${formatTime(clip.end)}</span>
+                            <span>${formatTime(clip.end - clip.start)}</span>
+                            ${(clip.tags || []).map(tag =>
+                                `<span class="tag">#${escapeHTML(tag)}</span>`
+                            ).join("")}
+                        </div>
+                    </div>
+                    <div class="clip-library-actions">
+                        <button class="icon-action" data-clip-action="play" data-clip-id="${clip.id}" title="试听片段">▶</button>
+                        <button class="icon-action" data-clip-action="edit" data-clip-id="${clip.id}" title="编辑片段">✎</button>
+                        <button class="icon-action ${candidateIds.has(clip.id) ? "is-candidate" : ""}" data-clip-action="candidate" data-clip-id="${clip.id}" title="${candidateIds.has(clip.id) ? "移出候选" : "加入候选"}">${candidateIds.has(clip.id) ? "★" : "☆"}</button>
+                        <button class="icon-action" data-clip-action="delete" data-clip-id="${clip.id}" title="删除片段">🗑</button>
+                    </div>
+                </div>
+            `).join("")}
+        </div>
+    `;
+
+    visibleQueueMusic = [...new Map(visibleClips.map(({ music: parent }) => [parent.id, parent])).values()];
+    syncPlayerQueue();
+}
+
+
+/* =========================================================
+   列表视图
+========================================================= */
+
+function renderList(music, clips) {
+
+    const cand =
+        new Set(
+            state.player.candidates
+                .map(c => c.id)
+        );
+
+    const html = music
+        .map(item => {
+
+            const itemClips =
+                clips.filter(
+                    c => c.musicId === item.id
+                );
+
+            const tags =
+                item.tags || [];
+
+            return `
+
+                <div
+                    class="music-row ${state.selectedMusicIds.has(item.id) ? "is-selected" : ""}"
+                    data-music-id="${item.id}"
+                >
+
+                    ${state.selectionMode ? `<label class="music-select"><input type="checkbox" data-select-music="${item.id}" ${state.selectedMusicIds.has(item.id) ? "checked" : ""}><span></span></label>` : ""}
+
+                    <div class="music-icon">
+                        ♫
+                    </div>
+
+                    <div class="music-main">
+
+                        <div class="music-name">
+                            ${escapeHTML(item.name)}
+                        </div>
+
+                        <div class="music-meta">
+
+                            ${
+                                item.album
+                                    ? `<span>专辑：${escapeHTML(item.album)}</span>`
+                                    : ""
+                            }
+
+                            <span>
+                                ${formatTime(item.duration)}
+                            </span>
+
+                            ${
+                                itemClips.length
+                                    ? `<span>◈ ${itemClips.length} 个片段</span>`
+                                    : ""
+                            }
+
+                        </div>
+
+                        <div class="music-tags">
+
+                            ${tags
+                                .map(
+                                    tag =>
+                                        `<span class="tag">#${escapeHTML(tag)}</span>`
+                                )
+                                .join("")
+                            }
+
+                        </div>
+
+                    </div>
+
+
+                    <div class="music-actions">
+
+                        <button
+                            class="icon-action ${state.player.music?.id === item.id && state.player.playing ? "is-playing" : ""}"
+                            data-action="play"
+                            data-id="${item.id}"
+                            title="${state.player.music?.id === item.id && state.player.playing ? "暂停试听" : "试听"}"
+                        >
+                            ${state.player.music?.id === item.id && state.player.playing ? "Ⅱ" : "▶"}
+                        </button>
+
+                        <button
+                            class="icon-action ${
+                                cand.has(item.id)
+                                    ? "is-candidate"
+                                    : ""
+                            }"
+                            data-action="candidate"
+                            data-id="${item.id}"
+                            title="${
+                                cand.has(item.id)
+                                    ? "移出候选"
+                                    : "加入候选"
+                            }"
+                        >
+                            ${
+                                cand.has(item.id)
+                                    ? "★"
+                                    : "☆"
+                            }
+                        </button>
+
+                        <button
+                            class="icon-action info-strong"
+                            data-action="info"
+                            data-id="${item.id}"
+                            title="详情"
+                        >
+                            ⓘ
+                        </button>
+
+                        <button
+                            class="icon-action"
+                            data-action="delete"
+                            data-id="${item.id}"
+                            title="删除"
+                        >
+                            🗑
+                        </button>
+
+                    </div>
+
+                </div>
+            `;
+
+        })
+        .join("");
+
+
+    $("contentArea").innerHTML = `
+        <div class="music-list">
+            ${html}
+        </div>
+    `;
+}
+
+
+/* =========================================================
+   Grid
+========================================================= */
+
+function renderGrid(music, clips) {
+
+    const html = music
+        .map(item => {
+
+            const itemClips =
+                clips.filter(
+                    c => c.musicId === item.id
+                );
+
+            return `
+
+                <div
+                    class="music-card ${state.selectedMusicIds.has(item.id) ? "is-selected" : ""}"
+                    data-music-id="${item.id}"
+                >
+
+                    ${state.selectionMode ? `<label class="music-select card-select"><input type="checkbox" data-select-music="${item.id}" ${state.selectedMusicIds.has(item.id) ? "checked" : ""}><span></span></label>` : ""}
+
+                    <div class="card-icon">
+                        ♫
+                    </div>
+
+                    <div class="card-name">
+                        ${escapeHTML(item.name)}
+                    </div>
+
+                    <div class="card-meta">
+
+                        ${
+                            item.album
+                                ? escapeHTML(item.album)
+                                : "未设置专辑"
+                        }
+
+                        ·
+
+                        ${formatTime(item.duration)}
+
+                        ${
+                            itemClips.length
+                                ? " · " +
+                                  itemClips.length +
+                                  " 个片段"
+                                : ""
+                        }
+
+                    </div>
+
+
+                    <div class="card-tags">
+
+                        ${(item.tags || [])
+                            .map(
+                                tag =>
+                                    `<span class="tag">#${escapeHTML(tag)}</span>`
+                            )
+                            .join("")
+                        }
+
+                    </div>
+
+                </div>
+
+            `;
+
+        })
+        .join("");
+
+
+    $("contentArea").innerHTML = `
+        <div class="music-grid">
+            ${html}
+        </div>
+    `;
+}
+
+
+/* =========================================================
+   音乐详情
+========================================================= */
+
+async function openDetail(id) {
+
+    const music = await dbGet(
+        "music",
+        id
+    );
+
+    if (!music) {
+        return;
+    }
+
+    state.selectedMusic = music;
+    $("musicClipsPanel").classList.add("hidden");
+    state.clipsPanelMusic = null;
+
+    state.editTags =
+        [...(music.tags || [])];
+
+    const clips =
+        await getMusicClips(id);
+
+
+    $("detailPanel")
+        .classList.remove("hidden");
+
+
+    $("detailContent").innerHTML = `
+
+        <div class="detail-tabs">
+
+            <button
+                class="detail-tab active"
+                data-detail-tab="info"
+            >
+                详情
+            </button>
+
+            <button
+                class="detail-tab"
+                data-detail-tab="clips"
+            >
+                音乐片段
+                ${
+                    clips.length
+                        ? `（${clips.length}）`
+                        : ""
+                }
+            </button>
+
+        </div>
+
+
+        <div
+            id="detailTabInfo"
+            class="detail-tab-panel"
+        >
+
+            <div class="detail-name">
+                ${escapeHTML(music.name)}
+            </div>
+
+
+            <div class="detail-path">
+                ${escapeHTML(
+                    music.path || "本地文件"
+                )}
+            </div>
+
+
+            <div class="file-location">
+
+                <button
+                    id="detailPlayBtn"
+                    class="primary-btn"
+                >
+                    ▶ 试听
+                </button>
+
+                <button
+                    id="locateFileBtn"
+                    class="secondary-btn"
+                >
+                    在 Finder 中显示
+                </button>
+
+                <button
+                    id="reauthorizeBtn"
+                    class="secondary-btn"
+                >
+                    重新授权
+                </button>
+
+                <button id="detailShowClipsBtn" class="secondary-btn">
+                    音乐片段
+                </button>
+
+            </div>
+
+
+            <div class="detail-section detail-edit">
+
+                <div class="detail-section-title">
+                    基本信息
+                    <span class="detail-edit-hint">
+                        直接修改，自动保存
+                    </span>
+                </div>
+
+                <label>
+                    音乐名称
+                    <input
+                        id="detailEditName"
+                        type="text"
+                        value="${escapeHTML(music.name)}"
+                    >
+                </label>
+
+                <label>
+                    作者
+                    <input
+                        id="detailEditArtist"
+                        type="text"
+                        value="${escapeHTML(music.artist || "")}"
+                        placeholder="可留空"
+                    >
+                </label>
+
+                <label>
+                    专辑
+                    <input
+                        id="detailEditAlbum"
+                        type="text"
+                        value="${escapeHTML(music.album || "")}"
+                        placeholder="可留空"
+                    >
+                </label>
+
+                <label>
+                    音乐类型
+                    <input
+                        id="detailEditGenre"
+                        type="text"
+                        value="${escapeHTML(music.genre || "")}"
+                        placeholder="如：流行 / 古典"
+                    >
+                </label>
+
+                <label>
+                    录制年份
+                    <input
+                        id="detailEditYear"
+                        type="text"
+                        value="${escapeHTML(music.year || "")}"
+                        placeholder="如：2024"
+                    >
+                </label>
+
+                <div class="detail-specs">
+
+                    <div class="detail-spec">
+                        <span class="detail-spec-label">时长</span>
+                        <span class="detail-spec-value">${formatTime(music.duration)}</span>
+                    </div>
+
+                    <div class="detail-spec">
+                        <span class="detail-spec-label">音频声道</span>
+                        <span class="detail-spec-value">${escapeHTML(music.channels || "—")}</span>
+                    </div>
+
+                    <div class="detail-spec">
+                        <span class="detail-spec-label">采样速率</span>
+                        <span class="detail-spec-value">${music.sampleRate ? escapeHTML(String(music.sampleRate)) + " Hz" : "—"}</span>
+                    </div>
+
+                    <div class="detail-spec">
+                        <span class="detail-spec-label">码率</span>
+                        <span class="detail-spec-value">${music.bitrate ? escapeHTML(String(music.bitrate)) + " kbps" : "—"}</span>
+                    </div>
+
+                    <div class="detail-spec">
+                        <span class="detail-spec-label">文件大小</span>
+                        <span class="detail-spec-value">${formatFileSize(music.fileSize)}</span>
+                    </div>
+
+                    <div class="detail-spec">
+                        <span class="detail-spec-label">格式</span>
+                        <span class="detail-spec-value">${escapeHTML(music.mimeType || "—")}</span>
+                    </div>
+
+                </div>
+
+            </div>
+
+
+            <div class="detail-section detail-edit">
+
+                <div class="detail-section-title">
+                    音乐 Tag
+                </div>
+
+                <div
+                    id="detailEditTags"
+                    class="tag-editor"
+                ></div>
+
+                <div class="tag-input-row">
+                    <input
+                        id="detailEditTagInput"
+                        type="text"
+                        placeholder="输入新 Tag"
+                    >
+                    <button
+                        id="detailAddTagBtn"
+                        class="secondary-btn"
+                    >
+                        添加
+                    </button>
+                </div>
+
+                <div
+                    id="detailTagSuggestions"
+                    class="tag-suggestions"
+                ></div>
+
+            </div>
+
+        </div>
+
+
+        <div
+            id="detailTabClips"
+            class="detail-tab-panel hidden"
+        >
+
+            <div class="detail-section">
+
+                <div class="detail-section-title clip-section-heading">
+
+                    <span>音乐片段
+                    ${
+                        clips.length
+                            ? `（${clips.length}）`
+                            : ""
+                    }
+                    </span>
+                    <button id="detailAddClipBtn" class="primary-btn">＋ 新建片段</button>
+
+                </div>
+
+
+                <div class="clip-list">
+
+                    ${
+                        clips.length
+                            ? clips
+                                .sort(
+                                    (a,b) =>
+                                        a.start - b.start
+                                )
+                                .map(clip => `
+
+                                    <div
+                                        class="clip-item"
+                                        data-clip-id="${clip.id}"
+                                    >
+
+                                        <div class="clip-item-header">
+
+                                            <div class="clip-item-name">
+                                                ${
+                                                    escapeHTML(
+                                                        clip.name ||
+                                                        "未命名片段"
+                                                    )
+                                                }
+                                            </div>
+
+                                            <div class="clip-time">
+
+                                                ${formatTime(clip.start)}
+                                                -
+                                                ${formatTime(clip.end)}
+
+                                            </div>
+
+                                        </div>
+
+
+                                        <div class="clip-tags">
+
+                                            ${(clip.tags || [])
+                                                .map(
+                                                    tag =>
+                                                        `<span class="tag">#${escapeHTML(tag)}</span>`
+                                                )
+                                                .join("")
+                                            }
+
+                                        </div>
+
+
+                                        <div class="clip-item-actions">
+
+                                            <button
+                                                class="icon-action"
+                                                data-clip-action="play"
+                                                data-clip-id="${clip.id}"
+                                                title="试听这段"
+                                            >
+                                                ▶
+                                            </button>
+
+                                            <button
+                                                class="icon-action"
+                                                data-clip-action="edit"
+                                                data-clip-id="${clip.id}"
+                                                title="编辑片段"
+                                            >
+                                                ✎
+                                            </button>
+
+                                            <button
+                                                class="icon-action ${
+                                                    isClipCandidate(clip.id)
+                                                        ? "is-candidate"
+                                                        : ""
+                                                }"
+                                                data-clip-action="candidate"
+                                                data-clip-id="${clip.id}"
+                                                title="${
+                                                    isClipCandidate(clip.id)
+                                                        ? "移出候选"
+                                                        : "加入候选"
+                                                }"
+                                            >
+                                                ${
+                                                    isClipCandidate(clip.id)
+                                                        ? "★"
+                                                        : "☆"
+                                                }
+                                            </button>
+
+                                            <button
+                                                class="icon-action"
+                                                data-clip-action="delete"
+                                                data-clip-id="${clip.id}"
+                                                title="删除片段"
+                                            >
+                                                🗑
+                                            </button>
+
+                                        </div>
+
+                                    </div>
+
+                                `)
+                                .join("")
+                            :
+                                `<div class="detail-value">
+                                    暂无片段
+                                </div>`
+                    }
+
+                </div>
+
+            </div>
+
+
+        </div>
+
+    `;
+
+
+    /* Tab 切换 */
+
+    document
+        .querySelectorAll(
+            "[data-detail-tab]"
+        )
+        .forEach(btn => {
+
+            btn.addEventListener(
+                "click",
+                () => {
+
+                    document
+                        .querySelectorAll(
+                            "[data-detail-tab]"
+                        )
+                        .forEach(
+                            b =>
+                                b.classList
+                                    .remove("active")
+                        );
+
+                    btn.classList.add("active");
+
+                    const tab =
+                        btn.dataset.detailTab;
+
+                    $("detailTabInfo")
+                        .classList.toggle(
+                            "hidden",
+                            tab !== "info"
+                        );
+
+                    $("detailTabClips")
+                        .classList.toggle(
+                            "hidden",
+                            tab !== "clips"
+                        );
+                }
+            );
+        });
+
+
+    $("detailPlayBtn")
+        .onclick = () => {
+
+            const p = state.player;
+
+            if (
+                p.music &&
+                p.music.id === music.id
+            ) {
+
+                togglePlay();
+
+            } else {
+
+                playMusic(music.id);
+            }
+        };
+
+
+    $("locateFileBtn")
+        .onclick = () =>
+            revealInFinder(music);
+
+
+    $("reauthorizeBtn")
+        .onclick = () =>
+            reauthorizeFile(music);
+
+    $("detailShowClipsBtn").onclick = () => openMusicClipsPanel(music.id);
+
+
+    $("detailAddClipBtn")
+        .onclick = () =>
+            openClipEditor(music);
+
+
+    /* 详情内嵌编辑 */
+
+    $("detailEditName")
+        .addEventListener(
+            "change",
+            () => {
+
+                const newName =
+                    $("detailEditName").value
+                        .trim();
+
+                if (
+                    !newName ||
+                    newName === music.name
+                ) {
+                    return;
+                }
+
+                saveDetailEdit({
+                    name: newName
+                });
+            }
+        );
+
+
+    $("detailEditAlbum")
+        .addEventListener(
+            "change",
+            () => {
+
+                const newAlbum =
+                    $("detailEditAlbum").value
+                        .replace(/\s+/g, " ")
+                        .trim();
+
+                if (newAlbum === music.album) {
+                    return;
+                }
+
+                saveDetailEdit({
+                    album: newAlbum
+                });
+            }
+        );
+
+
+    $("detailEditArtist")
+        .addEventListener(
+            "change",
+            () => {
+
+                const newArtist =
+                    $("detailEditArtist").value
+                        .replace(/\s+/g, " ")
+                        .trim();
+
+                if (newArtist === (music.artist || "")) {
+                    return;
+                }
+
+                saveDetailEdit({
+                    artist: newArtist
+                });
+            }
+        );
+
+
+    $("detailEditGenre")
+        .addEventListener(
+            "change",
+            () => {
+
+                const newGenre =
+                    $("detailEditGenre").value
+                        .replace(/\s+/g, " ")
+                        .trim();
+
+                if (newGenre === (music.genre || "")) {
+                    return;
+                }
+
+                saveDetailEdit({
+                    genre: newGenre
+                });
+            }
+        );
+
+
+    $("detailEditYear")
+        .addEventListener(
+            "change",
+            () => {
+
+                const newYear =
+                    $("detailEditYear").value
+                        .replace(/\s+/g, " ")
+                        .trim();
+
+                if (newYear === (music.year || "")) {
+                    return;
+                }
+
+                saveDetailEdit({
+                    year: newYear
+                });
+            }
+        );
+
+
+    renderDetailEditTags();
+
+    renderDetailTagSuggestions();
+
+    $("detailEditTagInput")
+        .addEventListener(
+            "input",
+            () => {
+
+                renderDetailTagSuggestions(
+                    $("detailEditTagInput").value
+                        .trim()
+                );
+            }
+        );
+
+    $("detailAddTagBtn")
+        .addEventListener(
+            "click",
+            addDetailEditTag
+        );
+
+    $("detailEditTagInput")
+        .addEventListener(
+            "keydown",
+            event => {
+
+                if (
+                    event.key === "Enter"
+                ) {
+
+                    event.preventDefault();
+
+                    addDetailEditTag();
+                }
+            }
+        );
+
+    $("detailEditTags")
+        .addEventListener(
+            "click",
+            event => {
+
+                const btn =
+                    event.target.closest(
+                        "[data-remove-detail-tag]"
+                    );
+
+                if (!btn) {
+                    return;
+                }
+
+                const index =
+                    Number(
+                        btn.dataset.removeDetailTag
+                    );
+
+                state.editTags
+                    .splice(index, 1);
+
+                renderDetailEditTags();
+
+                saveDetailEdit({
+                    tags: [...state.editTags]
+                });
+            }
+        );
+
+    $("detailTagSuggestions")
+        .addEventListener(
+            "click",
+            event => {
+
+                const btn =
+                    event.target.closest(
+                        "[data-detail-suggest-tag]"
+                    );
+
+                if (!btn) {
+                    return;
+                }
+
+                const tag =
+                    btn.dataset.detailSuggestTag;
+
+                if (
+                    !state.editTags.includes(tag)
+                ) {
+
+                    state.editTags.push(tag);
+                }
+
+                renderDetailEditTags();
+
+                $("detailEditTagInput").value = "";
+
+                renderDetailTagSuggestions();
+
+                saveDetailEdit({
+                    tags: [...state.editTags]
+                });
+            }
+        );
+}
+
+
+/* =========================================================
+   详情内嵌编辑
+========================================================= */
+
+function renderDetailEditTags() {
+
+    const tags =
+        state.editTags;
+
+    $("detailEditTags").innerHTML =
+        tags
+            .map(
+                (tag, index) => `
+
+                    <span class="editing-tag">
+
+                        #${escapeHTML(tag)}
+
+                        <button
+                            data-remove-detail-tag="${index}"
+                        >
+                            ×
+                        </button>
+
+                    </span>
+
+                `
+            )
+            .join("") ||
+            `<span class="detail-value">暂无 Tag</span>`;
+}
+
+
+async function renderDetailTagSuggestions(query = "") {
+
+    const container =
+        $("detailTagSuggestions");
+
+    const allTags = [
+        ...new Set([
+            ...Object.values(RECOMMENDED_TAGS).flat(),
+            ...(await getAllTags())
+        ])
+    ];
+
+    const used =
+        new Set(state.editTags);
+
+    let suggestions =
+        allTags.filter(
+            tag =>
+                !used.has(tag) &&
+                (!query ||
+                    tag.toLowerCase()
+                        .includes(
+                            query.toLowerCase()
+                        ))
+        );
+
+    suggestions =
+        suggestions.slice(0, 20);
+
+    if (!suggestions.length) {
+
+        container.innerHTML = "";
+
+        return;
+    }
+
+    container.innerHTML =
+        `<div class="suggestion-title">已有 Tag</div>` +
+        suggestions
+            .map(tag => `
+
+                <button
+                    class="suggestion-tag"
+                    data-detail-suggest-tag="${escapeHTML(tag)}"
+                >
+                    #${escapeHTML(tag)}
+                </button>
+
+            `)
+            .join("");
+}
+
+
+function addDetailEditTag() {
+
+    const input =
+        $("detailEditTagInput");
+
+    const value = normalizeTag(input.value);
+
+    if (!value) {
+        return;
+    }
+
+    if (
+        !state.editTags.includes(value)
+    ) {
+
+        state.editTags.push(value);
+    }
+
+    input.value = "";
+
+    renderDetailEditTags();
+}
+
+
+async function saveDetailEdit(changes) {
+
+    const id =
+        state.selectedMusic.id;
+
+    const music =
+        await dbGet("music", id);
+
+    if (!music) {
+        return;
+    }
+
+    if (changes.name !== undefined) {
+
+        music.name =
+            changes.name;
+    }
+
+    if (changes.album !== undefined) {
+
+        music.album =
+            changes.album;
+    }
+
+    if (changes.artist !== undefined) {
+
+        music.artist =
+            changes.artist;
+    }
+
+    if (changes.genre !== undefined) {
+
+        music.genre =
+            changes.genre;
+    }
+
+    if (changes.year !== undefined) {
+
+        music.year =
+            changes.year;
+    }
+
+    if (changes.tags !== undefined) {
+
+        music.tags =
+            changes.tags;
+    }
+
+    music.updatedAt =
+        Date.now();
+
+    await dbPut("music", music);
+
+
+    /* 同步播放器 */
+
+    const p = state.player;
+
+    if (
+        p.music &&
+        p.music.id === music.id
+    ) {
+
+        p.music = music;
+
+        renderBarMeta();
+    }
+
+
+    /* 刷新 */
+
+    await updateCounts();
+
+    await renderSidebarTags();
+
+    await render();
+
+    await openDetail(music.id);
+
+    showToast("已保存");
+}
+
+
+/* =========================================================
+   文件定位
+========================================================= */
+
+async function revealInFinder(music) {
+
+    if (!music.path) {
+
+        showToast(
+            "这个音乐没有关联文件路径"
+        );
+
+        return;
+    }
+
+    try {
+
+        const exists =
+            await invoke("file_exists", {
+                path: music.path
+            });
+
+        if (!exists) {
+
+            showToast(
+                "文件不存在，可能已经被移动或删除"
+            );
+
+            return;
+        }
+
+        await __TAURI__.opener.revealItemInDir(
+            music.path
+        );
+
+    } catch (error) {
+
+        console.error(error);
+
+        showToast(
+            "无法在 Finder 中定位"
+        );
+    }
+}
+
+
+/* =========================================================
+   底部播放器
+========================================================= */
+
+function getAudio() {
+
+    const p = state.player;
+
+    if (!p.audio) {
+
+        p.audio = $("barAudio");
+    }
+
+    return p.audio;
+}
+
+
+function showPlayerBar() {
+
+    $("playerBar").classList.remove("hidden");
+
+    document.body.classList.add("has-player");
+}
+
+
+function hidePlayerBar() {
+
+    $("playerBar").classList.add("hidden");
+
+    document.body.classList.remove("has-player");
+}
+
+
+function renderBarMeta() {
+
+    const p = state.player;
+
+    const music = p.music;
+
+    if (!music) {
+
+        $("playerTitle").textContent =
+            "未在播放";
+
+        $("playerMeta").textContent =
+            "—";
+
+        return;
+    }
+
+    if (p.segment) {
+
+        $("playerTitle").textContent =
+            "◈ 片段：";
+
+    } else {
+
+        $("playerTitle").textContent =
+            "";
+    }
+
+    $("playerTitle").textContent +=
+        music.name || "未命名";
+
+    const meta = [];
+
+    if (p.segment) {
+
+        meta.push(
+            formatTime(p.segment.start) +
+            " - " +
+            formatTime(p.segment.end)
+        );
+    }
+
+    if (music.album) {
+        meta.push("专辑：" + music.album);
+    }
+
+    $("playerMeta").textContent =
+        meta.join(" · ") ||
+        (music.duration
+            ? formatTime(music.duration)
+            : "—");
+}
+
+
+function updateBarTime() {
+
+    const a = getAudio();
+
+    const p = state.player;
+
+    const dur =
+        Number.isFinite(a.duration)
+            ? a.duration
+            : 0;
+
+    const cur =
+        Number.isFinite(a.currentTime)
+            ? a.currentTime
+            : 0;
+
+    $("playerTime").textContent =
+        formatTime(cur) +
+        " / " +
+        formatTime(dur || (p.music && p.music.duration) || 0);
+
+    if (!p.seeking) {
+
+        $("playerSeek").value =
+            dur
+                ? Math.round(cur / dur * 1000)
+                : 0;
+    }
+}
+
+
+function updateBarControls() {
+
+    const p = state.player;
+
+    const hasQueue =
+        p.queue.length > 0;
+
+    const prevBtn =
+        $("playerPrevBtn");
+
+    const nextBtn =
+        $("playerNextBtn");
+
+    prevBtn.disabled =
+        !hasQueue ||
+        p.index <= 0;
+
+    nextBtn.disabled =
+        !hasQueue ||
+        p.index >=
+            p.queue.length - 1;
+}
+
+
+function setPlayingUI(playing) {
+
+    state.player.playing =
+        playing;
+
+    $("playerPlayBtn").textContent =
+        playing ? "⏸" : "▶";
+
+    $("playerPlayBtn").title =
+        playing ? "暂停" : "播放";
+}
+
+
+function skipBroken(music) {
+
+    showToast(
+        "文件不存在，已跳过：" +
+        (music && music.name
+            ? music.name
+            : "未知音乐")
+    );
+
+    nextTrack(true);
+}
+
+
+async function loadAndPlay(music, segment = null) {
+
+    const p = state.player;
+
+    const a = getAudio();
+
+    p.loading = true;
+
+    p.music = music;
+
+    p.segment = segment;
+
+    renderBarMeta();
+
+    showPlayerBar();
+
+    try {
+
+        const exists =
+            await invoke("file_exists", {
+                path: music.path
+            });
+
+        if (!exists) {
+
+            p.loading = false;
+
+            skipBroken(music);
+
+            return;
+        }
+
+        const url =
+            convertFileSrc(music.path);
+
+        if (p.currentUrl === url) {
+
+            if (segment) {
+
+                a.currentTime = segment.start;
+
+            } else {
+
+                a.currentTime = 0;
+            }
+
+        } else {
+
+            p.currentUrl = url;
+
+            a.src = url;
+        }
+
+        if (segment) {
+
+            const handleMeta = () => {
+
+                a.removeEventListener(
+                    "loadedmetadata",
+                    handleMeta
+                );
+
+                a.currentTime = segment.start;
+
+                updateBarTime();
+            };
+
+            a.addEventListener(
+                "loadedmetadata",
+                handleMeta
+            );
+        }
+
+        try {
+
+            await a.play();
+
+            setPlayingUI(true);
+
+        } catch (error) {
+
+            /*
+             * 自动播放可能被拦:
+             * 停在"已加载未播放"状态,等用户点 ▶
+             */
+
+            setPlayingUI(false);
+        }
+
+    } catch (error) {
+
+        console.error(error);
+
+        showToast(
+            "文件无法访问，可能已经被移动或删除"
+        );
+
+    } finally {
+
+        p.loading = false;
+    }
+}
+
+
+function onSegmentTimeupdate() {
+
+    const p = state.player;
+
+    const a = getAudio();
+
+    if (
+        !p.segment ||
+        !a.duration
+    ) {
+        return;
+    }
+
+    if (
+        a.currentTime >=
+        p.segment.end
+    ) {
+
+        a.pause();
+        if (p.queueSource === "candidates") {
+            nextTrack(true);
+        } else {
+            setPlayingUI(false);
+            a.currentTime = p.segment.start;
+        }
+    }
+}
+
+
+async function playMusic(id, opts = {}) {
+
+    const p = state.player;
+
+    const music =
+        await dbGet("music", id);
+
+    if (!music) {
+        return;
+    }
+
+    const source =
+        opts.source || "view";
+
+    if (source === "candidates") {
+
+        p.queue =
+            p.candidates.slice();
+
+        p.queueSource =
+            "candidates";
+
+        p.index =
+            p.queue.findIndex(
+                m => m.id === id
+            );
+
+    } else {
+
+        p.queue =
+            visibleQueueMusic.slice();
+
+        p.queueSource = "view";
+
+        p.index =
+            p.queue.findIndex(
+                m => m.id === id
+            );
+
+        if (p.index === -1) {
+
+            /*
+             * 点击的音乐不在当前可见队列
+             * (如详情/候选里点播)
+             * 单独作为一首播放,不绑定队列
+             */
+
+            p.queue = [];
+            p.index = -1;
+        }
+    }
+
+    updateBarControls();
+
+    await loadAndPlay(music);
+}
+
+
+async function playClip(clip, opts = {}) {
+
+    const currentClip = clip?.id
+        ? await dbGet("clips", clip.id)
+        : null;
+    if (currentClip) clip = currentClip;
+
+    const music =
+        await dbGet("music", clip.musicId);
+
+    if (!music) {
+        return;
+    }
+
+    const p = state.player;
+
+    if (opts.source === "candidates") {
+        p.queue = p.candidates.slice();
+        p.queueSource = "candidates";
+        p.index = p.queue.findIndex(item => item.id === clip.id);
+    } else {
+        p.queue = [];
+        p.queueSource = "clip";
+        p.index = -1;
+    }
+
+    p.segment = {
+        start: clip.start,
+        end: clip.end,
+        musicId: clip.musicId,
+        clipId: clip.id
+    };
+
+    updateBarControls();
+
+    await loadAndPlay(music, p.segment);
+}
+
+
+async function togglePlay() {
+
+    const p = state.player;
+
+    const a = getAudio();
+
+    if (!p.music) {
+        return;
+    }
+
+    if (a.paused) {
+
+        try {
+
+            await a.play();
+
+            setPlayingUI(true);
+
+        } catch (error) {
+
+            showToast(
+                "播放被浏览器拦截，请重试"
+            );
+        }
+
+    } else {
+
+        a.pause();
+
+        setPlayingUI(false);
+    }
+}
+
+
+async function nextTrack(auto = false) {
+
+    const p = state.player;
+
+    if (!p.queue.length) {
+        return;
+    }
+
+    const max =
+        p.queue.length - 1;
+
+    if (p.index >= max) {
+
+        if (!auto) {
+
+            showToast("已是最后一首");
+        }
+
+        return;
+    }
+
+    p.index++;
+
+    updateBarControls();
+
+    const item = p.queue[p.index];
+    if (item.kind === "clip") await playClip(item, { source: "candidates" });
+    else await playMusic(item.id, { source: "candidates" });
+}
+
+
+async function prevTrack() {
+
+    const p = state.player;
+
+    if (!p.queue.length) {
+        return;
+    }
+
+    if (p.index <= 0) {
+
+        showToast("已是第一首");
+
+        return;
+    }
+
+    p.index--;
+
+    updateBarControls();
+
+    const item = p.queue[p.index];
+    if (item.kind === "clip") await playClip(item, { source: "candidates" });
+    else await playMusic(item.id, { source: "candidates" });
+}
+
+
+function clearPlayer() {
+
+    const p = state.player;
+
+    const a = getAudio();
+
+    a.pause();
+
+    a.removeAttribute("src");
+
+    a.load();
+
+    p.playing = false;
+
+    p.music = null;
+
+    p.queue = [];
+
+    p.index = -1;
+
+    p.currentUrl = "";
+
+    p.segment = null;
+
+    hidePlayerBar();
+}
+
+
+function pausePlayerKeepPosition() {
+
+    const p = state.player;
+
+    if (!p.music) {
+        return;
+    }
+
+    const a = getAudio();
+
+    if (!a.paused) {
+
+        a.pause();
+
+        setPlayingUI(false);
+    }
+}
+
+
+/* =========================================================
+   队列与视图联动
+========================================================= */
+
+function syncPlayerQueue() {
+
+    const p = state.player;
+
+    if (!p.music) {
+        return;
+    }
+
+    if (p.queueSource !== "view") {
+        return;
+    }
+
+    const idx =
+        visibleQueueMusic.findIndex(
+            m => m.id === p.music.id
+        );
+
+    p.queue =
+        visibleQueueMusic.slice();
+
+    p.index = idx;
+
+    p.viewKey =
+        state.currentView +
+        "|" +
+        state.search;
+
+    updateBarControls();
+}
+
+
+/* =========================================================
+   候选暂存
+========================================================= */
+
+function isCandidate(id) {
+
+    return state.player.candidates
+        .some(c => c.id === id);
+}
+
+
+function isClipCandidate(clipId) {
+
+    return state.player.candidates
+        .some(
+            c =>
+                c.kind === "clip" &&
+                c.id === clipId
+        );
+}
+
+
+async function addCandidate(item) {
+
+    const p = state.player;
+
+    if (
+        isCandidate(item.id) ||
+        isClipCandidate(item.id)
+    ) {
+        return;
+    }
+
+    const entry = { kind: item.kind || "music", id: item.id };
+    p.candidates.push(entry);
+    await invoke("create_candidate", { targetId: entry.id, kind: entry.kind, createdAt: Date.now() });
+
+    renderCandidateBadge();
+
+    renderCandidatePanel();
+
+    render();
+}
+
+
+async function removeCandidate(id) {
+
+    const p = state.player;
+
+    p.candidates =
+        p.candidates.filter(
+            c => c.id !== id
+        );
+
+    await invoke("delete_candidate", { targetId: id });
+
+    renderCandidateBadge();
+
+    renderCandidatePanel();
+
+    render();
+}
+
+async function deleteClip(clipId) {
+    const clip = await dbGet("clips", clipId);
+    if (!clip) return;
+    const yes = await confirm("确定删除这个音乐片段吗？");
+    if (!yes) return;
+    await dbDelete("clips", clipId);
+    await removeCandidate(clipId);
+    if (state.player.segment?.clipId === clipId) clearPlayer();
+    await updateCounts();
+    await render();
+    await renderSidebarTags();
+    if (state.clipsPanelMusic?.id === clip.musicId) await openMusicClipsPanel(clip.musicId);
+    else if (state.selectedMusic) await openDetail(state.selectedMusic.id);
+    showToast("片段已删除");
+}
+
+
+async function toggleClipCandidate(clipId) {
+
+    const clip =
+        await dbGet("clips", clipId);
+
+    if (!clip) {
+        return;
+    }
+
+    const music =
+        await dbGet("music", clip.musicId);
+
+    if (!music) {
+        return;
+    }
+
+    if (isClipCandidate(clipId)) {
+
+        await removeCandidate(clipId);
+
+        showToast("已移出候选");
+
+    } else {
+
+        await addCandidate({ kind: "clip", id: clip.id });
+
+        showToast("已加入候选");
+    }
+
+    if (
+        state.selectedMusic &&
+        state.selectedMusic.id === music.id
+    ) {
+
+        await openDetail(music.id);
+    }
+}
+
+
+async function toggleCandidate(id) {
+
+    const music =
+        await dbGet("music", id);
+
+    if (!music) {
+        return;
+    }
+
+    if (isCandidate(id)) {
+
+        await removeCandidate(id);
+
+        showToast("已移出候选");
+
+    } else {
+
+        await addCandidate({ kind: "music", id: music.id });
+
+        showToast("已加入候选");
+    }
+}
+
+
+function renderCandidateBadge() {
+
+    $("candidateBadge").textContent =
+        state.player.candidates.length;
+}
+
+
+async function renderCandidatePanel() {
+
+    const body =
+        $("candidatePanelBody");
+
+    const count =
+        $("candidatePanelCount");
+
+    const list =
+        state.player.candidates;
+
+    count.textContent =
+        list.length
+            ? "（" + list.length + "）"
+            : "";
+
+    if (!list.length) {
+
+        body.innerHTML = `
+            <div class="candidate-empty">
+                还没有候选<br>
+                试听时点播放条的「＋」加入候选
+            </div>
+        `;
+
+        return;
+    }
+
+    const entries = (await Promise.all(list.map(async c => {
+        if (c.kind === "clip") {
+            const clip = await dbGet("clips", c.id);
+            if (!clip) return null;
+            const music = await dbGet("music", clip.musicId);
+            if (!music) return null;
+            return { ...c, ...clip, musicName: music.name, tags: clip.tags || [] };
+        }
+        const music = await dbGet("music", c.id);
+        return music ? { ...c, ...music, tags: music.tags || [] } : null;
+    }))).filter(Boolean);
+
+    body.innerHTML = entries
+        .map(c => {
+
+            const isClip =
+                c.kind === "clip";
+
+            const meta = isClip
+                ? `片段 · ${escapeHTML(c.musicName || "")} ` +
+                  `${formatTime(c.start)}-${formatTime(c.end)}`
+                : (c.album ? escapeHTML(c.album) : "");
+
+            return `
+
+            <div
+                class="candidate-item ${isClip ? "is-clip" : ""}"
+                data-candidate-id="${c.id}"
+            >
+
+                <div class="candidate-item-header">
+
+                    <div class="candidate-item-name">
+                        ${
+                            isClip ? "◈ " : ""
+                        }${escapeHTML(c.name)}
+                    </div>
+
+                    <div class="candidate-item-time">
+                        ${formatTime(c.duration)}
+                    </div>
+
+                </div>
+
+                <div class="candidate-item-meta">
+                    ${meta || "—"}
+                </div>
+
+                ${(c.tags || []).length ? `<div class="candidate-item-tags">${c.tags.map(tag => `<span class="tag">#${escapeHTML(tag)}</span>`).join("")}</div>` : ""}
+
+                <div class="candidate-item-actions">
+
+                    <button
+                        class="icon-action"
+                        data-action="play-candidate"
+                        data-id="${c.id}"
+                        title="试听"
+                    >
+                        ▶
+                    </button>
+
+                    <button
+                        class="icon-action"
+                        data-action="remove-candidate"
+                        data-id="${c.id}"
+                        title="移出候选"
+                    >
+                        ✕
+                    </button>
+
+                </div>
+
+            </div>
+            `;
+        })
+        .join("");
+}
+
+
+function openCandidatePanel() {
+
+    renderCandidatePanel();
+
+    $("candidatePanel").classList.remove("hidden");
+}
+
+
+function closeCandidatePanel() {
+
+    $("candidatePanel").classList.add("hidden");
+}
+
+
+function initPlayer() {
+
+    const a =
+        getAudio();
+
+    a.addEventListener(
+        "loadedmetadata",
+        () => {
+
+            updateBarTime();
+        }
+    );
+
+    a.addEventListener(
+        "timeupdate",
+        () => {
+
+            if (
+                !state.player.seeking
+            ) {
+
+                updateBarTime();
+
+                onSegmentTimeupdate();
+            }
+        }
+    );
+
+    a.addEventListener(
+        "ended",
+        () => {
+
+            nextTrack(true);
+        }
+    );
+
+    a.addEventListener(
+        "error",
+        () => {
+
+            const p = state.player;
+
+            if (p.music) {
+
+                const broken = p.music;
+
+                p.currentUrl = "";
+
+                skipBroken(broken);
+            }
+        }
+    );
+
+    $("playerPlayBtn").addEventListener(
+        "click",
+        togglePlay
+    );
+
+    $("playerNextBtn").addEventListener(
+        "click",
+        () => nextTrack(false)
+    );
+
+    $("playerPrevBtn").addEventListener(
+        "click",
+        prevTrack
+    );
+
+    $("playerCloseBtn").addEventListener(
+        "click",
+        clearPlayer
+    );
+
+    $("playerTitle").addEventListener(
+        "click",
+        () => {
+
+            const p = state.player;
+
+            if (p.music) {
+
+                openDetail(
+                    p.music.id
+                );
+            }
+        }
+    );
+
+    $("playerAddCandidateBtn").addEventListener(
+        "click",
+        async () => {
+
+            const p = state.player;
+
+            if (p.segment?.clipId) {
+                await toggleClipCandidate(p.segment.clipId);
+            } else if (p.music) {
+                await addCandidate(p.music);
+            }
+        }
+    );
+
+    $("playerCandidatesBtn").addEventListener(
+        "click",
+        () => {
+
+            if (
+                $("candidatePanel").classList
+                    .contains("hidden")
+            ) {
+
+                openCandidatePanel();
+
+            } else {
+
+                closeCandidatePanel();
+            }
+        }
+    );
+
+    $("closeCandidatePanel").addEventListener(
+        "click",
+        closeCandidatePanel
+    );
+
+    $("playerSeek").addEventListener(
+        "input",
+        event => {
+
+            const p = state.player;
+
+            const audio = getAudio();
+
+            p.seeking = true;
+
+            if (audio.duration) {
+
+                audio.currentTime =
+                    event.target.value /
+                    1000 *
+                    audio.duration;
+            }
+
+            updateBarTime();
+        }
+    );
+
+    $("playerSeek").addEventListener(
+        "change",
+        () => {
+
+            state.player.seeking = false;
+        }
+    );
+}
+
+
+/* =========================================================
+   重新授权 / 重新选择文件
+========================================================= */
+
+async function reauthorizeFile(music) {
+
+    try {
+
+        const selected =
+            await __TAURI__.dialog.open({
+                multiple: false,
+                filters: [
+                    {
+                        name: "音频文件",
+                        extensions: [
+                            "mp3",
+                            "wav",
+                            "flac",
+                            "m4a",
+                            "aac",
+                            "ogg",
+                            "opus"
+                        ]
+                    }
+                ]
+            });
+
+        if (!selected) {
+
+            return;
+        }
+
+
+        const path =
+            String(selected);
+
+        const info =
+            await invoke("probe_file", {
+                path
+            });
+
+        if (!info.exists) {
+
+            showToast("选中的文件不存在");
+
+            return;
+        }
+
+
+        music.path = info.path;
+
+        music.fileName = info.fileName;
+
+        music.name = info.name;
+
+        music.fileSize = info.fileSize;
+
+        music.mimeType = info.mimeType;
+
+        try {
+
+            music.duration =
+                await getAudioDuration(
+                    info.path
+                );
+
+        } catch (error) {
+
+            console.log(error);
+        }
+
+        music.updatedAt = Date.now();
+
+
+        await dbPut(
+            "music",
+            music
+        );
+
+
+        showToast("原文件已经重新绑定");
+
+        await openDetail(music.id);
+
+    } catch (error) {
+
+        console.error(error);
+    }
+}
+
+
+/* =========================================================
+   导入弹窗
+========================================================= */
+
+function openImportModal() {
+
+    state.importFiles = [];
+    state.importAlbumSource = "metadata";
+    state.importSelectedAlbum = null;
+    document.querySelector('input[name="albumSource"][value="metadata"]').checked = true;
+    $("confirmImportBtn").textContent = "导入";
+
+    renderSelectedFiles();
+
+    importModal.classList.remove("hidden");
+}
+
+
+function closeImportModal() {
+
+    importModal.classList.add("hidden");
+}
+
+
+/* =========================================================
+   选择文件
+========================================================= */
+
+async function chooseFiles() {
+
+    try {
+
+        const selected =
+            await __TAURI__.dialog.open({
+                multiple: true,
+                filters: [
+                    {
+                        name: "MP3 音乐文件",
+                        extensions: [
+                            "mp3"
+                        ]
+                    }
+                ]
+            });
+
+        if (!selected) {
+
+            return;
+        }
+
+
+        state.importFiles = makeImportItems(
+            await invoke("scan_import_sources", { paths: selected.map(String) })
+        );
+
+
+        renderSelectedFiles();
+
+    } catch (error) {
+
+        console.error(error);
+    }
+}
+
+async function chooseFolders() {
+    try {
+        const selected = await __TAURI__.dialog.open({ multiple: true, directory: true });
+        if (!selected) return;
+        state.importFiles = makeImportItems(
+            await invoke("scan_import_sources", { paths: selected.map(String) })
+        );
+        renderSelectedFiles();
+    } catch (error) {
+        console.error(error);
+        showToast("读取文件夹失败");
+    }
+}
+
+function makeImportItems(infos) {
+    return infos.filter(info => info.exists).map(info => ({
+        path: info.path,
+        name: info.name,
+        fileName: info.fileName,
+        fileSize: info.fileSize,
+        mimeType: info.mimeType,
+        album: state.importAlbumSource === "folder" ? info.folderAlbum : (info.album || ""),
+        metadataAlbum: info.album || "",
+        folderAlbum: info.folderAlbum || "",
+        artist: info.artist || "",
+        genre: info.genre || "",
+        year: info.year || "",
+        channels: info.channels || "",
+        sampleRate: info.sampleRate || 0,
+        bitrate: info.bitrate || 0,
+        duration: info.duration || 0,
+        tags: []
+    }));
+}
+
+
+/* =========================================================
+   拖入
+========================================================= */
+
+async function probePaths(paths) {
+    return makeImportItems(await invoke("scan_import_sources", { paths }));
+}
+
+
+function setupDropZone() {
+
+    const zone = $("dropZone");
+
+    const modalOpen = () =>
+        !importModal.classList.contains("hidden");
+
+    const zoneAdd = () =>
+        zone.classList.add("dragover");
+
+    const zoneRemove = () =>
+        zone.classList.remove("dragover");
+
+
+    const appWindow =
+        __TAURI__.window.getCurrentWindow();
+
+    appWindow.onDragDropEvent(
+        async event => {
+
+            if (!modalOpen()) {
+                return;
+            }
+
+            if (event.type === "over") {
+
+                zoneAdd();
+
+            } else if (
+                event.type === "leave"
+            ) {
+
+                zoneRemove();
+
+            } else if (
+                event.type === "drop"
+            ) {
+
+                zoneRemove();
+
+                state.importFiles =
+                    await probePaths(
+                        event.payload.paths
+                    );
+
+                renderSelectedFiles();
+            }
+        }
+    );
+}
+
+
+/* =========================================================
+   已选择文件
+========================================================= */
+
+async function renderSelectedFiles(focusTagIndex) {
+
+    const container =
+        $("selectedFiles");
+
+    const button =
+        $("confirmImportBtn");
+
+
+    if (!state.importFiles.length) {
+
+        container.innerHTML = "";
+
+        button.disabled = true;
+        button.textContent = "导入";
+
+        return;
+    }
+
+
+    const allTags = [
+        ...new Set([
+            ...Object.values(RECOMMENDED_TAGS).flat(),
+            ...(await getAllTags())
+        ])
+    ];
+
+
+    const groups = new Map();
+    state.importFiles.forEach((item, index) => {
+        const album = item.album || "未归档音乐";
+        if (!groups.has(album)) groups.set(album, []);
+        groups.get(album).push({ item, index });
+    });
+    if (!groups.has(state.importSelectedAlbum)) state.importSelectedAlbum = groups.keys().next().value;
+    const visibleItems = groups.get(state.importSelectedAlbum) || [];
+    const renderTrack = ({ item, index }, order) => {
+        const suggestions = allTags.filter(tag => !(item.tags || []).includes(tag)).slice(0, 10);
+        const genreOptions = ["", "流行", "摇滚", "民谣", "电子", "嘻哈", "爵士", "古典", "轻音乐", "影视原声", "其他"]
+            .map(g => `<option value="${escapeHTML(g)}" ${g === (item.genre || "") ? "selected" : ""}>${g === "" ? "未指定" : escapeHTML(g)}</option>`)
+            .join("");
+        const channelsOptions = ["", "单声道", "立体声", "双声道", "环绕声"]
+            .map(c => `<option value="${escapeHTML(c)}" ${c === (item.channels || "") ? "selected" : ""}>${c === "" ? "未指定" : escapeHTML(c)}</option>`)
+            .join("");
+        return `<article class="import-track" data-file-index="${index}">
+            <div class="import-track-summary"><span class="import-track-number">${String(order + 1).padStart(2, "0")}</span><div class="import-track-main"><strong>${escapeHTML(item.name)}</strong><span>${escapeHTML(item.artist || "未知作者")} · ${item.duration ? formatTime(item.duration) : "时长读取中"}</span></div><span class="import-track-format">${item.sampleRate ? `${(item.sampleRate / 1000).toFixed(1)} kHz` : "MP3"}${item.bitrate ? ` · ${item.bitrate} kbps` : ""}</span></div>
+            <details class="import-edit-details"><summary>编辑曲目资料</summary><div class="selected-file-fields import-edit-fields">
+                <div class="import-basic-fields">
+                    <label>音乐名称<input type="text" data-file-field="name" value="${escapeHTML(item.name)}"></label>
+                    <label>作者<input type="text" data-file-field="artist" value="${escapeHTML(item.artist || "")}" placeholder="可留空"></label>
+                    <label>专辑<input type="text" data-file-field="album" value="${escapeHTML(item.album || "")}" placeholder="可留空"></label>
+                </div>
+                <div class="import-meta-cards">
+                    <div class="import-meta-card">
+                        <div class="import-meta-label">音乐类型</div>
+                        <select data-file-field="genre">${genreOptions}</select>
+                    </div>
+                    <div class="import-meta-card">
+                        <div class="import-meta-label">录制年份</div>
+                        <input type="text" inputmode="numeric" maxlength="10" data-file-field="year" value="${escapeHTML(item.year || "")}" placeholder="如 2024">
+                    </div>
+                    <div class="import-meta-card">
+                        <div class="import-meta-label">音频声道</div>
+                        <select data-file-field="channels">${channelsOptions}</select>
+                    </div>
+                    <div class="import-meta-card">
+                        <div class="import-meta-label">采样速率</div>
+                        <div class="import-meta-input"><input type="number" min="0" step="1000" data-file-field="sampleRate" value="${item.sampleRate || ""}" placeholder="44100"><span class="import-meta-unit">Hz</span></div>
+                    </div>
+                    <div class="import-meta-card">
+                        <div class="import-meta-label">码率</div>
+                        <div class="import-meta-input"><input type="number" min="0" step="16" data-file-field="bitrate" value="${item.bitrate || ""}" placeholder="320"><span class="import-meta-unit">kbps</span></div>
+                    </div>
+                    <div class="import-meta-card is-readonly">
+                        <div class="import-meta-label">文件大小</div>
+                        <div class="import-meta-value">${formatFileSize(item.fileSize)}</div>
+                    </div>
+                </div>
+                <div class="file-tag-area"><div class="tag-editor" data-file-tags>${(item.tags || []).map((tag, tagIndex) => `<span class="editing-tag">#${escapeHTML(tag)}<button data-file-remove-tag="${tagIndex}">×</button></span>`).join("")}</div><div class="tag-input-row"><input type="text" data-file-tag-input placeholder="输入 Tag"><button class="secondary-btn" data-file-add-tag>添加</button></div>${suggestions.length ? `<div class="tag-suggestions"><div class="suggestion-title">已有 Tag</div>${suggestions.map(tag => `<button class="suggestion-tag" data-file-suggest-tag="${escapeHTML(tag)}">#${escapeHTML(tag)}</button>`).join("")}</div>` : ""}</div>
+            </div></details></article>`;
+    };
+
+    // 记录当前展开的「编辑曲目资料」面板，重绘后恢复，避免点 Tag 时被自动收起
+    const openDetails = new Set(
+        [...container.querySelectorAll("details.import-edit-details[open]")]
+            .map(details => details.closest("[data-file-index]")?.dataset.fileIndex)
+            .filter(Boolean)
+    );
+
+    container.innerHTML = `<div class="import-review"><aside class="import-album-list"><div class="import-review-label">本次识别到 ${groups.size} 张专辑 · ${state.importFiles.length} 首音乐</div>${[...groups.entries()].map(([album, items]) => `<button class="import-album-item ${album === state.importSelectedAlbum ? "active" : ""}" data-import-album="${escapeHTML(album)}"><span>${escapeHTML(album)}</span><b>${items.length}</b></button>`).join("")}</aside><section class="import-album-detail"><header><div><span>正在审阅</span><h3>${escapeHTML(state.importSelectedAlbum)}</h3></div><strong>${visibleItems.length} 首</strong></header><div class="import-track-list">${visibleItems.map(renderTrack).join("")}</div></section></div>`;
+    openDetails.forEach(index => {
+        const details = container.querySelector(`[data-file-index="${index}"] details.import-edit-details`);
+        if (details) details.open = true;
+    });
+
+    if (focusTagIndex != null) {
+        focusFileTagInput(focusTagIndex);
+    }
+
+    button.disabled = false;
+    button.textContent = `确认导入 ${state.importFiles.length} 首`;
+}
+
+
+function focusFileTagInput(index) {
+
+    const card =
+        document.querySelector(
+            `[data-file-index="${index}"]`
+        );
+
+    if (!card) {
+        return;
+    }
+
+    const input =
+        card.querySelector(
+            "[data-file-tag-input]"
+        );
+
+    if (input) {
+
+        input.focus();
+    }
+}
+
+
+/* =========================================================
+   获取音频时长
+========================================================= */
+
+function getAudioDuration(path) {
+
+    return new Promise(resolve => {
+
+        const url =
+            convertFileSrc(path);
+
+        const audio =
+            document.createElement("audio");
+
+        audio.preload = "metadata";
+
+        audio.onloadedmetadata = () => {
+
+            const duration =
+                audio.duration;
+
+            resolve(
+                Number.isFinite(duration)
+                    ? duration
+                    : 0
+            );
+        };
+
+
+        audio.onerror = () => {
+
+            resolve(0);
+        };
+
+
+        audio.src = url;
+    });
+}
+
+
+/* =========================================================
+   导入
+========================================================= */
+
+async function importSelectedFiles() {
+
+    if (!state.importFiles.length) {
+        return;
+    }
+
+
+    const button =
+        $("confirmImportBtn");
+
+    button.disabled = true;
+
+    button.textContent =
+        "导入中...";
+
+
+    try {
+
+        for (const item of state.importFiles) {
+
+            const duration = (await getAudioDuration(item.path)) || item.duration || 0;
+
+
+            /*
+             * 音乐本身只保存元数据 + 绝对路径。
+             *
+             * 不把音频 Blob 存在数据库。
+             *
+             * 这样 10 万首音乐时数据库不会巨大。
+             */
+
+            const music = {
+
+                id: createId("music_"),
+
+                name:
+                    item.name,
+
+                fileName:
+                    item.fileName,
+
+                path:
+                    item.path,
+
+                album:
+                    item.album || "",
+
+                artist:
+                    item.artist || "",
+
+                genre:
+                    item.genre || "",
+
+                year:
+                    item.year || "",
+
+                channels:
+                    item.channels || "",
+
+                sampleRate:
+                    item.sampleRate || 0,
+
+                bitrate:
+                    item.bitrate || 0,
+
+                tags:
+                    [...(item.tags || [])],
+
+                duration,
+
+                fileSize:
+                    item.fileSize,
+
+                mimeType:
+                    item.mimeType,
+
+                createdAt:
+                    Date.now(),
+
+                updatedAt:
+                    Date.now()
+            };
+
+
+            await dbAdd(
+                "music",
+                music
+            );
+        }
+
+
+        state.importFiles = [];
+
+        renderSelectedFiles();
+
+        closeImportModal();
+
+        await updateCounts();
+
+        await render();
+
+        await renderSidebarTags();
+
+        showToast(
+            "音乐导入成功"
+        );
+
+    } catch (error) {
+
+        console.error(error);
+
+        showToast(
+            "导入失败：" +
+            error.message
+        );
+
+    } finally {
+
+        button.disabled = false;
+
+        button.textContent =
+            "导入";
+    }
+}
+
+
+/* =========================================================
+   编辑音乐
+========================================================= */
+
+function openEditModal(music) {
+
+    $("editMusicId").value =
+        music.id;
+
+    $("editName").value =
+        music.name || "";
+
+    $("editAlbum").value =
+        music.album || "";
+
+
+    state.editTags =
+        [...(music.tags || [])];
+
+
+    renderEditTags();
+
+
+    editModal.classList.remove(
+        "hidden"
+    );
+}
+
+
+function renderEditTags() {
+
+    $("editTags").innerHTML =
+        state.editTags
+            .map(
+                (tag, index) => `
+
+                    <span class="editing-tag">
+
+                        #${escapeHTML(tag)}
+
+                        <button
+                            data-remove-edit-tag="${index}"
+                        >
+                            ×
+                        </button>
+
+                    </span>
+
+                `
+            )
+            .join("");
+}
+
+
+function addEditTag() {
+
+    const input =
+        $("editTagInput");
+
+    const value = normalizeTag(input.value);
+
+    if (!value) {
+        return;
+    }
+
+
+    if (
+        !state.editTags.includes(value)
+    ) {
+
+        state.editTags.push(value);
+    }
+
+
+    input.value = "";
+
+    renderEditTags();
+}
+
+
+async function saveEdit() {
+
+    const id =
+        $("editMusicId").value;
+
+    const music =
+        await dbGet(
+            "music",
+            id
+        );
+
+    if (!music) {
+        return;
+    }
+
+
+    music.name =
+        $("editName").value.trim()
+        || music.name;
+
+    music.album =
+        $("editAlbum").value.trim();
+
+    music.tags =
+        [...state.editTags];
+
+    music.updatedAt =
+        Date.now();
+
+
+    await dbPut(
+        "music",
+        music
+    );
+
+
+    editModal.classList.add(
+        "hidden"
+    );
+
+
+    await render();
+
+    await renderSidebarTags();
+
+    await updateCounts();
+
+
+    const p = state.player;
+
+    if (
+        p.music &&
+        p.music.id === music.id
+    ) {
+
+        p.music = music;
+
+        renderBarMeta();
+    }
+
+    if (
+        state.selectedMusic &&
+        state.selectedMusic.id === music.id
+    ) {
+
+        await openDetail(music.id);
+    }
+
+
+    showToast(
+        "音乐信息已保存"
+    );
+}
+
+
+/* =========================================================
+   Tag suggestion
+========================================================= */
+
+async function renderClipTagSuggestions() {
+
+    const container =
+        $("clipTagSuggestions");
+
+    const tags = [
+        ...new Set([
+            ...Object.values(RECOMMENDED_TAGS).flat(),
+            ...(await getAllTags())
+        ])
+    ];
+
+
+    container.innerHTML =
+        tags
+            .map(
+                tag => `
+
+                    <button
+                        class="suggestion-tag"
+                        data-suggestion-tag="${escapeHTML(tag)}"
+                    >
+                        #${escapeHTML(tag)}
+                    </button>
+
+                `
+            )
+            .join("");
+}
+
+
+/* =========================================================
+   添加 Clip Tag
+========================================================= */
+
+function addClipTag() {
+
+    const input =
+        $("clipTagInput");
+
+    const value = normalizeTag(input.value);
+
+    if (!value) {
+        return;
+    }
+
+
+    if (
+        !state.clipTags.includes(value)
+    ) {
+
+        state.clipTags.push(value);
+    }
+
+
+    input.value = "";
+
+    renderClipTags();
+}
+
+
+function renderClipTags() {
+
+    $("clipTags").innerHTML =
+        state.clipTags
+            .map(
+                (tag, index) => `
+
+                    <span class="editing-tag">
+
+                        #${escapeHTML(tag)}
+
+                        <button
+                            data-remove-clip-tag="${index}"
+                        >
+                            ×
+                        </button>
+
+                    </span>
+
+                `
+            )
+            .join("");
+}
+
+
+/* =========================================================
+   Clip Modal
+========================================================= */
+
+async function openClipEditor(music, clip = null) {
+
+    pausePlayerKeepPosition();
+
+    const playerAt = state.player.music && state.player.music.id === music.id
+        ? getAudio().currentTime
+        : 0;
+
+    state.clipMusic =
+        music;
+
+    state.editingClip =
+        clip;
+
+    state.clipStart = clip ? clip.start : Math.max(0, playerAt || 0);
+    state.clipEnd = clip ? clip.end : Math.min(
+        music.duration || state.clipStart + 10,
+        state.clipStart + 10
+    );
+
+    state.clipDuration =
+        music.duration || 0;
+
+    state.clipTags =
+        [...(clip?.tags || [])];
+
+
+    $("clipMusicId").value =
+        music.id;
+
+    $("clipEditorMusicName").textContent =
+        music.name;
+
+    $("clipEditorTitle").textContent =
+        clip ? "编辑音乐片段" : "新建音乐片段";
+
+    $("clipName").value =
+        clip?.name || "";
+
+
+    renderClipTags();
+
+    await renderClipTagSuggestions();
+
+
+    /*
+     * 加载原音乐
+     */
+
+    if (!music.path) {
+
+        showToast(
+            "该音乐没有关联文件路径，请重新选择文件"
+        );
+
+        return;
+    }
+
+
+    try {
+
+        const exists =
+            await invoke("file_exists", {
+                path: music.path
+            });
+
+        if (!exists) {
+
+            showToast(
+                "文件不存在，可能已经被移动或删除"
+            );
+
+            return;
+        }
+
+
+        const url =
+            convertFileSrc(music.path);
+
+
+        const audio =
+            $("clipAudio");
+
+
+        audio.src = url;
+
+
+        audio.onloadedmetadata = () => {
+            state.clipDuration = audio.duration;
+            if (!state.editingClip) {
+                state.clipStart = Math.min(state.clipStart, Math.max(0, audio.duration - 0.1));
+                state.clipEnd = Math.min(audio.duration, state.clipStart + 10);
+                if (state.clipEnd <= state.clipStart) state.clipStart = Math.max(0, audio.duration - 0.1);
+            }
+            audio.currentTime = state.clipStart;
+            state.clipInitialState = getClipEditorSnapshot();
+            updateTimeline();
+        };
+
+
+        audio.ontimeupdate =
+            () => {
+                updateClipPlayhead();
+                $("clipCurrentTime").textContent = `${formatTime(audio.currentTime)} / ${formatTime(state.clipDuration)}`;
+
+                if (
+                    state.clipPreviewing &&
+                    audio.currentTime >= state.clipEnd
+                ) {
+                    audio.pause();
+                    audio.currentTime = state.clipStart;
+                    state.clipPreviewing = false;
+                    $("previewClipBtn").textContent =
+                        "▶ 试听选段";
+                }
+            };
+
+
+        clipEditorPanel.classList.remove(
+            "hidden"
+        );
+
+
+        updateTimeline();
+
+    } catch (error) {
+
+        console.error(error);
+
+        showToast(
+            "无法读取原音乐文件"
+        );
+    }
+}
+
+function getClipEditorSnapshot() {
+    return JSON.stringify({
+        start: Number(state.clipStart.toFixed(3)),
+        end: Number(state.clipEnd.toFixed(3)),
+        name: $("clipName").value.trim(),
+        tags: [...state.clipTags]
+    });
+}
+
+function isClipEditorDirty() {
+    return Boolean(state.clipInitialState && state.clipInitialState !== getClipEditorSnapshot());
+}
+
+
+/* =========================================================
+   Timeline
+========================================================= */
+
+function updateClipPlayhead() {
+
+    const playhead = $("timelinePlayhead");
+    const audio = $("clipAudio");
+
+    if (!playhead || !state.clipDuration) {
+        return;
+    }
+
+    playhead.style.left =
+        Math.min(100, Math.max(0,
+            audio.currentTime / state.clipDuration * 100
+        )) + "%";
+}
+
+
+function updateTimeline() {
+
+    const duration =
+        state.clipDuration;
+
+
+    if (!duration) {
+        return;
+    }
+
+
+    const startPercent =
+        state.clipStart /
+        duration *
+        100;
+
+    const endPercent =
+        state.clipEnd /
+        duration *
+        100;
+
+
+    const selection =
+        $("timelineSelection");
+
+
+    selection.style.left =
+        startPercent + "%";
+
+    selection.style.width =
+        (endPercent - startPercent) +
+        "%";
+
+
+    $("clipStartInput").value = formatTime(state.clipStart);
+    $("clipEndInput").value = formatTime(state.clipEnd);
+    $("clipCurrentTime").textContent = `${formatTime($("clipAudio").currentTime)} / ${formatTime(duration)}`;
+}
+
+
+/* =========================================================
+   Timeline 拖动
+========================================================= */
+
+function timelinePositionToTime(
+    event
+) {
+
+    const rect =
+        $("timelineTrack")
+            .getBoundingClientRect();
+
+
+    let x =
+        event.clientX -
+        rect.left;
+
+
+    x =
+        Math.max(
+            0,
+            Math.min(
+                rect.width,
+                x
+            )
+        );
+
+
+    return (
+        x /
+        rect.width *
+        state.clipDuration
+    );
+}
+
+
+function setupTimeline() {
+
+    const track =
+        $("timelineTrack");
+
+    const startHandle =
+        $("startHandle");
+
+    const endHandle =
+        $("endHandle");
+
+
+    startHandle.addEventListener(
+        "mousedown",
+        event => {
+
+            event.preventDefault();
+
+            state.draggingHandle =
+                "start";
+        }
+    );
+
+
+    endHandle.addEventListener(
+        "mousedown",
+        event => {
+
+            event.preventDefault();
+
+            state.draggingHandle =
+                "end";
+        }
+    );
+
+
+    document.addEventListener(
+        "mousemove",
+        event => {
+
+            if (
+                !state.draggingHandle
+            ) {
+                return;
+            }
+
+
+            const time =
+                timelinePositionToTime(
+                    event
+                );
+
+
+            if (
+                state.draggingHandle ===
+                "start"
+            ) {
+
+                state.clipStart =
+                    Math.min(
+                        time,
+                        state.clipEnd - 0.1
+                    );
+
+            } else {
+
+                state.clipEnd =
+                    Math.max(
+                        time,
+                        state.clipStart + 0.1
+                    );
+            }
+
+
+            updateTimeline();
+        }
+    );
+
+
+    document.addEventListener(
+        "mouseup",
+        () => {
+
+            state.draggingHandle =
+                null;
+        }
+    );
+
+
+    /*
+     * 点击时间轴：
+     * 移动播放位置
+     */
+
+    track.addEventListener(
+        "click",
+        event => {
+
+            if (
+                state.draggingHandle
+            ) {
+                return;
+            }
+
+
+            const time =
+                timelinePositionToTime(
+                    event
+                );
+
+
+            $("clipAudio").currentTime =
+                time;
+        }
+    );
+}
+
+
+/* =========================================================
+   当前时间设置开始 / 结束
+========================================================= */
+
+$("setStartBtn")
+    .addEventListener(
+        "click",
+        () => {
+
+            const time =
+                $("clipAudio").currentTime;
+
+            state.clipStart =
+                Math.min(
+                    time,
+                    state.clipEnd - 0.1
+                );
+
+            updateTimeline();
+        }
+    );
+
+function applyClipTimeInput(kind) {
+    const input = $(kind === "start" ? "clipStartInput" : "clipEndInput");
+    const value = parseTime(input.value);
+    if (!Number.isFinite(value) || !state.clipDuration) {
+        updateTimeline();
+        return;
+    }
+    if (kind === "start") state.clipStart = Math.max(0, Math.min(value, state.clipEnd - 0.1));
+    else state.clipEnd = Math.min(state.clipDuration, Math.max(value, state.clipStart + 0.1));
+    updateTimeline();
+}
+
+
+$("setEndBtn")
+    .addEventListener(
+        "click",
+        () => {
+
+            const time =
+                $("clipAudio").currentTime;
+
+            state.clipEnd =
+                Math.max(
+                    time,
+                    state.clipStart + 0.1
+                );
+
+            updateTimeline();
+        }
+    );
+
+
+/* =========================================================
+   保存片段
+========================================================= */
+
+async function previewClipSelection() {
+
+    const audio = $("clipAudio");
+
+    if (!state.clipMusic || !audio.src || !state.clipDuration) {
+        return;
+    }
+
+    if (state.clipPreviewing) {
+        audio.pause();
+        state.clipPreviewing = false;
+        $("previewClipBtn").textContent = "▶ 试听选段";
+        return;
+    }
+
+    audio.currentTime = state.clipStart;
+    state.clipPreviewing = true;
+    $("previewClipBtn").textContent = "Ⅱ 暂停试听";
+
+    try {
+        await audio.play();
+    } catch (error) {
+        state.clipPreviewing = false;
+        $("previewClipBtn").textContent = "▶ 试听选段";
+    }
+}
+
+
+async function closeClipEditor(force = false) {
+
+    if (!force && isClipEditorDirty()) {
+        const discard = await confirm("片段编辑尚未保存，确定放弃这些修改吗？", "放弃片段修改");
+        if (!discard) return false;
+    }
+
+    const audio = $("clipAudio");
+
+    audio.pause();
+    audio.removeAttribute("src");
+    audio.load();
+
+    state.clipMusic = null;
+    state.editingClip = null;
+    state.clipPreviewing = false;
+    state.clipTags = [];
+    state.clipDuration = 0;
+    state.clipInitialState = null;
+    clipEditorPanel.classList.add("hidden");
+    return true;
+}
+
+
+async function saveClip() {
+
+    if (!state.clipMusic || saveClip.isSaving) {
+        return;
+    }
+
+    const musicId = state.clipMusic.id;
+
+
+    if (
+        state.clipEnd <=
+        state.clipStart
+    ) {
+
+        showToast(
+            "片段结束时间必须大于开始时间"
+        );
+
+        return;
+    }
+
+
+    saveClip.isSaving = true;
+    $("saveClipBtn").disabled = true;
+
+    const clip = {
+
+        id:
+            state.editingClip?.id ||
+            createId("clip_"),
+
+        musicId:
+            state.clipMusic.id,
+
+        name:
+            $("clipName").value.trim()
+            || "未命名片段",
+
+        start:
+            state.clipStart,
+
+        end:
+            state.clipEnd,
+
+        tags:
+            [...state.clipTags],
+
+        createdAt:
+            state.editingClip?.createdAt ||
+            Date.now(),
+
+        updatedAt:
+            Date.now()
+    };
+
+
+    try {
+        if (state.editingClip) {
+            await dbPut("clips", clip);
+        } else {
+            await dbAdd("clips", clip);
+        }
+    } catch (error) {
+        console.error(error);
+        showToast("片段保存失败");
+        return;
+    } finally {
+        saveClip.isSaving = false;
+        $("saveClipBtn").disabled = false;
+    }
+
+
+    await closeClipEditor(true);
+
+
+    await updateCounts();
+
+    await render();
+
+    await renderSidebarTags();
+    await renderCandidatePanel();
+
+
+    if (
+        state.selectedMusic &&
+        state.selectedMusic.id ===
+            musicId
+    ) {
+
+        await openDetail(
+            musicId
+        );
+    }
+
+    if (state.clipsPanelMusic && state.clipsPanelMusic.id === musicId) {
+        await openMusicClipsPanel(musicId);
+    }
+
+
+    showToast(
+        "音乐片段已保存"
+    );
+}
+
+
+/* =========================================================
+   删除片段
+========================================================= */
+
+/* =========================================================
+   删除音乐
+========================================================= */
+
+async function deleteMusic(music, id) {
+
+    const yes =
+        await confirm(
+            "确定删除「" +
+            (music && music.name
+                ? music.name
+                : "这首音乐") +
+            "」吗？\n它的片段也会一起删除。"
+        );
+
+    if (!yes) {
+        return;
+    }
+
+    const clipIds = new Set((await getMusicClips(music.id)).map(clip => clip.id));
+
+    await dbDelete(
+        "music",
+        id || music.id
+    );
+
+
+    /* 候选清理 */
+
+    const p = state.player;
+
+    const removedCandidateIds = p.candidates
+        .filter(c => c.id === music.id || (c.kind === "clip" && clipIds.has(c.id)))
+        .map(c => c.id);
+    p.candidates = p.candidates.filter(c => !removedCandidateIds.includes(c.id));
+    await Promise.all(removedCandidateIds.map(targetId => invoke("delete_candidate", { targetId })));
+
+    renderCandidateBadge();
+
+    renderCandidatePanel();
+
+
+    /* 若正在播放这首歌则清播放器 */
+
+    if (
+        p.music &&
+        p.music.id === music.id
+    ) {
+
+        clearPlayer();
+    }
+
+
+    /* 若详情正开着这首歌则关闭 */
+
+    if (
+        state.selectedMusic &&
+        state.selectedMusic.id === music.id
+    ) {
+
+        $("detailPanel")
+            .classList.add("hidden");
+
+        state.selectedMusic = null;
+    }
+
+
+    await updateCounts();
+
+    await renderSidebarTags();
+
+    await render();
+
+
+    showToast(
+        "已删除"
+    );
+}
+
+
+/* =========================================================
+   Tag 视图跳转
+========================================================= */
+
+function goToTagView(tag) {
+
+    closeMusicContextPanels();
+    state.tagResultTab = null;
+
+    state.currentView =
+        "tag:" + tag;
+
+    document
+        .querySelectorAll(
+            ".nav-item"
+        )
+        .forEach(
+            b =>
+                b.classList.remove(
+                    "active"
+                )
+        );
+
+    render();
+}
+
+function closeMusicContextPanels() {
+    $("detailPanel").classList.add("hidden");
+    $("musicClipsPanel").classList.add("hidden");
+    state.selectedMusic = null;
+    state.clipsPanelMusic = null;
+}
+
+
+/* =========================================================
+   事件绑定
+========================================================= */
+
+function setupEvents() {
+
+    const saveTagAction = async () => {
+        const action = state.tagAction;
+        const name = normalizeTag($("tagActionName").value);
+        if (!action) return;
+        if (!name) {
+            showToast(action.type === "create-category" ? "请填写分类名称" : "请填写 Tag 名称");
+            $("tagActionName").focus();
+            return;
+        }
+        try {
+            if (action.type === "create-category") {
+                await invoke("create_tag_category", { name });
+                showToast("分类已创建");
+            } else if (action.type === "create-tag") {
+                await invoke("create_tag", { name, category: action.category });
+                showToast("Tag 已创建");
+            } else if (action.type === "edit-tag") {
+                await invoke("update_tag", { id: action.tag.id, name, category: $("tagActionCategory").value });
+                state.activeTags = state.activeTags.map(value => value === action.tag.name ? name : value);
+                showToast("Tag 已更新");
+            }
+            closeTagAction();
+            await renderSidebarTags();
+            await renderFilterPanel();
+            await render();
+        } catch (error) {
+            showToast(`保存失败：${error}`);
+        }
+    };
+
+    $("closeTagAction").addEventListener("click", closeTagAction);
+    $("cancelTagAction").addEventListener("click", closeTagAction);
+    $("saveTagAction").addEventListener("click", saveTagAction);
+    $("tagActionName").addEventListener("keydown", event => {
+        if (event.key === "Enter") {
+            event.preventDefault();
+            saveTagAction();
+        }
+    });
+
+
+    /* 导入 */
+
+    $("importBtn")
+        .addEventListener(
+            "click",
+            openImportModal
+        );
+
+
+    $("chooseFileBtn")
+        .addEventListener(
+            "click",
+            chooseFiles
+        );
+
+    $("chooseFolderBtn")
+        .addEventListener(
+            "click",
+            chooseFolders
+        );
+
+    document.querySelectorAll('input[name="albumSource"]').forEach(input => {
+        input.addEventListener("change", event => {
+            state.importAlbumSource = event.target.value;
+            state.importFiles.forEach(item => {
+                item.album = state.importAlbumSource === "folder"
+                    ? item.folderAlbum
+                    : item.metadataAlbum;
+            });
+            renderSelectedFiles();
+        });
+    });
+
+
+    $("confirmImportBtn")
+        .addEventListener(
+            "click",
+            importSelectedFiles
+        );
+
+
+    /* 已选文件的逐首属性编辑 */
+
+    const fileList =
+        $("selectedFiles");
+
+    fileList.addEventListener(
+        "input",
+        event => {
+
+            const field =
+                event.target.dataset.fileField;
+
+            if (!field) {
+                return;
+            }
+
+            const card =
+                event.target.closest(
+                    "[data-file-index]"
+                );
+
+            const index =
+                Number(
+                    card.dataset.fileIndex
+                );
+
+            const item =
+                state.importFiles[index];
+
+            if (!item) {
+                return;
+            }
+
+            if (["sampleRate", "bitrate"].includes(field)) {
+                item[field] = Math.max(0, Number(event.target.value) || 0);
+                return;
+            }
+
+            if (["name", "album", "artist", "genre", "year", "channels"].includes(field)) {
+                item[field] = event.target.value.replace(/\s+/g, " ").trim();
+            }
+        }
+    );
+
+
+    fileList.addEventListener(
+        "click",
+        event => {
+
+            const albumButton = event.target.closest("[data-import-album]");
+            if (albumButton) {
+                state.importSelectedAlbum = albumButton.dataset.importAlbum;
+                renderSelectedFiles();
+                return;
+            }
+
+            const addBtn =
+                event.target.closest(
+                    "[data-file-add-tag]"
+                );
+
+            if (addBtn) {
+
+                const card =
+                    addBtn.closest(
+                        "[data-file-index]"
+                    );
+
+                const index =
+                    Number(
+                        card.dataset.fileIndex
+                    );
+
+                const item =
+                    state.importFiles[index];
+
+                const input =
+                    card.querySelector(
+                        "[data-file-tag-input]"
+                    );
+
+                const value = normalizeTag(input.value);
+
+                if (value) {
+
+                    if (
+                        !item.tags.includes(value)
+                    ) {
+
+                        item.tags.push(value);
+                    }
+
+                    input.value = "";
+
+                    renderSelectedFiles(index);
+                }
+
+                return;
+            }
+
+
+            const suggBtn =
+                event.target.closest(
+                    "[data-file-suggest-tag]"
+                );
+
+            if (suggBtn) {
+
+                const card =
+                    suggBtn.closest(
+                        "[data-file-index]"
+                    );
+
+                const index =
+                    Number(
+                        card.dataset.fileIndex
+                    );
+
+                const item =
+                    state.importFiles[index];
+
+                const tag =
+                    suggBtn.dataset.fileSuggestTag;
+
+                if (
+                    !item.tags.includes(tag)
+                ) {
+
+                    item.tags.push(tag);
+                }
+
+                renderSelectedFiles(index);
+
+                return;
+            }
+
+
+            const removeBtn =
+                event.target.closest(
+                    "[data-file-remove-tag]"
+                );
+
+            if (removeBtn) {
+
+                const card =
+                    removeBtn.closest(
+                        "[data-file-index]"
+                    );
+
+                const index =
+                    Number(
+                        card.dataset.fileIndex
+                    );
+
+                const item =
+                    state.importFiles[index];
+
+                const ti =
+                    Number(
+                        removeBtn.dataset.fileRemoveTag
+                    );
+
+                item.tags.splice(ti, 1);
+
+                renderSelectedFiles(index);
+            }
+        }
+    );
+
+
+    fileList.addEventListener(
+        "keydown",
+        event => {
+
+            const input =
+                event.target.closest(
+                    "[data-file-tag-input]"
+                );
+
+            if (
+                !input ||
+                event.key !== "Enter"
+            ) {
+                return;
+            }
+
+            event.preventDefault();
+
+            input
+                .closest(
+                    "[data-file-index]"
+                )
+                .querySelector(
+                    "[data-file-add-tag]"
+                )
+                .click();
+        }
+    );
+
+
+    /* 搜索 */
+
+    $("searchInput")
+        .addEventListener(
+            "input",
+            event => {
+
+                state.search =
+                    event.target.value
+                        .trim();
+
+                render();
+            }
+        );
+
+
+    $("clearSearch")
+        .addEventListener(
+            "click",
+            () => {
+
+                $("searchInput").value =
+                    "";
+
+                state.search = "";
+
+                render();
+            }
+        );
+
+    $("filterToggleBtn").addEventListener("click", () => {
+        const panel = $("filterPanel");
+        panel.classList.toggle("hidden");
+        $("filterToggleBtn").setAttribute("aria-expanded", String(!panel.classList.contains("hidden")));
+        renderFilterPanel();
+    });
+
+    $("recommendedTags").addEventListener("click", event => {
+        if (state.suppressTagClick) {
+            state.suppressTagClick = false;
+            event.preventDefault();
+            return;
+        }
+        const button = event.target.closest("[data-recommended-tag]");
+        if (button) setActiveTag(button.dataset.recommendedTag);
+    });
+
+    $("recommendedTags").addEventListener("click", async event => {
+        const addCategory = event.target.closest("[data-add-category]");
+        if (addCategory) {
+            await openTagAction({ type: "create-category" });
+            return;
+        }
+        const addTag = event.target.closest("[data-category-add]");
+        if (addTag) {
+            await openTagAction({ type: "create-tag", category: addTag.dataset.categoryAdd });
+            return;
+        }
+        const edit = event.target.closest("[data-tag-edit]");
+        if (edit) {
+            const records = await getAllTagRecords();
+            const tag = records.find(item => item.id === Number(edit.dataset.tagEdit));
+            if (!tag) return;
+            await openTagAction({ type: "edit-tag", tag, category: tag.category });
+            return;
+        }
+        const remove = event.target.closest("[data-tag-delete]");
+        if (remove) {
+            const ok = await confirm(`删除 Tag「${remove.dataset.tagName}」吗？它会从所有音乐和片段中移除。`, "删除 Tag");
+            if (!ok) return;
+            await invoke("delete_tag", { id: Number(remove.dataset.tagDelete) });
+            state.activeTags = state.activeTags.filter(value => value !== remove.dataset.tagName);
+            await renderSidebarTags(); await renderFilterPanel(); await render();
+            showToast("Tag 已删除");
+        }
+    });
+
+    const findTagGroupAtPoint = (drag, x, y) => {
+        if (!drag.groupRects) {
+            drag.groupRects = [...document.querySelectorAll(".recommended-tag-group[data-tag-category]")]
+                .map(el => ({ el, category: el.dataset.tagCategory, rect: el.getBoundingClientRect() }));
+        }
+        for (const entry of drag.groupRects) {
+            const { rect } = entry;
+            if (x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom) return entry;
+        }
+        return null;
+    };
+
+    const isPointInsideTagPanel = (x, y) => {
+        const rect = $("recommendedTags").getBoundingClientRect();
+        return x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom;
+    };
+
+    const clearTagPointerDrag = () => {
+        const drag = state.tagPointerDrag;
+        drag?.tagElement?.classList.remove("is-dragging");
+        drag?.ghost?.remove();
+        document.querySelectorAll(".recommended-tag-group.is-drop-target")
+            .forEach(item => item.classList.remove("is-drop-target"));
+        state.draggingTagId = null;
+        state.tagPointerDrag = null;
+    };
+
+    $("recommendedTags").addEventListener("pointerdown", event => {
+        const tag = event.target.closest("[data-tag-id]");
+        if (!tag || !state.tagManagerOpen || event.button !== 0) return;
+        state.tagPointerDrag = {
+            pointerId: event.pointerId,
+            tagId: Number(tag.dataset.tagId),
+            tagName: tag.dataset.tagName,
+            tagElement: tag,
+            startX: event.clientX,
+            startY: event.clientY,
+            moved: false,
+            targetCategory: null,
+            ghost: null
+        };
+        tag.setPointerCapture?.(event.pointerId);
+    });
+
+    $("recommendedTags").addEventListener("pointermove", event => {
+        const drag = state.tagPointerDrag;
+        if (!drag || drag.pointerId !== event.pointerId) return;
+        const distance = Math.hypot(event.clientX - drag.startX, event.clientY - drag.startY);
+        if (!drag.moved && distance < 5) return;
+        if (!drag.moved) {
+            drag.moved = true;
+            state.draggingTagId = drag.tagId;
+            drag.tagElement.classList.add("is-dragging");
+            drag.ghost = document.createElement("div");
+            drag.ghost.className = "tag-drag-ghost";
+            drag.ghost.textContent = `#${drag.tagName}`;
+            document.body.appendChild(drag.ghost);
+        }
+        event.preventDefault();
+        drag.ghost.style.left = `${event.clientX}px`;
+        drag.ghost.style.top = `${event.clientY}px`;
+        const match = findTagGroupAtPoint(drag, event.clientX, event.clientY);
+        if (match) {
+            drag.targetCategory = match.category;
+            drag.targetEl = match.el;
+        } else if (!isPointInsideTagPanel(event.clientX, event.clientY)) {
+            drag.targetCategory = null;
+            drag.targetEl = null;
+        }
+        document.querySelectorAll(".recommended-tag-group.is-drop-target")
+            .forEach(item => item.classList.toggle("is-drop-target", item === drag.targetEl));
+    });
+
+    const finishTagPointerDrag = async event => {
+        const drag = state.tagPointerDrag;
+        if (!drag || drag.pointerId !== event.pointerId) return;
+        const targetCategory = drag.targetCategory;
+        const moved = drag.moved;
+        if (moved) state.suppressTagClick = true;
+        clearTagPointerDrag();
+        if (!moved) return;
+        const records = await getAllTagRecords();
+        const tag = records.find(item => item.id === drag.tagId);
+        if (!tag) return;
+        if (!targetCategory) {
+            showToast("未放入任何分类");
+            return;
+        }
+        if (tag.category === targetCategory) {
+            showToast(`「${tag.name}」已在「${targetCategory}」`);
+            return;
+        }
+        try {
+            await invoke("update_tag", { id: tag.id, name: tag.name, category: targetCategory });
+            await renderFilterPanel();
+            showToast(`已移动到「${targetCategory}」`);
+        } catch (error) {
+            showToast(`移动失败：${error}`);
+        }
+    };
+
+    $("recommendedTags").addEventListener("pointerup", finishTagPointerDrag);
+    $("recommendedTags").addEventListener("pointercancel", event => {
+        if (state.tagPointerDrag?.pointerId === event.pointerId) clearTagPointerDrag();
+    });
+
+    $("activeFilterTags").addEventListener("click", event => {
+        const button = event.target.closest("[data-filter-tag]");
+        if (button) setActiveTag(button.dataset.filterTag);
+    });
+
+    $("clearFiltersBtn").addEventListener("click", () => {
+        state.activeTags = [];
+        state.search = "";
+        $("searchInput").value = "";
+        renderFilterPanel();
+        render();
+    });
+
+    $("manageTagsBtn").addEventListener("click", () => {
+        state.tagManagerOpen = !state.tagManagerOpen;
+        $("manageTagsBtn").textContent = state.tagManagerOpen ? "收起管理" : "管理 Tag";
+        renderFilterPanel();
+    });
+
+    $("createTagBtn").addEventListener("click", async () => {
+        const name = normalizeTag($("newTagName").value);
+        const selectedCategory = $("newTagCategory").value;
+        const category = selectedCategory === "__custom__"
+            ? normalizeTag($("newTagCustomCategory").value)
+            : selectedCategory;
+        if (!name) return;
+        if (!category) { showToast("请填写新分类名称"); return; }
+        try {
+            const records = await getAllTagRecords();
+            const editing = records.find(tag => tag.id === state.editingTagId);
+            if (editing) {
+                await invoke("update_tag", { id: editing.id, name, category });
+                state.activeTags = state.activeTags.map(tag => tag === editing.name ? name : tag);
+            } else {
+                await invoke("create_tag", { name, category });
+            }
+            state.editingTagId = null;
+            await renderSidebarTags();
+            await renderFilterPanel();
+            await render();
+            showToast(editing ? "Tag 已更新" : "Tag 已创建");
+        } catch (error) {
+            showToast(`创建失败：${error}`);
+        }
+    });
+
+    $("newTagCategory").addEventListener("change", event => {
+        $("newTagCustomCategory").classList.toggle("hidden", event.target.value !== "__custom__");
+    });
+
+    $("tagManagerList").addEventListener("click", async event => {
+        const chip = event.target.closest("[data-manage-tag-id]");
+        if (!chip) return;
+        state.editingTagId = Number(chip.dataset.manageTagId);
+        await renderFilterPanel();
+    });
+
+    $("resetTagEditorBtn").addEventListener("click", async () => {
+        state.editingTagId = null;
+        await renderFilterPanel();
+    });
+
+    $("deleteEditingTagBtn").addEventListener("click", async () => {
+        const records = await getAllTagRecords();
+        const editing = records.find(tag => tag.id === state.editingTagId);
+        if (!editing) return;
+        const ok = await confirm(`删除 Tag「${editing.name}」吗？它会从所有音乐和片段中移除。`, "删除 Tag");
+        if (!ok) return;
+        await invoke("delete_tag", { id: editing.id });
+        state.activeTags = state.activeTags.filter(tag => tag !== editing.name);
+        state.editingTagId = null;
+        await renderSidebarTags();
+        await renderFilterPanel();
+        await render();
+        showToast("Tag 已删除");
+    });
+
+    $("selectionToggleBtn").addEventListener("click", () => {
+        state.selectionMode = !state.selectionMode;
+        state.selectedMusicIds.clear();
+        renderSelectionToolbar();
+        render();
+    });
+
+    $("rowPlayToggleBtn").addEventListener("click", () => {
+        state.playOnRowClick = !state.playOnRowClick;
+        const btn = $("rowPlayToggleBtn");
+        btn.textContent = `点击试听：${state.playOnRowClick ? "开" : "关"}`;
+        btn.setAttribute("aria-pressed", String(state.playOnRowClick));
+    });
+
+    $("exitSelectionBtn").addEventListener("click", () => $("selectionToggleBtn").click());
+    $("selectAllVisibleBtn").addEventListener("click", () => {
+        visibleQueueMusic.forEach(music => state.selectedMusicIds.add(music.id));
+        renderSelectionToolbar();
+        render();
+    });
+
+    async function applyBulkTags(add) {
+        const tag = normalizeTag($("bulkTagInput").value);
+        if (!tag || !state.selectedMusicIds.size) return;
+        const selected = [...state.selectedMusicIds];
+        for (const id of selected) {
+            const music = await dbGet("music", id);
+            if (!music) continue;
+            const tags = music.tags || [];
+            music.tags = add ? (tags.includes(tag) ? tags : [...tags, tag]) : tags.filter(item => item !== tag);
+            music.updatedAt = Date.now();
+            await dbPut("music", music);
+        }
+        $("bulkTagInput").value = "";
+        await renderSidebarTags();
+        await render();
+        showToast(add ? "已批量添加 Tag" : "已批量移除 Tag");
+    }
+    $("bulkAddTagBtn").addEventListener("click", () => applyBulkTags(true));
+    $("bulkRemoveTagBtn").addEventListener("click", () => applyBulkTags(false));
+
+
+    /* 视图 */
+
+    document
+        .querySelectorAll(
+            ".view-btn"
+        )
+        .forEach(button => {
+
+            button.addEventListener(
+                "click",
+                () => {
+
+                    document
+                        .querySelectorAll(
+                            ".view-btn"
+                        )
+                        .forEach(
+                            b =>
+                                b.classList
+                                    .remove(
+                                        "active"
+                                    )
+                        );
+
+
+                    button.classList
+                        .add("active");
+
+
+                    state.layout =
+                        button.dataset.layout;
+
+
+                    render();
+                }
+            );
+        });
+
+
+    /* 左侧导航 */
+
+    document
+        .querySelectorAll(
+            ".nav-item"
+        )
+        .forEach(button => {
+
+            button.addEventListener(
+                "click",
+                () => {
+
+                    document
+                        .querySelectorAll(
+                            ".nav-item"
+                        )
+                        .forEach(
+                            b =>
+                                b.classList
+                                    .remove(
+                                        "active"
+                                    )
+                        );
+
+
+                    button.classList
+                        .add("active");
+
+
+                    state.currentView =
+                        button.dataset.view;
+
+                    state.catalogSelection =
+                        null;
+
+                    closeMusicContextPanels();
+
+
+                    render();
+                }
+            );
+        });
+
+
+    /* sidebar tag */
+
+    $("sidebarTags")
+        .addEventListener(
+            "click",
+            event => {
+
+                const button =
+                    event.target.closest(
+                        ".sidebar-tag"
+                    );
+
+                if (!button) {
+                    return;
+                }
+
+                goToTagView(
+                    button.dataset.tag
+                );
+            }
+        );
+
+
+    /* 主列表 */
+
+    $("contentArea")
+        .addEventListener(
+            "click",
+            async event => {
+
+                const tagTab = event.target.closest("[data-tag-result-tab]");
+                if (tagTab) {
+                    state.tagResultTab = tagTab.dataset.tagResultTab;
+                    render();
+                    return;
+                }
+
+                const selection = event.target.closest("[data-select-music]");
+                if (selection) {
+                    event.stopPropagation();
+                    const id = selection.dataset.selectMusic;
+                    if (selection.checked) state.selectedMusicIds.add(id);
+                    else state.selectedMusicIds.delete(id);
+                    renderSelectionToolbar();
+                    return;
+                }
+
+                const clipAction =
+                    event.target.closest(
+                        "[data-clip-action]"
+                    );
+
+                if (clipAction) {
+
+                    event.stopPropagation();
+
+                    const clipId = clipAction.dataset.clipId;
+                    const act = clipAction.dataset.clipAction;
+                    const clipData = await dbGet("clips", clipId);
+
+                    if (!clipData) {
+                        return;
+                    }
+
+                    const parent = await dbGet("music", clipData.musicId);
+
+                    if (!parent) {
+                        return;
+                    }
+
+                    if (act === "play") {
+                        playClip(clipData);
+                        return;
+                    }
+
+                    if (act === "edit") {
+                        openClipEditor(parent, clipData);
+                        return;
+                    }
+
+                    if (act === "candidate") {
+                        toggleClipCandidate(clipId);
+                        return;
+                    }
+
+                    if (act === "delete") {
+                        await deleteClip(clipId);
+                    }
+
+                    return;
+                }
+
+                const clipRow =
+                    event.target.closest(".clip-library-row");
+
+                if (clipRow) {
+                    const clipData = await dbGet(
+                        "clips",
+                        clipRow.dataset.clipId
+                    );
+
+                    if (!clipData) {
+                        return;
+                    }
+
+                    if (state.playOnRowClick) playClip(clipData);
+
+                    return;
+                }
+
+                const action =
+                    event.target.closest(
+                        "[data-action]"
+                    );
+
+
+                if (action) {
+
+                    event.stopPropagation();
+
+                    const act =
+                        action.dataset.action;
+
+                    const id =
+                        action.dataset.id;
+
+
+                    if (
+                        act === "play" ||
+                        act === "clip" ||
+                        act === "edit" ||
+                        act === "candidate"
+                    ) {
+
+                        const music =
+                            await dbGet(
+                                "music",
+                                id
+                            );
+
+                        if (!music) {
+                            return;
+                        }
+
+                        if (act === "play") {
+                            if (state.player.music?.id === id) {
+                                togglePlay();
+                            } else {
+                                playMusic(id);
+                            }
+
+                            return;
+                        }
+
+                        if (act === "clip") {
+
+                            openClipEditor(
+                                music
+                            );
+
+                            return;
+                        }
+
+                        if (act === "edit") {
+
+                            openEditModal(
+                                music
+                            );
+
+                            return;
+                        }
+
+                        if (act === "candidate") {
+
+                            toggleCandidate(id);
+
+                            return;
+                        }
+                    }
+
+
+                    if (
+                        act === "delete"
+                    ) {
+
+                        const music =
+                            await dbGet(
+                                "music",
+                                id
+                            );
+
+                        if (!music) {
+                            return;
+                        }
+
+                        deleteMusic(
+                            music,
+                            id
+                        );
+
+                        return;
+                    }
+
+
+                    if (
+                        act === "info"
+                    ) {
+
+                        openDetail(id);
+
+                        return;
+                    }
+
+
+                    if (
+                        act === "play-candidate" ||
+                        act === "remove-candidate"
+                    ) {
+
+                        if (act === "play-candidate") {
+
+                            const cand =
+                                state.player.candidates
+                                    .find(c => c.id === id);
+
+                            if (
+                                cand &&
+                                cand.kind === "clip"
+                            ) {
+
+                                playClip(cand, { source: "candidates" });
+
+                            } else {
+
+                                playMusic(
+                                    id,
+                                    { source: "candidates" }
+                                );
+                            }
+
+                        } else {
+
+                            removeCandidate(id);
+                        }
+
+                        return;
+                    }
+                }
+
+
+                const pageTag =
+                    event.target.closest(
+                        "[data-page-tag]"
+                    );
+
+
+                if (pageTag) {
+
+                    goToTagView(
+                        pageTag.dataset.pageTag
+                    );
+
+                    return;
+                }
+
+
+                const catalogItem =
+                    event.target.closest(
+                        "[data-catalog-key]"
+                    );
+
+
+                if (catalogItem) {
+
+                    state.catalogSelection =
+                        catalogItem.dataset.catalogKey;
+
+                    render();
+
+                    return;
+                }
+
+
+                const row =
+                    event.target.closest(
+                        "[data-music-id]"
+                    );
+
+
+                if (row) {
+
+                    const rowId =
+                        row.dataset.musicId;
+
+                    if (state.selectionMode) {
+                        state.selectedMusicIds.has(rowId) ? state.selectedMusicIds.delete(rowId) : state.selectedMusicIds.add(rowId);
+                        renderSelectionToolbar();
+                        render();
+                        return;
+                    }
+
+                    if (state.playOnRowClick) playMusic(rowId);
+                    openMusicClipsPanel(rowId);
+                }
+            }
+        );
+
+
+    /* 关闭详情 */
+
+    $("closeDetail")
+        .addEventListener(
+            "click",
+            () => {
+
+                $("detailPanel")
+                    .classList
+                    .add("hidden");
+
+                state.selectedMusic =
+                    null;
+            }
+        );
+
+    $("closeMusicClips").addEventListener("click", () => {
+        $("musicClipsPanel").classList.add("hidden");
+        state.clipsPanelMusic = null;
+    });
+
+    $("musicClipsBody").addEventListener("click", async event => {
+        const create = event.target.closest("[data-clips-panel-action]");
+        if (create && state.clipsPanelMusic) {
+            await openClipEditor(state.clipsPanelMusic);
+            return;
+        }
+        const action = event.target.closest("[data-panel-clip-action]");
+        const row = event.target.closest("[data-panel-clip-id]");
+        const clipId = action?.dataset.panelClipId || row?.dataset.panelClipId;
+        if (!clipId) return;
+        const clip = await dbGet("clips", clipId);
+        if (!clip) return;
+        if (!action) {
+            if (state.playOnRowClick) playClip(clip);
+            return;
+        }
+        event.stopPropagation();
+        const act = action.dataset.panelClipAction;
+        if (act === "play") playClip(clip);
+        if (act === "edit") {
+            const music = await dbGet("music", clip.musicId);
+            if (music) await openClipEditor(music, clip);
+        }
+        if (act === "candidate") await toggleClipCandidate(clip.id);
+        if (act === "delete") await deleteClip(clip.id);
+    });
+
+
+    /* 编辑 Tag */
+
+    $("addEditTagBtn")
+        .addEventListener(
+            "click",
+            addEditTag
+        );
+
+
+    $("editTagInput")
+        .addEventListener(
+            "keydown",
+            event => {
+
+                if (
+                    event.key ===
+                    "Enter"
+                ) {
+
+                    event.preventDefault();
+
+                    addEditTag();
+                }
+            }
+        );
+
+
+    $("editTags")
+        .addEventListener(
+            "click",
+            event => {
+
+                const button =
+                    event.target.closest(
+                        "[data-remove-edit-tag]"
+                    );
+
+                if (!button) {
+                    return;
+                }
+
+
+                const index =
+                    Number(
+                        button.dataset
+                            .removeEditTag
+                    );
+
+
+                state.editTags
+                    .splice(
+                        index,
+                        1
+                    );
+
+
+                renderEditTags();
+            }
+        );
+
+
+    $("saveEditBtn")
+        .addEventListener(
+            "click",
+            saveEdit
+        );
+
+
+    /* Clip Tag */
+
+    $("addClipTagBtn")
+        .addEventListener(
+            "click",
+            addClipTag
+        );
+
+
+    $("clipTagInput")
+        .addEventListener(
+            "keydown",
+            event => {
+
+                if (
+                    event.key ===
+                    "Enter"
+                ) {
+
+                    event.preventDefault();
+
+                    addClipTag();
+                }
+            }
+        );
+
+
+    $("clipTags")
+        .addEventListener(
+            "click",
+            event => {
+
+                const button =
+                    event.target.closest(
+                        "[data-remove-clip-tag]"
+                    );
+
+                if (!button) {
+                    return;
+                }
+
+
+                const index =
+                    Number(
+                        button.dataset
+                            .removeClipTag
+                    );
+
+
+                state.clipTags
+                    .splice(
+                        index,
+                        1
+                    );
+
+
+                renderClipTags();
+            }
+        );
+
+
+    $("clipTagSuggestions")
+        .addEventListener(
+            "click",
+            event => {
+
+                const button =
+                    event.target.closest(
+                        "[data-suggestion-tag]"
+                    );
+
+                if (!button) {
+                    return;
+                }
+
+
+                const tag =
+                    button.dataset
+                        .suggestionTag;
+
+
+                if (
+                    !state.clipTags
+                        .includes(tag)
+                ) {
+
+                    state.clipTags
+                        .push(tag);
+
+                    renderClipTags();
+                }
+            }
+        );
+
+
+    $("saveClipBtn")
+        .addEventListener(
+            "click",
+            saveClip
+        );
+
+    $("previewClipBtn")
+        .addEventListener(
+            "click",
+            previewClipSelection
+        );
+
+    $("closeClipEditor")
+        .addEventListener(
+            "click",
+            closeClipEditor
+        );
+
+    $("cancelClipEditor")
+        .addEventListener(
+            "click",
+            closeClipEditor
+        );
+
+    $("clipStartInput").addEventListener("change", () => applyClipTimeInput("start"));
+    $("clipEndInput").addEventListener("change", () => applyClipTimeInput("end"));
+
+    document.addEventListener("keydown", event => {
+        const isTyping = /INPUT|TEXTAREA|SELECT/.test(document.activeElement?.tagName || "");
+        const editorOpen = !clipEditorPanel.classList.contains("hidden");
+        if (editorOpen && !isTyping) {
+            if (event.key === " ") {
+                event.preventDefault();
+                previewClipSelection();
+            } else if (event.key.toLowerCase() === "i") {
+                event.preventDefault();
+                $("setStartBtn").click();
+            } else if (event.key.toLowerCase() === "o") {
+                event.preventDefault();
+                $("setEndBtn").click();
+            }
+            return;
+        }
+        if (!isTyping && event.key === "/") {
+            event.preventDefault();
+            $("searchInput").focus();
+        } else if (!isTyping && event.key === " " && state.player.music) {
+            event.preventDefault();
+            togglePlay();
+        }
+    });
+
+
+    /* Modal 关闭 */
+
+    document
+        .querySelectorAll(
+            "[data-close-modal]"
+        )
+        .forEach(button => {
+
+            button.addEventListener(
+                "click",
+                () => {
+
+                    importModal
+                        .classList
+                        .add("hidden");
+
+                    editModal
+                        .classList
+                        .add("hidden");
+
+                }
+            );
+        });
+
+
+    /* ESC */
+
+    document.addEventListener(
+        "keydown",
+        async event => {
+
+            if (
+                event.key === "Escape"
+            ) {
+
+                if (!clipEditorPanel.classList.contains("hidden")) {
+                    event.preventDefault();
+                    await closeClipEditor();
+                    return;
+                }
+
+                if (state.selectionMode) {
+                    $("selectionToggleBtn").click();
+                    return;
+                }
+
+                if (state.search || state.activeTags.length) {
+                    state.search = "";
+                    state.activeTags = [];
+                    $("searchInput").value = "";
+                    renderFilterPanel();
+                    render();
+                    return;
+                }
+
+                importModal
+                    .classList
+                    .add("hidden");
+
+                editModal
+                    .classList
+                    .add("hidden");
+
+            }
+        }
+    );
+
+
+    /* Drop */
+
+    setupDropZone();
+
+
+    /* Timeline */
+
+    setupTimeline();
+
+
+    /* Detail 内的片段操作 */
+
+    $("detailContent")
+        .addEventListener(
+            "click",
+            async event => {
+
+                const clipAction =
+                    event.target.closest(
+                        "[data-clip-action]"
+                    );
+
+                if (clipAction) {
+
+                    const clipId =
+                        clipAction.dataset.clipId;
+
+                    const act =
+                        clipAction.dataset.clipAction;
+
+                    const clipData =
+                        await dbGet(
+                            "clips",
+                            clipId
+                        );
+
+                    if (!clipData) {
+                        return;
+                    }
+
+                    if (act === "play") {
+
+                        playClip(clipData);
+
+                        return;
+                    }
+
+                    if (act === "edit") {
+
+                        const music = await dbGet("music", clipData.musicId);
+
+                        if (music) {
+                            await openClipEditor(music, clipData);
+                        }
+
+                        return;
+                    }
+
+                    if (act === "candidate") {
+
+                        toggleClipCandidate(clipId);
+
+                        return;
+                    }
+
+                    if (act === "delete") {
+
+                        await deleteClip(clipId);
+                    }
+
+                    return;
+                }
+
+
+                const clip =
+                    event.target.closest(
+                        ".clip-item"
+                    );
+
+                if (!clip) {
+                    return;
+                }
+
+
+                const clipId =
+                    clip.dataset.clipId;
+
+                const clipData =
+                    await dbGet(
+                        "clips",
+                        clipId
+                    );
+
+
+                if (!clipData) {
+                    return;
+                }
+
+
+                const music =
+                    await dbGet(
+                        "music",
+                        clipData.musicId
+                    );
+
+
+                if (!music) {
+                    return;
+                }
+
+
+                /*
+                 * 打开这个片段，
+                 * 并自动定位到它的时间。
+                 */
+
+                if (state.playOnRowClick) playClip(clipData);
+            }
+        );
+
+
+    /* 候选面板操作 */
+
+    $("candidatePanelBody")
+        .addEventListener(
+            "click",
+            async event => {
+
+                const btn =
+                    event.target.closest(
+                        "[data-action]"
+                    );
+
+                if (!btn) {
+                    return;
+                }
+
+                const act =
+                    btn.dataset.action;
+
+                const id =
+                    btn.dataset.id;
+
+                if (act === "play-candidate") {
+
+                    const cand =
+                        state.player.candidates
+                            .find(c => c.id === id);
+
+                    if (
+                        cand &&
+                        cand.kind === "clip"
+                    ) {
+
+                        playClip(cand, { source: "candidates" });
+
+                    } else {
+
+                        playMusic(
+                            id,
+                            { source: "candidates" }
+                        );
+                    }
+
+                    return;
+                }
+
+                if (act === "remove-candidate") {
+
+                    removeCandidate(id);
+                }
+            }
+        );
+
+
+    /* 播放器 */
+
+    initPlayer();
+}
+
+
+/* =========================================================
+   初始化
+========================================================= */
+
+async function init() {
+
+    try {
+
+        ensureTauri();
+
+        await initDB();
+
+        state.player.candidates = (await invoke("list_candidates"))
+            .map(entry => ({ id: entry.targetId, kind: entry.kind }));
+
+        setupThemeSwitcher();
+        setupEvents();
+
+        renderFilterPanel();
+        renderSelectionToolbar();
+
+        await updateCounts();
+
+        await renderSidebarTags();
+
+        await render();
+
+        console.log(
+            "音乐库初始化完成"
+        );
+
+    } catch (error) {
+
+        console.error(error);
+
+        const message = error instanceof Error
+            ? error.message
+            : String(error ?? "未知错误");
+
+        alert(
+            "音乐库初始化失败：\n" +
+            message
+        );
+    }
+}
+
+
+init();
