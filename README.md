@@ -1,4 +1,4 @@
-# 剪辑音乐库
+# 声场档案
 
 本地音乐素材管理工具 —— 为剪辑师设计,用来管理、检索、标记音乐素材和片段。
 
@@ -25,8 +25,8 @@
 
 ### 安装与打开
 
-1. 双击 `.dmg`,把「剪辑音乐库」拖进「应用程序」(或直接用 `.app`)
-2. 首次打开如果提示 *"剪辑音乐库" 来自身份不明的开发者*,不要用普通双击
+1. 双击 `.dmg`,把「声场档案」拖进「应用程序」(或直接用 `.app`)
+2. 首次打开如果提示 *"声场档案" 来自身份不明的开发者*,不要用普通双击
    - **右键点击图标 → 选择「打开」→ 再点「打开」** 一次
    - 之后就能正常双击打开了
 3. 打开后点击右上角 **「＋ 导入音乐」**,选择或拖入你的音频文件
@@ -117,12 +117,12 @@ cd src-tauri && cargo tauri build --target x86_64-apple-darwin
 
 | 命令 | app / dmg |
 |---|---|
-| `--target aarch64-apple-darwin` | `target/aarch64-apple-darwin/release/bundle/macos/剪辑音乐库.app`<br>`target/aarch64-apple-darwin/release/bundle/dmg/剪辑音乐库_0.1.0_aarch64.dmg` |
-| `--target x86_64-apple-darwin` | `target/x86_64-apple-darwin/release/bundle/macos/剪辑音乐库.app`<br>`target/x86_64-apple-darwin/release/bundle/dmg/剪辑音乐库_0.1.0_x64.dmg` |
+| `--target aarch64-apple-darwin` | `target/aarch64-apple-darwin/release/bundle/macos/声场档案.app`<br>`target/aarch64-apple-darwin/release/bundle/dmg/声场档案_0.1.0_aarch64.dmg` |
+| `--target x86_64-apple-darwin` | `target/x86_64-apple-darwin/release/bundle/macos/声场档案.app`<br>`target/x86_64-apple-darwin/release/bundle/dmg/声场档案_0.1.0_x64.dmg` |
 
 发给朋友时说一句:M 芯片的 Mac 装 `aarch64` 版、老 Intel 的装 `x64` 版。
 
-> 备选:也可以打 Universal Binary(一个 dmg 通吃两种 Mac),`cargo tauri build --target universal-apple-darwin`,产物为 `剪辑音乐库_0.1.0_universal.dmg`,但体积约大一倍。我们默认用上面的分架构方式。
+> 备选:也可以打 Universal Binary(一个 dmg 通吃两种 Mac),`cargo tauri build --target universal-apple-darwin`,产物为 `声场档案_0.1.0_universal.dmg`,但体积约大一倍。我们默认用上面的分架构方式。
 
 把 `.dmg` 或 `.app` 发给朋友即可。未签名应用首次打开需右键 → 打开(见上文);要彻底免提示需 Apple 开发者账号公证($99/年),对少量朋友不必。
 

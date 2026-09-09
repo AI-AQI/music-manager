@@ -1,7 +1,7 @@
 [package]
 name = "music-manager"
 version = "0.1.0"
-description = "剪辑音乐库 - 本地音乐素材管理"
+description = "声场档案 - 本地音乐素材管理"
 authors = ["qi"]
 edition = "2021"
 
