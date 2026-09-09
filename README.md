@@ -35,15 +35,23 @@
 
 > 如果你是剪辑师朋友、完全不碰代码 —— 这部分就够了。
 
-你收到的是一个可双击的应用图标(`.app` 或 `.dmg`),**不需要安装 Node、Rust 或任何命令行工具**。
+你收到的是一个 `.dmg` 安装包，**不需要安装 Node、Rust 或任何开发环境**。当前版本尚未进行 Apple 签名和公证；因此从浏览器下载后，macOS 可能会阻止直接打开。
 
 ### 安装与打开
 
-1. 双击 `.dmg`,把「声场档案」拖进「应用程序」(或直接用 `.app`)
-2. 首次打开如果提示 *"声场档案" 来自身份不明的开发者*,不要用普通双击
-   - **右键点击图标 → 选择「打开」→ 再点「打开」** 一次
-   - 之后就能正常双击打开了
-3. 打开后点击右上角 **「＋ 导入音乐」**,选择或拖入你的音频文件
+1. 双击 `.dmg`，把「声场档案」拖进「应用程序」。
+2. 请按 Mac 芯片选择 DMG：M1/M2/M3/M4 下载文件名含 `aarch64` 的版本；Intel Mac 下载文件名含 `x64` 的版本。若 macOS 显示“已损坏”或阻止打开，请从同一个 GitHub Release 一并下载 `install-macos.sh`，然后在终端运行（DMG 路径按实际下载位置填写）：
+   ```bash
+   bash "$HOME/Downloads/install-macos.sh" "$HOME/Downloads/声场档案_0.1.0_aarch64.dmg"
+   ```
+   脚本会校验 DMG、复制应用并移除**该应用**的下载隔离标记；它会要求输入 Mac 管理员密码。
+   已有旧版本时，在命令末尾加 `--replace`。
+   ```bash
+   bash "$HOME/Downloads/install-macos.sh" "$HOME/Downloads/声场档案_0.1.0_aarch64.dmg" --replace
+   ```
+3. 打开后点击右上角 **「＋ 导入音乐」**,选择或拖入你的音频文件。
+
+> 这是小范围测试的临时安装方式。未签名应用无法保证在所有 macOS 设置下都能无提示安装；正式发布仍需要 Apple Developer ID 签名与公证。
 
 ### 数据存在哪里
 
@@ -138,7 +146,7 @@ cd src-tauri && cargo tauri build --target x86_64-apple-darwin
 
 > 备选:也可以打 Universal Binary(一个 dmg 通吃两种 Mac),`cargo tauri build --target universal-apple-darwin`,产物为 `声场档案_0.1.0_universal.dmg`,但体积约大一倍。我们默认用上面的分架构方式。
 
-把 `.dmg` 或 `.app` 发给朋友即可。未签名应用首次打开需右键 → 打开(见上文);要彻底免提示需 Apple 开发者账号公证($99/年),对少量朋友不必。
+发布 GitHub Release 时，同时上传 `aarch64` 和 `x64` 两个 `.dmg`，以及仓库中的 `scripts/install-macos.sh`。未签名应用从浏览器下载后可能显示“已损坏”；按上方「给使用者的说明」运行安装脚本。要彻底免提示需 Apple 开发者账号签名与公证($99/年)。
 
 ### 常用命令(增删改查)
 

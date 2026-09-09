@@ -1,0 +1,141 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  # 按 CPU 架构分两个原生 runner 构建，避免交叉编译的坑
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Apple Silicon 原生构建 arm64
+          - runner: macos-14
+            target: aarch64-apple-darwin
+            arch: aarch64
+          # Intel 原生构建 x64（macos-13 是最后一个 Intel runner）
+          # 若 macos-13 退役，可改为在 macos-14 上交叉编译：rustup target add x86_64-apple-darwin
+          - runner: macos-13
+            target: x86_64-apple-darwin
+            arch: x64
+
+    runs-on: ${{ matrix.runner }}
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      # CI 里没有 cargo-tauri，需要单独装；版本与本地保持一致，必要时升级
+      - name: Install Tauri CLI
+        run: cargo install tauri-cli --version 2.11.4 --locked
+
+      - name: Build DMG
+        run: cargo tauri build --target ${{ matrix.target }}
+        working-directory: src-tauri
+
+      # 关键一步：把中文名 dmg 重命名成纯 ASCII 名，再上传，避免中文在发布时被“删掉”
+      - name: Rename to ASCII asset name
+        id: rename
+        run: |
+          version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' src-tauri/Cargo.toml | head -n 1)"
+          dmg_dir="src-tauri/target/${{ matrix.target }}/release/bundle/dmg"
+          src_dmg="$(ls "$dmg_dir"/*.dmg | head -n 1)"
+          dst="music-manager_${version}_${{ matrix.arch }}.dmg"
+          cp "$src_dmg" "$dst"
+          echo "asset=${dst}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: music-manager-${{ matrix.arch }}
+          path: ${{ steps.rename.outputs.asset }}
+          if-no-files-found: error
+
+  # 打 tag 时才创建 release；workflow_dispatch 只用来测试构建、不发布
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      # 资产名里的版本号取自 Cargo.toml（不带 v），和 build job 的命名保持一致
+      - name: Read version
+        id: version
+        run: |
+          v="$(sed -n 's/^version = "\([^"]*\)"/\1/p' src-tauri/Cargo.toml | head -n 1)"
+          echo "version=${v}" >> "$GITHUB_OUTPUT"
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          files: |
+            dist/*.dmg
+            scripts/install-macos.sh
+          generate_release_notes: true
+          # 加了 body 后，它会被放在自动生成的 release notes 之前
+          body: |
+            ### 下载文件
+
+            请根据你的 Mac 芯片下载对应的 DMG，并同时下载 `install-macos.sh`：
+
+            | 设备 | 下载文件 |
+            | --- | --- |
+            | M1 / M2 / M3 / M4 等 Apple Silicon Mac | `music-manager_${{ steps.version.outputs.version }}_aarch64.dmg` |
+            | Intel Mac | `music-manager_${{ steps.version.outputs.version }}_x64.dmg` |
+
+            ### 安装
+
+            当前版本尚未进行 Apple 签名与公证。浏览器下载后，如果 macOS 提示“已损坏”或阻止打开，请打开“终端”，运行以下命令。
+
+            Apple Silicon Mac：
+
+            ```sh
+            bash "$HOME/Downloads/install-macos.sh" "$HOME/Downloads/music-manager_${{ steps.version.outputs.version }}_aarch64.dmg"
+            ```
+
+            Intel Mac：
+
+            ```sh
+            bash "$HOME/Downloads/install-macos.sh" "$HOME/Downloads/music-manager_${{ steps.version.outputs.version }}_x64.dmg"
+            ```
+
+            脚本会校验 DMG、将应用复制到“应用程序”文件夹，并移除该应用的下载隔离标记。首次运行会要求输入 Mac 管理员密码。
+
+            已有旧版本时，在命令最后加上 `--replace`：
+
+            ```sh
+            bash "$HOME/Downloads/install-macos.sh" "$HOME/Downloads/music-manager_${{ steps.version.outputs.version }}_aarch64.dmg" --replace
+            ```
+
+            ### 注意
+
+            - 删除音乐或片段只会移除软件中的记录，不会删除原始音频文件。
+            - 当前安装脚本用于小范围测试；正式无提示安装仍需要 Apple Developer ID 签名与公证。
+          # 想先人工确认再发，就打开下面这行：
+          # draft: true
+          # 预发布版本（如 v0.1.0-beta.1）打开下面这行：
+          # prerelease: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
