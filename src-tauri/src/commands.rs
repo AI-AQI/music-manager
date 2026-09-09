@@ -109,6 +109,7 @@ pub struct ProbeResult {
     bitrate: u32,
     duration: f64,
     folder_album: String,
+    cover_art: String,
 }
 
 #[derive(Default)]
@@ -122,6 +123,44 @@ struct Mp3Metadata {
     sample_rate: u32,
     bitrate: u32,
     duration: f64,
+    cover_art: String,
+}
+
+fn base64_encode(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut result = String::with_capacity((bytes.len() + 2) / 3 * 4);
+    for chunk in bytes.chunks(3) {
+        let value = (chunk[0] as u32) << 16 | (chunk.get(1).copied().unwrap_or(0) as u32) << 8 | chunk.get(2).copied().unwrap_or(0) as u32;
+        result.push(TABLE[((value >> 18) & 0x3f) as usize] as char);
+        result.push(TABLE[((value >> 12) & 0x3f) as usize] as char);
+        result.push(if chunk.len() > 1 { TABLE[((value >> 6) & 0x3f) as usize] as char } else { '=' });
+        result.push(if chunk.len() > 2 { TABLE[(value & 0x3f) as usize] as char } else { '=' });
+    }
+    result
+}
+
+fn parse_apic(frame: &[u8]) -> Option<String> {
+    if frame.len() < 4 { return None; }
+    let encoding = frame[0];
+    let mime_end = frame[1..].iter().position(|byte| *byte == 0)? + 1;
+    let mime = std::str::from_utf8(&frame[1..mime_end]).ok()?.to_ascii_lowercase();
+    let image_mime = match mime.as_str() {
+        "image/jpeg" | "image/jpg" => "image/jpeg",
+        "image/png" => "image/png",
+        _ => return None,
+    };
+    let description_start = mime_end + 1;
+    if description_start >= frame.len() { return None; }
+    let image_start = if encoding == 1 || encoding == 2 {
+        (description_start..frame.len().saturating_sub(1)).step_by(2)
+            .find(|index| frame[*index] == 0 && frame[*index + 1] == 0)
+            .map(|index| index + 2)?
+    } else {
+        frame[description_start..].iter().position(|byte| *byte == 0).map(|index| description_start + index + 1)?
+    };
+    let image = frame.get(image_start..)?;
+    if image.is_empty() || image.len() > 2 * 1024 * 1024 { return None; }
+    Some(format!("data:{image_mime};base64,{}", base64_encode(image)))
 }
 
 fn synchsafe(bytes: &[u8]) -> usize {
@@ -169,13 +208,15 @@ fn parse_mp3_metadata(path: &Path, file_size: u64) -> Mp3Metadata {
                     if id.iter().all(|byte| *byte == 0) { break; }
                     let size = if version == 4 { synchsafe(&tag[pos + 4..pos + 8]) } else { u32::from_be_bytes([tag[pos + 4], tag[pos + 5], tag[pos + 6], tag[pos + 7]]) as usize };
                     if size == 0 || pos + 10 + size > tag.len() { break; }
-                    let text = decode_id3_text(&tag[pos + 10..pos + 10 + size]);
+                    let frame = &tag[pos + 10..pos + 10 + size];
+                    let text = decode_id3_text(frame);
                     match id {
                         b"TIT2" => metadata.title = text,
                         b"TPE1" => metadata.artist = text,
                         b"TALB" => metadata.album = text,
                         b"TCON" => metadata.genre = text,
                         b"TDRC" | b"TYER" => metadata.year = text.chars().take(4).collect(),
+                        b"APIC" if metadata.cover_art.is_empty() => metadata.cover_art = parse_apic(frame).unwrap_or_default(),
                         _ => {}
                     }
                     pos += 10 + size;
@@ -242,6 +283,7 @@ fn probe_path(path: String) -> ProbeResult {
         bitrate: mp3.bitrate,
         duration: mp3.duration,
         folder_album,
+        cover_art: mp3.cover_art,
     }
 }
 
@@ -296,6 +338,7 @@ pub struct Music {
     duration: f64,
     file_size: u64,
     mime_type: String,
+    cover_art: String,
     created_at: i64,
     updated_at: i64,
 }
@@ -318,6 +361,7 @@ impl Music {
             duration: row.get("duration")?,
             file_size: row.get("file_size")?,
             mime_type: row.get("mime_type")?,
+            cover_art: row.get("cover_art")?,
             created_at: row.get("created_at")?,
             updated_at: row.get("updated_at")?,
         })
@@ -342,6 +386,7 @@ pub struct MusicInput {
     duration: f64,
     file_size: u64,
     mime_type: String,
+    cover_art: String,
     created_at: i64,
     updated_at: i64,
 }
@@ -355,8 +400,8 @@ pub fn create_music(
     let tx = conn.transaction().map_err(|e| format!("开启事务失败: {e}"))?;
 
     tx.execute(
-        "INSERT INTO music (id, name, file_name, path, album, artist, genre, year, channels, sample_rate, bitrate, duration, file_size, mime_type, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+        "INSERT INTO music (id, name, file_name, path, album, artist, genre, year, channels, sample_rate, bitrate, duration, file_size, mime_type, cover_art, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
         params![
             music.id,
             music.name,
@@ -372,6 +417,7 @@ pub fn create_music(
             music.duration,
             music.file_size,
             music.mime_type,
+            music.cover_art,
             music.created_at,
             music.updated_at,
         ],
@@ -394,7 +440,7 @@ pub fn update_music(
     let tx = conn.transaction().map_err(|e| format!("开启事务失败: {e}"))?;
 
     tx.execute(
-        "UPDATE music SET name=?1, file_name=?2, path=?3, album=?4, artist=?5, genre=?6, year=?7, channels=?8, sample_rate=?9, bitrate=?10, duration=?11, file_size=?12, mime_type=?13, updated_at=?14 WHERE id=?15",
+        "UPDATE music SET name=?1, file_name=?2, path=?3, album=?4, artist=?5, genre=?6, year=?7, channels=?8, sample_rate=?9, bitrate=?10, duration=?11, file_size=?12, mime_type=?13, cover_art=?14, updated_at=?15 WHERE id=?16",
         params![
             music.name,
             music.file_name,
@@ -409,6 +455,7 @@ pub fn update_music(
             music.duration,
             music.file_size,
             music.mime_type,
+            music.cover_art,
             music.updated_at,
             music.id,
         ],
@@ -435,6 +482,18 @@ pub fn delete_music(
     )
     .map_err(|e| format!("删除音乐失败: {e}"))?;
 
+    Ok(())
+}
+
+#[tauri::command]
+pub fn delete_music_batch(state: tauri::State<'_, AppState>, ids: Vec<String>) -> Result<(), String> {
+    let mut conn = lock_db!(state);
+    let tx = conn.transaction().map_err(|e| format!("开启批量删除音乐事务失败: {e}"))?;
+    for id in ids {
+        tx.execute("DELETE FROM music WHERE id=?1", params![id])
+            .map_err(|e| format!("批量删除音乐失败: {e}"))?;
+    }
+    tx.commit().map_err(|e| format!("提交批量删除音乐失败: {e}"))?;
     Ok(())
 }
 
@@ -634,6 +693,18 @@ pub fn delete_clip(
 }
 
 #[tauri::command]
+pub fn delete_clip_batch(state: tauri::State<'_, AppState>, ids: Vec<String>) -> Result<(), String> {
+    let mut conn = lock_db!(state);
+    let tx = conn.transaction().map_err(|e| format!("开启批量删除片段事务失败: {e}"))?;
+    for id in ids {
+        tx.execute("DELETE FROM clips WHERE id=?1", params![id])
+            .map_err(|e| format!("批量删除片段失败: {e}"))?;
+    }
+    tx.commit().map_err(|e| format!("提交批量删除片段失败: {e}"))?;
+    Ok(())
+}
+
+#[tauri::command]
 pub fn get_clip(
     state: tauri::State<'_, AppState>,
     id: String,
@@ -715,7 +786,6 @@ fn validate_tag(name: &str, category: &str) -> Result<(String, String), String> 
     let name = name.trim().to_string();
     let category = category.trim().to_string();
     if name.is_empty() { return Err("Tag 名称不能为空".into()); }
-    if category.is_empty() { return Err("Tag 分类不能为空".into()); }
     Ok((name, category))
 }
 
@@ -747,7 +817,7 @@ pub fn update_tag(state: tauri::State<'_, AppState>, id: i64, name: String, cate
 #[tauri::command]
 pub fn list_tag_categories(state: tauri::State<'_, AppState>) -> Result<Vec<String>, String> {
     let conn = lock_db!(state);
-    let mut stmt = conn.prepare("SELECT name FROM tag_categories ORDER BY name COLLATE NOCASE")
+    let mut stmt = conn.prepare("SELECT name FROM tag_categories WHERE name != '' ORDER BY name COLLATE NOCASE")
         .map_err(|e| format!("准备分类查询失败: {e}"))?;
     let categories = stmt.query_map([], |row| row.get(0))
         .map_err(|e| format!("查询分类失败: {e}"))?
@@ -763,6 +833,54 @@ pub fn create_tag_category(state: tauri::State<'_, AppState>, name: String) -> R
     let conn = lock_db!(state);
     conn.execute("INSERT INTO tag_categories (name, created_at) VALUES (?1, ?2)", params![name, now_ms()])
         .map_err(|e| format!("创建分类失败: {e}"))?;
+    Ok(())
+}
+
+#[tauri::command]
+pub fn update_tag_category(state: tauri::State<'_, AppState>, old_name: String, name: String) -> Result<(), String> {
+    let old_name = old_name.trim();
+    let name = name.trim();
+    if old_name.is_empty() || name.is_empty() { return Err("分类名称不能为空".into()); }
+    if old_name.eq_ignore_ascii_case(name) { return Ok(()); }
+
+    let mut conn = lock_db!(state);
+    let tx = conn.transaction().map_err(|e| format!("开启分类更新事务失败: {e}"))?;
+    let exists: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM tag_categories WHERE name=?1)",
+        params![old_name],
+        |row| row.get(0),
+    ).map_err(|e| format!("读取分类失败: {e}"))?;
+    if !exists { return Err("分类不存在".into()); }
+    tx.execute("INSERT INTO tag_categories (name, created_at) VALUES (?1, ?2)", params![name, now_ms()])
+        .map_err(|e| format!("创建新分类失败: {e}"))?;
+    tx.execute("UPDATE tags SET category=?1 WHERE category=?2", params![name, old_name])
+        .map_err(|e| format!("迁移分类下 Tag 失败: {e}"))?;
+    tx.execute("DELETE FROM tag_categories WHERE name=?1", params![old_name])
+        .map_err(|e| format!("删除旧分类失败: {e}"))?;
+    tx.commit().map_err(|e| format!("保存分类修改失败: {e}"))?;
+    Ok(())
+}
+
+#[tauri::command]
+pub fn delete_tag_category(state: tauri::State<'_, AppState>, name: String) -> Result<(), String> {
+    let name = name.trim();
+    if name.is_empty() { return Err("分类名称不能为空".into()); }
+
+    let mut conn = lock_db!(state);
+    let tx = conn.transaction().map_err(|e| format!("开启分类删除事务失败: {e}"))?;
+    let exists: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM tag_categories WHERE name=?1)",
+        params![name],
+        |row| row.get(0),
+    ).map_err(|e| format!("读取分类失败: {e}"))?;
+    if !exists { return Err("分类不存在".into()); }
+    tx.execute("INSERT OR IGNORE INTO tag_categories (name, created_at) VALUES ('', ?1)", params![now_ms()])
+        .map_err(|e| format!("确保未分类 Tag 失败: {e}"))?;
+    tx.execute("UPDATE tags SET category='' WHERE category=?1", params![name])
+        .map_err(|e| format!("迁移分类下 Tag 失败: {e}"))?;
+    tx.execute("DELETE FROM tag_categories WHERE name=?1", params![name])
+        .map_err(|e| format!("删除分类失败: {e}"))?;
+    tx.commit().map_err(|e| format!("保存分类删除失败: {e}"))?;
     Ok(())
 }
 

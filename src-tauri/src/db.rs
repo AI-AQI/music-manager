@@ -3,7 +3,7 @@ use std::fs;
 use std::path::PathBuf;
 use tauri::Manager;
 
-pub const SCHEMA_VERSION: i32 = 8;
+pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub fn db_path(app: &tauri::App) -> Result<PathBuf, String> {
     let dir = app
@@ -52,6 +52,7 @@ fn migrate(conn: &Connection) -> Result<(), String> {
             duration    REAL DEFAULT 0,
             file_size   INTEGER DEFAULT 0,
             mime_type   TEXT DEFAULT '',
+            cover_art   TEXT DEFAULT '',
             created_at  INTEGER NOT NULL,
             updated_at  INTEGER NOT NULL
         );
@@ -83,6 +84,11 @@ fn migrate(conn: &Connection) -> Result<(), String> {
         );
         CREATE INDEX IF NOT EXISTS idx_candidate_created ON candidate_entries(created_at);
 
+        CREATE TABLE IF NOT EXISTS app_metadata (
+            key         TEXT PRIMARY KEY,
+            value       TEXT NOT NULL
+        );
+
         CREATE TABLE IF NOT EXISTS tag_categories (
             name        TEXT PRIMARY KEY COLLATE NOCASE,
             created_at  INTEGER NOT NULL
@@ -91,7 +97,7 @@ fn migrate(conn: &Connection) -> Result<(), String> {
         CREATE TABLE IF NOT EXISTS tags (
             id          INTEGER PRIMARY KEY AUTOINCREMENT,
             name        TEXT NOT NULL UNIQUE COLLATE NOCASE,
-            category    TEXT NOT NULL DEFAULT '自定义' COLLATE NOCASE REFERENCES tag_categories(name),
+            category    TEXT NOT NULL DEFAULT '' COLLATE NOCASE REFERENCES tag_categories(name),
             created_at  INTEGER NOT NULL
         );
 
@@ -124,84 +130,47 @@ fn migrate(conn: &Connection) -> Result<(), String> {
     )
     .map_err(|e| format!("建表失败: {e}"))?;
 
+    // 尚未发版，开发期仅做一次幂等初始化；不维护内部 schema 版本序列。
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as i64;
+    for category in ["情绪", "节奏", "用途", "人声", "风格", "结构", ""] {
+        conn.execute("INSERT OR IGNORE INTO tag_categories (name, created_at) VALUES (?1, ?2)", params![category, now])
+            .map_err(|e| format!("初始化 Tag 分类失败: {e}"))?;
+    }
+    if has_column(conn, "music", "tags") {
+        migrate_json_tags(conn, "music", "id", "music_tags", "music_id")?;
+        conn.execute("ALTER TABLE music DROP COLUMN tags", [])
+            .map_err(|e| format!("移除旧音乐 Tag 列失败: {e}"))?;
+    }
+    if has_column(conn, "clips", "tags") {
+        migrate_json_tags(conn, "clips", "id", "clip_tags", "clip_id")?;
+        conn.execute("ALTER TABLE clips DROP COLUMN tags", [])
+            .map_err(|e| format!("移除旧片段 Tag 列失败: {e}"))?;
+    }
+    for (column, definition) in [
+        ("artist", "TEXT DEFAULT ''"), ("genre", "TEXT DEFAULT ''"), ("year", "TEXT DEFAULT ''"),
+        ("channels", "TEXT DEFAULT ''"), ("sample_rate", "INTEGER DEFAULT 0"),
+        ("bitrate", "INTEGER DEFAULT 0"), ("cover_art", "TEXT DEFAULT ''"),
+    ] {
+        if !has_column(conn, "music", column) {
+            conn.execute(&format!("ALTER TABLE music ADD COLUMN {column} {definition}"), [])
+                .map_err(|e| format!("补齐音乐属性失败: {e}"))?;
+        }
+    }
+    conn.execute("INSERT OR IGNORE INTO tag_categories (name, created_at) SELECT DISTINCT category, created_at FROM tags", [])
+        .map_err(|e| format!("初始化 Tag 分类失败: {e}"))?;
+    conn.execute("INSERT OR IGNORE INTO tag_categories (name, created_at) VALUES ('', ?1)", params![now])
+        .map_err(|e| format!("初始化未分类 Tag 失败: {e}"))?;
+    conn.execute("UPDATE tags SET category='' WHERE category='自定义'", [])
+        .map_err(|e| format!("迁移自定义 Tag 分类失败: {e}"))?;
+    conn.execute("DELETE FROM tag_categories WHERE name='自定义'", [])
+        .map_err(|e| format!("移除自定义 Tag 分类失败: {e}"))?;
+    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_music_path ON music(path)", [])
+        .map_err(|e| format!("建立音乐路径唯一索引失败: {e}"))?;
     seed_standard_tags(conn)?;
-
-    let version: i32 = conn
-        .pragma_query_value(None, "user_version", |row| row.get(0))
-        .unwrap_or(0);
-
-    if version < 3 {
-        if has_column(conn, "music", "tags") {
-            migrate_json_tags(conn, "music", "id", "music_tags", "music_id")?;
-        }
-        if has_column(conn, "clips", "tags") {
-            migrate_json_tags(conn, "clips", "id", "clip_tags", "clip_id")?;
-        }
-    }
-
-    if version < 4 {
-        if has_column(conn, "music", "tags") {
-            conn.execute("ALTER TABLE music DROP COLUMN tags", [])
-                .map_err(|e| format!("移除旧音乐 Tag 列失败: {e}"))?;
-        }
-        if has_column(conn, "clips", "tags") {
-            conn.execute("ALTER TABLE clips DROP COLUMN tags", [])
-                .map_err(|e| format!("移除旧片段 Tag 列失败: {e}"))?;
-        }
-    }
-
-    if version < 5 {
-        conn.execute("INSERT OR IGNORE INTO tag_categories (name, created_at) SELECT DISTINCT category, created_at FROM tags", [])
-            .map_err(|e| format!("迁移 Tag 分类失败: {e}"))?;
-    }
-
-    if version < 6 {
-        for (column, definition) in [
-            ("artist", "TEXT DEFAULT ''"),
-            ("genre", "TEXT DEFAULT ''"),
-            ("year", "TEXT DEFAULT ''"),
-            ("channels", "TEXT DEFAULT ''"),
-            ("sample_rate", "INTEGER DEFAULT 0"),
-            ("bitrate", "INTEGER DEFAULT 0"),
-        ] {
-            if !has_column(conn, "music", column) {
-                conn.execute(
-                    &format!("ALTER TABLE music ADD COLUMN {column} {definition}"),
-                    [],
-                )
-                .map_err(|e| format!("增加音乐属性失败: {e}"))?;
-            }
-        }
-    }
-
-    if version < 7 {
-        conn.execute("DROP INDEX IF EXISTS idx_music_movie", [])
-            .map_err(|e| format!("删除影片索引失败: {e}"))?;
-        if has_column(conn, "music", "movie") {
-            conn.execute("ALTER TABLE music DROP COLUMN movie", [])
-                .map_err(|e| format!("移除影片列失败: {e}"))?;
-        }
-    }
-
-    if version < 8 {
-        conn.execute(
-            "DELETE FROM music WHERE rowid NOT IN (SELECT MIN(rowid) FROM music GROUP BY path)",
-            [],
-        )
-        .map_err(|e| format!("音乐路径去重失败: {e}"))?;
-        conn.execute("DROP INDEX IF EXISTS idx_music_path", [])
-            .map_err(|e| format!("移除旧路径索引失败: {e}"))?;
-        conn.execute(
-            "CREATE UNIQUE INDEX IF NOT EXISTS idx_music_path ON music(path)",
-            [],
-        )
-        .map_err(|e| format!("建立路径唯一索引失败: {e}"))?;
-    }
-
-    if version < SCHEMA_VERSION {
-        conn.pragma_update(None, "user_version", SCHEMA_VERSION)
-            .map_err(|e| format!("设置 schema 版本失败: {e}"))?;
-    }
+    conn.execute(
+        "INSERT INTO app_metadata (key, value) VALUES ('app_version', ?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        params![APP_VERSION],
+    ).map_err(|e| format!("记录应用版本失败: {e}"))?;
 
     Ok(())
 }
@@ -223,25 +192,23 @@ fn seed_standard_tags(conn: &Connection) -> Result<(), String> {
     }
 
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as i64;
-    for category in ["情绪", "节奏", "用途", "人声", "风格", "乐器", "结构", "自定义"] {
+    for category in ["情绪", "节奏", "用途", "人声", "风格", "结构", ""] {
         conn.execute("INSERT OR IGNORE INTO tag_categories (name, created_at) VALUES (?1, ?2)", params![category, now])
             .map_err(|e| format!("初始化 Tag 分类失败: {e}"))?;
     }
     for name in [
         // 情绪
-        "治愈", "温暖", "激昂", "紧张", "悬疑", "悲伤", "浪漫", "轻松", "欢快", "庄重",
+        "温暖", "治愈", "紧张", "悬疑", "悲伤", "激昂", "庄重",
         // 节奏
-        "舒缓", "慢节奏", "中速", "快节奏", "无鼓点", "强鼓点", "卡点",
+        "舒缓", "中速", "快节奏", "卡点",
         // 用途 / 场景
-        "Vlog", "纪录片", "剧情", "广告", "转场", "片头", "片尾", "旅行", "美食", "婚礼", "科技", "企业宣传", "游戏",
+        "纪录片", "剧情", "预告", "转场", "片头", "片尾",
         // 人声
-        "纯音乐", "人声", "旁白友好", "男声", "女声", "合唱",
+        "纯音乐", "旁白友好", "人声",
         // 风格
-        "流行", "电子", "嘻哈", "摇滚", "爵士", "古典", "民谣", "国风", "Lo-fi", "电影感",
-        // 乐器
-        "钢琴", "吉他", "弦乐", "管弦乐", "鼓点", "贝斯", "合成器",
+        "电影感", "氛围", "史诗", "电子",
         // 剪辑结构
-        "渐强", "高潮", "循环友好", "铺底",
+        "渐强", "高潮", "铺底", "循环友好",
     ] {
         conn.execute("INSERT OR IGNORE INTO tags (name, category, created_at) VALUES (?1, ?2, ?3)", params![name, tag_category(name), now])
             .map_err(|e| format!("初始化预设 Tag 失败: {e}"))?;
@@ -251,14 +218,13 @@ fn seed_standard_tags(conn: &Connection) -> Result<(), String> {
 
 pub(crate) fn tag_category(name: &str) -> &'static str {
     match name {
-        "治愈" | "温暖" | "激昂" | "紧张" | "悬疑" | "悲伤" | "浪漫" | "轻松" | "欢快" | "庄重" => "情绪",
-        "舒缓" | "慢节奏" | "中速" | "快节奏" | "无鼓点" | "强鼓点" | "卡点" => "节奏",
-        "Vlog" | "纪录片" | "剧情" | "广告" | "转场" | "片头" | "片尾" | "旅行" | "美食" | "婚礼" | "科技" | "企业宣传" | "游戏" => "用途",
-        "纯音乐" | "人声" | "旁白友好" | "男声" | "女声" | "合唱" => "人声",
-        "流行" | "电子" | "嘻哈" | "摇滚" | "爵士" | "古典" | "民谣" | "国风" | "Lo-fi" | "电影感" => "风格",
-        "钢琴" | "吉他" | "弦乐" | "管弦乐" | "鼓点" | "贝斯" | "合成器" => "乐器",
+        "温暖" | "治愈" | "紧张" | "悬疑" | "悲伤" | "激昂" | "庄重" => "情绪",
+        "舒缓" | "中速" | "快节奏" | "卡点" => "节奏",
+        "纪录片" | "剧情" | "预告" | "转场" | "片头" | "片尾" => "用途",
+        "纯音乐" | "旁白友好" | "人声" => "人声",
+        "电影感" | "氛围" | "史诗" | "电子" => "风格",
         "渐强" | "高潮" | "循环友好" | "铺底" => "结构",
-        _ => "自定义",
+        _ => "",
     }
 }
 

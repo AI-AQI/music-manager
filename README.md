@@ -95,6 +95,8 @@ cd src-tauri && cargo tauri dev
 
 ### 打包
 
+> **发布新版本前先更新版本号**：在 `src-tauri/Cargo.toml` 中修改 `version`，例如发布 `v0.1.1` 时设为 `version = "0.1.1"`。打包生成的 dmg 会使用这个版本号；GitHub Release 的 Tag 则使用带 `v` 的 `v0.1.1`。
+
 先确保装有两个 Mac 架构的 Rust 目标(仅需执行一次):
 
 ```bash

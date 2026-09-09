@@ -158,6 +158,7 @@
 
             </div>
 
+            <div class="main-scroll-area">
             <section id="filterPanel" class="filter-panel hidden" aria-label="标签筛选">
                 <div class="filter-panel-header">
                     <div>
@@ -188,11 +189,12 @@
             <section id="bulkToolbar" class="bulk-toolbar hidden">
                 <span id="selectionCount">已选择 0 首</span>
                 <button id="selectAllVisibleBtn" class="text-btn">全选当前结果</button>
-                <div class="bulk-tag-controls">
+                <div id="bulkTagControls" class="bulk-tag-controls">
                     <input id="bulkTagInput" type="text" placeholder="输入 Tag">
                     <button id="bulkAddTagBtn" class="secondary-btn">添加 Tag</button>
                     <button id="bulkRemoveTagBtn" class="secondary-btn">移除 Tag</button>
                 </div>
+                <button id="bulkDeleteBtn" class="text-btn danger-btn">删除已选</button>
                 <button id="exitSelectionBtn" class="text-btn">完成</button>
             </section>
 
@@ -216,6 +218,7 @@
             <!-- 内容 -->
             <div id="contentArea" class="content-area">
                 <!-- JS 渲染 -->
+            </div>
             </div>
 
         </main>
@@ -530,54 +533,47 @@
 
             <div class="clip-editor-preview">
                 <audio id="clipAudio"></audio>
-                <button id="previewClipBtn" class="primary-btn">▶ 试听选段</button>
+                <button id="playFullTrackBtn" class="secondary-btn">▶ 从头试听</button>
+                <button id="previewClipBtn" class="primary-btn">▶ 循环试听</button>
                 <span id="clipCurrentTime" class="clip-current-time">00:00 / 00:00</span>
             </div>
 
             <!-- 时间轴 -->
             <div class="timeline-editor">
 
-                <div class="timeline-buttons">
-                    <button id="setStartBtn" class="secondary-btn">
-                        当前时间设为开始
-                    </button>
-
-                    <button id="setEndBtn" class="secondary-btn">
-                        当前时间设为结束
-                    </button>
-                </div>
-
-                <div class="timeline-time">
-                    <label>开始 <input id="clipStartInput" type="text" inputmode="decimal" value="00:00"></label>
-                    <label>结束 <input id="clipEndInput" type="text" inputmode="decimal" value="00:00"></label>
+                <div class="clip-range-summary">
+                    <span><b>IN</b> <input id="clipStartInput" type="text" inputmode="decimal" value="00:00"></span>
+                    <strong id="clipSelectionDuration">选区 00:00</strong>
+                    <span><b>OUT</b> <input id="clipEndInput" type="text" inputmode="decimal" value="00:00"></span>
                 </div>
 
                 <div id="timelineTrack" class="timeline-track">
 
                     <div id="timelinePlayhead" class="timeline-playhead"></div>
 
-                    <div
-                        id="timelineSelection"
-                        class="timeline-selection"
-                    >
-                        <div
-                            id="startHandle"
-                            class="timeline-handle left"
-                        ></div>
-
-                        <div
-                            id="endHandle"
-                            class="timeline-handle right"
-                        ></div>
+                    <div id="timelineSelection" class="timeline-selection">
+                        <div id="startHandle" class="timeline-handle left" aria-label="入点"></div>
+                        <div id="endHandle" class="timeline-handle right" aria-label="出点"></div>
                     </div>
 
                 </div>
 
+                <div class="timeline-buttons">
+                    <button id="setStartBtn" class="secondary-btn" title="快捷键 I">
+                        设入点 <kbd>I</kbd>
+                    </button>
+
+                    <button id="setEndBtn" class="secondary-btn" title="快捷键 O">
+                        设出点 <kbd>O</kbd>
+                    </button>
+                </div>
+                <p class="timeline-help">拖动两端调整范围；点击轨道定位播放头，再用 I / O 标记。</p>
+
             </div>
 
 
-            <label>
-                片段名称
+            <label class="clip-name-field">
+                保存为素材 <span>可修改</span>
                 <input
                     id="clipName"
                     type="text"
@@ -586,8 +582,8 @@
             </label>
 
 
-            <label>
-                Tag
+            <details class="clip-tags-details">
+                <summary>Tag <span>可选</span></summary>
 
                 <div
                     id="clipTags"
@@ -619,7 +615,7 @@
                     <div id="clipTagSuggestions"></div>
                 </div>
 
-            </label>
+            </details>
 
     </div>
 
