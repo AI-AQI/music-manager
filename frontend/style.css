@@ -157,6 +157,91 @@ button {
     padding: 0 18px;
 }
 
+.top-actions .theme-toggle,
+.top-actions .candidate-panel-trigger,
+.top-actions .primary-btn {
+    box-sizing: border-box;
+    height: 40px;
+    min-height: 40px;
+}
+
+.candidate-panel-trigger {
+    position: relative;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 7px;
+    width: 36px;
+    min-height: 36px;
+    padding: 0;
+    color: #fff;
+    background: var(--primary-strong);
+    border-color: var(--primary-strong);
+    font-size: 17px;
+}
+
+.candidate-trigger-count {
+    position: absolute;
+    top: -7px;
+    right: -8px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 18px;
+    height: 18px;
+    padding: 0 5px;
+    border-radius: 999px;
+    background: #fff;
+    color: var(--primary-strong);
+    font-size: 10px;
+    font-weight: 700;
+}
+
+.candidate-panel-trigger:hover {
+    color: #fff;
+    background: var(--primary);
+    border-color: var(--primary);
+}
+
+.top-actions .candidate-panel-trigger {
+    color: #e8e1d5;
+    background: transparent;
+    border-color: #56514a;
+    border-radius: 2px;
+}
+
+.top-actions .candidate-panel-trigger:not(.is-active):hover {
+    color: #fff;
+    background: #292825;
+    border-color: #aaa294;
+}
+
+body[data-theme="sky"] .top-actions .candidate-panel-trigger {
+    color: var(--primary-strong);
+    background: rgba(255,255,255,.7);
+    border-color: var(--border-strong);
+    border-radius: 9px;
+}
+
+body[data-theme="sky"] .top-actions .candidate-panel-trigger:not(.is-active):hover {
+    color: var(--primary-strong);
+    background: var(--primary-light);
+    border-color: var(--primary);
+}
+
+.top-actions .candidate-panel-trigger.is-active,
+body[data-theme="sky"] .top-actions .candidate-panel-trigger.is-active {
+    color: #fff;
+    background: var(--primary);
+    border-color: var(--primary);
+}
+
+body[data-theme="sky"] .top-actions .candidate-panel-trigger.is-active {
+    background: var(--primary-grad);
+    border-color: transparent;
+    box-shadow: 0 10px 24px rgba(62, 130, 164, 0.18);
+}
+
 
 /* =========================
    MAIN
@@ -585,6 +670,35 @@ button {
     padding: 0 26px 36px;
 }
 
+.database-path {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    min-width: 0;
+    width: 100%;
+    flex-shrink: 0;
+    padding: 8px 26px;
+    border: 0;
+    border-top: 1px solid var(--border);
+    background: transparent;
+    color: var(--subtext);
+    cursor: pointer;
+    font-size: 11px;
+    text-align: left;
+}
+
+.database-path span:last-child {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    text-decoration: underline;
+    text-underline-offset: 2px;
+    white-space: nowrap;
+}
+
+.database-path:hover {
+    color: var(--primary-strong);
+}
+
 
 /* =========================
    MUSIC LIST
@@ -914,6 +1028,12 @@ button {
     font-weight: 500;
     color: var(--subtext);
     margin-left: 4px;
+}
+
+.candidate-panel-actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
 }
 
 .detail-content {
@@ -5767,4 +5887,34 @@ body[data-theme="sky"] .import-album-detail h3 { font-family: var(--font-ui); }
     .import-review-label { display: none; }
     .import-album-item { width: auto; min-width: 130px; }
     .import-track-list { max-height: 340px; }
+}
+
+/* 当前播放项：列表、网格和片段库使用同一状态提示。 */
+.music-row.is-playing,
+.music-card.is-playing,
+.clip-library-row.is-playing,
+.clip-item.is-playing {
+    border-color: var(--primary-strong);
+    box-shadow: 0 0 0 2px var(--primary-light);
+}
+
+/* 右侧面板展开后，主列表宽度会收窄；专辑等长文本必须在操作按钮前截断。 */
+.music-row .music-meta {
+    min-width: 0;
+    flex-wrap: nowrap;
+    overflow: hidden;
+}
+
+.music-row .music-meta > span {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.music-row .music-meta > span:first-child {
+    flex: 1 1 auto;
+}
+
+.music-row .music-meta > span:not(:first-child) {
+    flex: 0 1 auto;
 }

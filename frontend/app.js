@@ -61,16 +61,9 @@ let state = {
     }
 };
 
-const RECOMMENDED_TAGS = {
-    "情绪": ["治愈", "温暖", "激昂", "紧张", "悬疑", "悲伤", "浪漫"],
-    "节奏": ["舒缓", "中速", "快节奏"],
-    "用途": ["Vlog", "纪录片", "剧情", "广告", "转场", "片头", "片尾"],
-    "人声": ["纯音乐", "人声", "旁白友好"]
-};
-const TAG_CATEGORIES = ["情绪", "节奏", "用途", "人声", "自定义"];
-
 /* 最近一次内容渲染展示的、可播放、按显示顺序的音乐数组 */
 let visibleQueueMusic = [];
+let databasePath = "";
 
 
 /* =========================================================
@@ -204,6 +197,28 @@ async function initDB() {
     await invoke("init_db");
 }
 
+async function setupDatabasePath() {
+    databasePath = await invoke("get_database_path");
+    $("databasePath").textContent = databasePath;
+    $("databasePathLink").title = `在 Finder 中显示 ${databasePath}`;
+}
+
+async function revealDatabaseFile() {
+    try {
+        if (!databasePath) {
+            await setupDatabasePath();
+        }
+        await __TAURI__.opener.revealItemInDir(databasePath);
+    } catch (error) {
+        console.error(error);
+        await showMessage(
+            `无法在 Finder 中显示数据库文件：${getErrorMessage(error)}`,
+            "无法定位数据库",
+            "error"
+        );
+    }
+}
+
 
 /* =========================================================
    ID
@@ -238,6 +253,30 @@ function escapeHTML(value) {
         .replaceAll(">", "&gt;")
         .replaceAll('"', "&quot;")
         .replaceAll("'", "&#039;");
+}
+
+function getErrorMessage(error) {
+    if (error instanceof Error && error.message) {
+        return error.message;
+    }
+
+    if (typeof error === "string" && error.trim()) {
+        return error;
+    }
+
+    if (error && typeof error === "object") {
+        const message = error.message || error.error || error.details;
+        if (typeof message === "string" && message.trim()) {
+            return message;
+        }
+        try {
+            return JSON.stringify(error);
+        } catch (_) {
+            // 忽略无法序列化的异常对象，返回统一兜底文案。
+        }
+    }
+
+    return "未知错误";
 }
 
 
@@ -357,19 +396,27 @@ async function confirm(message, title = "确认") {
 }
 
 
-function showToast(message) {
+let toastTimer = null;
+
+function showToast(message, duration = 2200) {
 
     const toast = $("toast");
+
+    clearTimeout(toastTimer);
 
     toast.textContent = message;
 
     toast.classList.add("show");
 
-    setTimeout(() => {
+    toastTimer = setTimeout(() => {
 
         toast.classList.remove("show");
 
-    }, 2200);
+    }, duration);
+}
+
+async function showMessage(message, title = "提示", kind = "info") {
+    await __TAURI__.dialog.message(message, { title, kind });
 }
 
 
@@ -458,10 +505,10 @@ async function renderFilterPanel() {
     $("tagManager").classList.add("hidden");
 }
 
-function renderTagManager(records) {
+async function renderTagManager(records) {
     const manager = $("tagManager");
     manager.classList.toggle("hidden", !state.tagManagerOpen);
-    const categories = [...new Set([...TAG_CATEGORIES, ...records.map(tag => tag.category)])];
+    const categories = await invoke("list_tag_categories");
     const options = selected => categories.map(category => `<option value="${escapeHTML(category)}" ${category === selected ? "selected" : ""}>${escapeHTML(category)}</option>`).join("") + `<option value="__custom__">＋ 新建分类…</option>`;
     const editing = records.find(tag => tag.id === state.editingTagId);
     $("newTagName").value = editing?.name || "";
@@ -883,12 +930,15 @@ function renderTagResults(music, clips, tag) {
             <div class="music-main"><div class="music-name">${escapeHTML(item.name)}</div><div class="music-meta"><span>${formatTime(item.duration)}</span>${item.album ? `<span>专辑：${escapeHTML(item.album)}</span>` : ""}</div><div class="music-tags">${(item.tags || []).map(value => `<span class="tag">#${escapeHTML(value)}</span>`).join("")}</div></div>
             <div class="music-actions"><button class="icon-action" data-action="play" data-id="${item.id}" title="试听">▶</button><button class="icon-action info-strong" data-action="info" data-id="${item.id}" title="详情">ⓘ</button></div>
         </div>`).join("");
-    const clipRows = matchingClips.map(({ clip, music: parent }) => `
+    const clipRows = matchingClips.map(({ clip, music: parent }) => {
+        const isCandidate = isClipCandidate(clip.id);
+        return `
         <div class="clip-library-row" data-clip-id="${clip.id}">
             <div class="clip-library-icon">◈</div>
             <div class="clip-library-main"><div class="clip-library-name">${escapeHTML(clip.name || "未命名片段")}</div><div class="clip-library-source-name">${escapeHTML(parent.name)}</div><div class="clip-library-meta"><span>${formatTime(clip.start)} – ${formatTime(clip.end)}</span><span>${formatTime(clip.end - clip.start)}</span>${(clip.tags || []).map(value => `<span class="tag">#${escapeHTML(value)}</span>`).join("")}</div></div>
-            <div class="clip-library-actions"><button class="icon-action" data-clip-action="play" data-clip-id="${clip.id}" title="试听片段">▶</button><button class="icon-action" data-clip-action="edit" data-clip-id="${clip.id}" title="编辑片段">✎</button><button class="icon-action" data-clip-action="candidate" data-clip-id="${clip.id}" title="加入候选">☆</button></div>
-        </div>`).join("");
+            <div class="clip-library-actions"><button class="icon-action" data-clip-action="play" data-clip-id="${clip.id}" title="试听片段">▶</button><button class="icon-action" data-clip-action="edit" data-clip-id="${clip.id}" title="编辑片段">✎</button><button class="icon-action ${isCandidate ? "is-candidate" : ""}" data-clip-action="candidate" data-clip-id="${clip.id}" title="${isCandidate ? "移出候选" : "加入候选"}">${isCandidate ? "★" : "☆"}</button></div>
+        </div>`;
+    }).join("");
 
     $("contentArea").innerHTML = `
         <div class="tag-result-groups">
@@ -1309,9 +1359,6 @@ function renderClipLibrary(music, clips) {
 
     $("resultInfo").textContent = `${visibleClips.length} 个片段`;
 
-    const candidateIds =
-        new Set(state.player.candidates.map(item => item.id));
-
     $("contentArea").innerHTML = `
         <div class="clip-library">
             ${visibleClips.map(({ clip, music: parent }) => `
@@ -1335,7 +1382,7 @@ function renderClipLibrary(music, clips) {
                     <div class="clip-library-actions">
                         <button class="icon-action" data-clip-action="play" data-clip-id="${clip.id}" title="试听片段">▶</button>
                         <button class="icon-action" data-clip-action="edit" data-clip-id="${clip.id}" title="编辑片段">✎</button>
-                        <button class="icon-action ${candidateIds.has(clip.id) ? "is-candidate" : ""}" data-clip-action="candidate" data-clip-id="${clip.id}" title="${candidateIds.has(clip.id) ? "移出候选" : "加入候选"}">${candidateIds.has(clip.id) ? "★" : "☆"}</button>
+                        <button class="icon-action ${isClipCandidate(clip.id) ? "is-candidate" : ""}" data-clip-action="candidate" data-clip-id="${clip.id}" title="${isClipCandidate(clip.id) ? "移出候选" : "加入候选"}">${isClipCandidate(clip.id) ? "★" : "☆"}</button>
                         <button class="icon-action" data-clip-action="delete" data-clip-id="${clip.id}" title="删除片段">🗑</button>
                     </div>
                 </div>
@@ -2283,12 +2330,7 @@ async function renderDetailTagSuggestions(query = "") {
     const container =
         $("detailTagSuggestions");
 
-    const allTags = [
-        ...new Set([
-            ...Object.values(RECOMMENDED_TAGS).flat(),
-            ...(await getAllTags())
-        ])
-    ];
+    const allTags = await getAllTags();
 
     const used =
         new Set(state.editTags);
@@ -2636,6 +2678,38 @@ function setPlayingUI(playing) {
 
     $("playerPlayBtn").title =
         playing ? "暂停" : "播放";
+
+    syncPlaybackIndicators();
+}
+
+function syncPlaybackIndicators() {
+    const p = state.player;
+    const activeMusicId = !p.segment && p.playing ? p.music?.id : null;
+    const activeClipId = p.segment && p.playing ? p.segment.clipId : null;
+
+    document.querySelectorAll('[data-action="play"][data-id]').forEach(button => {
+        const isPlaying = button.dataset.id === activeMusicId;
+        button.classList.toggle("is-playing", isPlaying);
+        button.textContent = isPlaying ? "Ⅱ" : "▶";
+        button.title = isPlaying ? "暂停试听" : "试听";
+    });
+
+    document.querySelectorAll('[data-clip-action="play"], [data-panel-clip-action="play"]').forEach(button => {
+        const clipId = button.dataset.clipId || button.dataset.panelClipId;
+        const isPlaying = clipId === activeClipId;
+        button.classList.toggle("is-playing", isPlaying);
+        button.textContent = isPlaying ? "Ⅱ" : "▶";
+        button.title = isPlaying ? "暂停试听" : "试听片段";
+    });
+
+    document.querySelectorAll(".music-row, .music-card").forEach(row => {
+        row.classList.toggle("is-playing", row.dataset.musicId === activeMusicId);
+    });
+
+    document.querySelectorAll(".clip-library-row, .clip-item").forEach(row => {
+        const clipId = row.dataset.clipId || row.dataset.panelClipId;
+        row.classList.toggle("is-playing", clipId === activeClipId);
+    });
 }
 
 
@@ -2997,6 +3071,7 @@ function clearPlayer() {
     p.segment = null;
 
     hidePlayerBar();
+    syncPlaybackIndicators();
 }
 
 
@@ -3005,6 +3080,7 @@ function pausePlayerKeepPosition() {
     const p = state.player;
 
     if (!p.music) {
+        syncPlaybackIndicators();
         return;
     }
 
@@ -3028,10 +3104,12 @@ function syncPlayerQueue() {
     const p = state.player;
 
     if (!p.music) {
+        syncPlaybackIndicators();
         return;
     }
 
     if (p.queueSource !== "view") {
+        syncPlaybackIndicators();
         return;
     }
 
@@ -3051,6 +3129,7 @@ function syncPlayerQueue() {
         state.search;
 
     updateBarControls();
+    syncPlaybackIndicators();
 }
 
 
@@ -3075,6 +3154,23 @@ function isClipCandidate(clipId) {
         );
 }
 
+function syncCandidateIndicators() {
+    document.querySelectorAll('[data-action="candidate"][data-id]').forEach(button => {
+        const selected = isCandidate(button.dataset.id);
+        button.classList.toggle("is-candidate", selected);
+        button.textContent = selected ? "★" : "☆";
+        button.title = selected ? "移出候选" : "加入候选";
+    });
+
+    document.querySelectorAll('[data-clip-action="candidate"], [data-panel-clip-action="candidate"]').forEach(button => {
+        const clipId = button.dataset.clipId || button.dataset.panelClipId;
+        const selected = isClipCandidate(clipId);
+        button.classList.toggle("is-candidate", selected);
+        button.textContent = selected ? "★" : "☆";
+        button.title = selected ? "移出候选" : "加入候选";
+    });
+}
+
 
 async function addCandidate(item) {
 
@@ -3091,6 +3187,7 @@ async function addCandidate(item) {
     p.candidates.push(entry);
     await invoke("create_candidate", { targetId: entry.id, kind: entry.kind, createdAt: Date.now() });
 
+    syncCandidateIndicators();
     renderCandidateBadge();
 
     renderCandidatePanel();
@@ -3110,6 +3207,7 @@ async function removeCandidate(id) {
 
     await invoke("delete_candidate", { targetId: id });
 
+    syncCandidateIndicators();
     renderCandidateBadge();
 
     renderCandidatePanel();
@@ -3199,8 +3297,34 @@ async function toggleCandidate(id) {
 
 function renderCandidateBadge() {
 
-    $("candidateBadge").textContent =
-        state.player.candidates.length;
+    const count = state.player.candidates.length;
+    $("candidateBadge").textContent = count;
+    $("candidateNavCount").textContent = count;
+}
+
+async function clearCandidates() {
+    if (!state.player.candidates.length) {
+        return;
+    }
+
+    const confirmed = await confirm("确定清空全部候选吗？此操作不会删除音乐或片段。", "清空候选");
+    if (!confirmed) {
+        return;
+    }
+
+    await invoke("clear_candidates");
+    state.player.candidates = [];
+    if (state.player.queueSource === "candidates") {
+        state.player.queue = [];
+        state.player.index = -1;
+        state.player.queueSource = "view";
+        updateBarControls();
+    }
+    syncCandidateIndicators();
+    renderCandidateBadge();
+    await renderCandidatePanel();
+    await render();
+    showToast("候选清单已清空");
 }
 
 
@@ -3219,6 +3343,8 @@ async function renderCandidatePanel() {
         list.length
             ? "（" + list.length + "）"
             : "";
+
+    $("clearCandidatesBtn").disabled = !list.length;
 
     if (!list.length) {
 
@@ -3316,12 +3442,16 @@ function openCandidatePanel() {
     renderCandidatePanel();
 
     $("candidatePanel").classList.remove("hidden");
+    $("openCandidatePanelBtn").classList.add("is-active");
+    $("openCandidatePanelBtn").setAttribute("aria-expanded", "true");
 }
 
 
 function closeCandidatePanel() {
 
     $("candidatePanel").classList.add("hidden");
+    $("openCandidatePanelBtn").classList.remove("is-active");
+    $("openCandidatePanelBtn").setAttribute("aria-expanded", "false");
 }
 
 
@@ -3445,9 +3575,25 @@ function initPlayer() {
         }
     );
 
+    $("openCandidatePanelBtn").addEventListener(
+        "click",
+        () => {
+            if ($("candidatePanel").classList.contains("hidden")) {
+                openCandidatePanel();
+            } else {
+                closeCandidatePanel();
+            }
+        }
+    );
+
     $("closeCandidatePanel").addEventListener(
         "click",
         closeCandidatePanel
+    );
+
+    $("clearCandidatesBtn").addEventListener(
+        "click",
+        clearCandidates
     );
 
     $("playerSeek").addEventListener(
@@ -3624,9 +3770,7 @@ async function chooseFiles() {
         }
 
 
-        state.importFiles = makeImportItems(
-            await invoke("scan_import_sources", { paths: selected.map(String) })
-        );
+        state.importFiles = await getNewImportItems(selected.map(String));
 
 
         renderSelectedFiles();
@@ -3641,9 +3785,7 @@ async function chooseFolders() {
     try {
         const selected = await __TAURI__.dialog.open({ multiple: true, directory: true });
         if (!selected) return;
-        state.importFiles = makeImportItems(
-            await invoke("scan_import_sources", { paths: selected.map(String) })
-        );
+        state.importFiles = await getNewImportItems(selected.map(String));
         renderSelectedFiles();
     } catch (error) {
         console.error(error);
@@ -3672,13 +3814,37 @@ function makeImportItems(infos) {
     }));
 }
 
+async function getNewImportItems(paths) {
+    const infos = await invoke("scan_import_sources", { paths });
+    const existingPaths = new Set(
+        await invoke("find_existing_music_paths", {
+            paths: infos.map(info => info.path)
+        })
+    );
+    const skippedPaths = infos
+        .filter(info => existingPaths.has(info.path))
+        .map(info => info.path);
+
+    if (skippedPaths.length) {
+        await showMessage(
+            `以下 ${skippedPaths.length} 首音乐已在音乐库中，已自动跳过：\n\n${skippedPaths.join("\n")}`,
+            "已跳过重复音乐",
+            "warning"
+        );
+    }
+
+    return makeImportItems(
+        infos.filter(info => !existingPaths.has(info.path))
+    );
+}
+
 
 /* =========================================================
    拖入
 ========================================================= */
 
 async function probePaths(paths) {
-    return makeImportItems(await invoke("scan_import_sources", { paths }));
+    return getNewImportItems(paths);
 }
 
 
@@ -3758,12 +3924,7 @@ async function renderSelectedFiles(focusTagIndex) {
     }
 
 
-    const allTags = [
-        ...new Set([
-            ...Object.values(RECOMMENDED_TAGS).flat(),
-            ...(await getAllTags())
-        ])
-    ];
+    const allTags = await getAllTags();
 
 
     const groups = new Map();
@@ -3776,12 +3937,6 @@ async function renderSelectedFiles(focusTagIndex) {
     const visibleItems = groups.get(state.importSelectedAlbum) || [];
     const renderTrack = ({ item, index }, order) => {
         const suggestions = allTags.filter(tag => !(item.tags || []).includes(tag)).slice(0, 10);
-        const genreOptions = ["", "流行", "摇滚", "民谣", "电子", "嘻哈", "爵士", "古典", "轻音乐", "影视原声", "其他"]
-            .map(g => `<option value="${escapeHTML(g)}" ${g === (item.genre || "") ? "selected" : ""}>${g === "" ? "未指定" : escapeHTML(g)}</option>`)
-            .join("");
-        const channelsOptions = ["", "单声道", "立体声", "双声道", "环绕声"]
-            .map(c => `<option value="${escapeHTML(c)}" ${c === (item.channels || "") ? "selected" : ""}>${c === "" ? "未指定" : escapeHTML(c)}</option>`)
-            .join("");
         return `<article class="import-track" data-file-index="${index}">
             <div class="import-track-summary"><span class="import-track-number">${String(order + 1).padStart(2, "0")}</span><div class="import-track-main"><strong>${escapeHTML(item.name)}</strong><span>${escapeHTML(item.artist || "未知作者")} · ${item.duration ? formatTime(item.duration) : "时长读取中"}</span></div><span class="import-track-format">${item.sampleRate ? `${(item.sampleRate / 1000).toFixed(1)} kHz` : "MP3"}${item.bitrate ? ` · ${item.bitrate} kbps` : ""}</span></div>
             <details class="import-edit-details"><summary>编辑曲目资料</summary><div class="selected-file-fields import-edit-fields">
@@ -3793,7 +3948,7 @@ async function renderSelectedFiles(focusTagIndex) {
                 <div class="import-meta-cards">
                     <div class="import-meta-card">
                         <div class="import-meta-label">音乐类型</div>
-                        <select data-file-field="genre">${genreOptions}</select>
+                        <input type="text" data-file-field="genre" value="${escapeHTML(item.genre || "")}" placeholder="自动识别，可修改">
                     </div>
                     <div class="import-meta-card">
                         <div class="import-meta-label">录制年份</div>
@@ -3801,7 +3956,7 @@ async function renderSelectedFiles(focusTagIndex) {
                     </div>
                     <div class="import-meta-card">
                         <div class="import-meta-label">音频声道</div>
-                        <select data-file-field="channels">${channelsOptions}</select>
+                        <input type="text" data-file-field="channels" value="${escapeHTML(item.channels || "")}" placeholder="自动识别，可修改">
                     </div>
                     <div class="import-meta-card">
                         <div class="import-meta-label">采样速率</div>
@@ -3924,10 +4079,13 @@ async function importSelectedFiles() {
     button.textContent =
         "导入中...";
 
+    let currentItem = null;
 
     try {
 
         for (const item of state.importFiles) {
+
+            currentItem = item;
 
             const duration = (await getAudioDuration(item.path)) || item.duration || 0;
 
@@ -4020,9 +4178,14 @@ async function importSelectedFiles() {
 
         console.error(error);
 
-        showToast(
-            "导入失败：" +
-            error.message
+        const fileName =
+            currentItem?.fileName ||
+            currentItem?.name;
+
+        await showMessage(
+            `导入${fileName ? `「${fileName}」` : ""}失败：${getErrorMessage(error)}`,
+            "导入失败",
+            "error"
         );
 
     } finally {
@@ -4199,12 +4362,7 @@ async function renderClipTagSuggestions() {
     const container =
         $("clipTagSuggestions");
 
-    const tags = [
-        ...new Set([
-            ...Object.values(RECOMMENDED_TAGS).flat(),
-            ...(await getAllTags())
-        ])
-    ];
+    const tags = await getAllTags();
 
 
     container.innerHTML =
@@ -5035,6 +5193,12 @@ function setupEvents() {
             openImportModal
         );
 
+    $("databasePathLink")
+        .addEventListener(
+            "click",
+            revealDatabaseFile
+        );
+
 
     $("chooseFileBtn")
         .addEventListener(
@@ -5621,6 +5785,10 @@ function setupEvents() {
                 "click",
                 () => {
 
+                    if (!button.dataset.view) {
+                        return;
+                    }
+
                     document
                         .querySelectorAll(
                             ".nav-item"
@@ -5724,7 +5892,11 @@ function setupEvents() {
                     }
 
                     if (act === "play") {
-                        playClip(clipData);
+                        if (state.player.segment?.clipId === clipId) {
+                            togglePlay();
+                        } else {
+                            playClip(clipData);
+                        }
                         return;
                     }
 
@@ -5798,7 +5970,7 @@ function setupEvents() {
                         }
 
                         if (act === "play") {
-                            if (state.player.music?.id === id) {
+                            if (state.player.music?.id === id && !state.player.segment) {
                                 togglePlay();
                             } else {
                                 playMusic(id);
@@ -6000,7 +6172,13 @@ function setupEvents() {
         }
         event.stopPropagation();
         const act = action.dataset.panelClipAction;
-        if (act === "play") playClip(clip);
+        if (act === "play") {
+            if (state.player.segment?.clipId === clipId) {
+                togglePlay();
+            } else {
+                playClip(clip);
+            }
+        }
         if (act === "edit") {
             const music = await dbGet("music", clip.musicId);
             if (music) await openClipEditor(music, clip);
@@ -6487,8 +6665,12 @@ async function init() {
 
         await initDB();
 
+        await setupDatabasePath();
+
         state.player.candidates = (await invoke("list_candidates"))
             .map(entry => ({ id: entry.targetId, kind: entry.kind }));
+
+        renderCandidateBadge();
 
         setupThemeSwitcher();
         setupEvents();

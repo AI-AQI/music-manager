@@ -30,6 +30,7 @@ pub fn run() {
             commands::delete_music,
             commands::get_music,
             commands::list_music,
+            commands::find_existing_music_paths,
             commands::create_clip,
             commands::update_clip,
             commands::delete_clip,
@@ -44,7 +45,9 @@ pub fn run() {
             commands::create_tag_category,
             commands::create_candidate,
             commands::delete_candidate,
+            commands::clear_candidates,
             commands::file_exists,
+            commands::get_database_path,
             commands::get_audio_base_url,
         ])
         .run(tauri::generate_context!())

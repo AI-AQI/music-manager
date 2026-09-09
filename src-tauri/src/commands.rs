@@ -1,6 +1,6 @@
 use crate::db::tag_category;
 use crate::AppState;
-use rusqlite::{params, OptionalExtension};
+use rusqlite::{params, params_from_iter, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
@@ -8,6 +8,7 @@ use std::{
     io::{Read, Seek, SeekFrom},
     path::{Path, PathBuf},
 };
+use tauri::Manager;
 
 macro_rules! lock_db {
     ($state:ident) => {
@@ -482,6 +483,40 @@ pub fn list_music(
     Ok(music)
 }
 
+#[tauri::command]
+pub fn find_existing_music_paths(
+    state: tauri::State<'_, AppState>,
+    paths: Vec<String>,
+) -> Result<Vec<String>, String> {
+    if paths.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let conn = lock_db!(state);
+    let mut existing_paths = Vec::new();
+
+    // SQLite 默认每条语句最多 999 个绑定参数，按批次查询以支持大文件夹导入。
+    for batch in paths.chunks(900) {
+        let placeholders = std::iter::repeat("?")
+            .take(batch.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let query = format!("SELECT path FROM music WHERE path IN ({placeholders})");
+        let mut stmt = conn
+            .prepare(&query)
+            .map_err(|e| format!("准备已导入路径查询失败: {e}"))?;
+        let rows = stmt
+            .query_map(params_from_iter(batch.iter()), |row| row.get::<_, String>(0))
+            .map_err(|e| format!("查询已导入路径失败: {e}"))?;
+        existing_paths.extend(
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("读取已导入路径失败: {e}"))?,
+        );
+    }
+
+    Ok(existing_paths)
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Clip {
@@ -784,8 +819,25 @@ pub fn delete_candidate(state: tauri::State<'_, AppState>, target_id: String) ->
 }
 
 #[tauri::command]
+pub fn clear_candidates(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    let conn = lock_db!(state);
+    conn.execute("DELETE FROM candidate_entries", [])
+        .map_err(|e| format!("清空候选失败: {e}"))?;
+    Ok(())
+}
+
+#[tauri::command]
 pub fn file_exists(path: String) -> bool {
     Path::new(&path).is_file()
+}
+
+#[tauri::command]
+pub fn get_database_path(app: tauri::AppHandle) -> Result<String, String> {
+    let app_data_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("无法获取应用数据目录: {e}"))?;
+    Ok(app_data_dir.join("library.db").to_string_lossy().into_owned())
 }
 
 #[tauri::command]

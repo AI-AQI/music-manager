@@ -53,6 +53,10 @@
                     </button>
                 </div>
             </div>
+            <button id="openCandidatePanelBtn" class="secondary-btn candidate-panel-trigger" type="button" title="候选清单" aria-label="打开候选清单" aria-expanded="false">
+                <span aria-hidden="true">★</span>
+                <span id="candidateNavCount" class="candidate-trigger-count">0</span>
+            </button>
             <button id="importBtn" class="primary-btn">
                 <span class="button-index">01</span> 导入曲目
             </button>
@@ -84,6 +88,7 @@
                     <span>◷</span>
                     <span>最近添加</span>
                 </button>
+
             </div>
 
 
@@ -248,7 +253,10 @@
                     候选清单
                     <span id="candidatePanelCount" class="detail-title-count"></span>
                 </div>
-                <button id="closeCandidatePanel" class="icon-btn">×</button>
+                <div class="candidate-panel-actions">
+                    <button id="clearCandidatesBtn" class="text-btn" type="button">清空</button>
+                    <button id="closeCandidatePanel" class="icon-btn">×</button>
+                </div>
             </div>
 
             <div id="candidatePanelBody" class="detail-content"></div>
@@ -256,6 +264,12 @@
         </aside>
 
     </div>
+
+
+    <button id="databasePathLink" class="database-path" type="button" title="在 Finder 中显示数据库文件">
+        <span>本地数据库</span>
+        <span id="databasePath">正在读取数据库位置…</span>
+    </button>
 
 
     <!-- 底部播放器 -->
