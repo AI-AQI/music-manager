@@ -9,7 +9,7 @@ readonly default_destination="/Applications/${app_name}"
 
 usage() {
   cat <<'EOF'
-用法：bash scripts/install-macos.sh /完整路径/声场档案_xxx_(aarch64|x64).dmg [--replace]
+用法：bash scripts/install-macos.sh /完整路径/music-manager_xxx_(aarch64|x64).dmg [--replace]
 
 将 DMG 中的「声场档案」复制到 /Applications，并仅移除该应用的
 com.apple.quarantine 下载隔离标记。脚本支持 Apple Silicon 和 Intel Mac，

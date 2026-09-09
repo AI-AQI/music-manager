@@ -42,12 +42,12 @@
 1. 双击 `.dmg`，把「声场档案」拖进「应用程序」。
 2. 请按 Mac 芯片选择 DMG：M1/M2/M3/M4 下载文件名含 `aarch64` 的版本；Intel Mac 下载文件名含 `x64` 的版本。若 macOS 显示“已损坏”或阻止打开，请从同一个 GitHub Release 一并下载 `install-macos.sh`，然后在终端运行（DMG 路径按实际下载位置填写）：
    ```bash
-   bash "$HOME/Downloads/install-macos.sh" "$HOME/Downloads/声场档案_0.1.0_aarch64.dmg"
+   bash "$HOME/Downloads/install-macos.sh" "$HOME/Downloads/music-manager_0.1.0_aarch64.dmg"
    ```
    脚本会校验 DMG、复制应用并移除**该应用**的下载隔离标记；它会要求输入 Mac 管理员密码。
    已有旧版本时，在命令末尾加 `--replace`。
    ```bash
-   bash "$HOME/Downloads/install-macos.sh" "$HOME/Downloads/声场档案_0.1.0_aarch64.dmg" --replace
+   bash "$HOME/Downloads/install-macos.sh" "$HOME/Downloads/music-manager_0.1.0_aarch64.dmg" --replace
    ```
 3. 打开后点击右上角 **「＋ 导入音乐」**,选择或拖入你的音频文件。
 
