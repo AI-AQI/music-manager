@@ -42,7 +42,9 @@ fn migrate(conn: &Connection) -> Result<(), String> {
             name        TEXT NOT NULL,
             file_name   TEXT NOT NULL DEFAULT '',
             path        TEXT NOT NULL,
+            file_bookmark BLOB,
             album       TEXT DEFAULT '',
+            album_source TEXT NOT NULL DEFAULT 'folder',
             artist      TEXT DEFAULT '',
             genre       TEXT DEFAULT '',
             year        TEXT DEFAULT '',
@@ -147,6 +149,7 @@ fn migrate(conn: &Connection) -> Result<(), String> {
             .map_err(|e| format!("移除旧片段 Tag 列失败: {e}"))?;
     }
     for (column, definition) in [
+        ("file_bookmark", "BLOB"), ("album_source", "TEXT NOT NULL DEFAULT 'folder'"),
         ("artist", "TEXT DEFAULT ''"), ("genre", "TEXT DEFAULT ''"), ("year", "TEXT DEFAULT ''"),
         ("channels", "TEXT DEFAULT ''"), ("sample_rate", "INTEGER DEFAULT 0"),
         ("bitrate", "INTEGER DEFAULT 0"), ("cover_art", "TEXT DEFAULT ''"),
@@ -156,6 +159,10 @@ fn migrate(conn: &Connection) -> Result<(), String> {
                 .map_err(|e| format!("补齐音乐属性失败: {e}"))?;
         }
     }
+    // 首个包含该字段的正式版本将既有曲目视为“按文件夹识别”，
+    // 以便启动同步后直接反映 Finder 中的专辑文件夹改名。
+    conn.execute("UPDATE music SET album_source='folder' WHERE album_source IS NULL OR album_source='' OR album_source='legacy'", [])
+        .map_err(|e| format!("迁移专辑来源失败: {e}"))?;
     conn.execute("INSERT OR IGNORE INTO tag_categories (name, created_at) SELECT DISTINCT category, created_at FROM tags", [])
         .map_err(|e| format!("初始化 Tag 分类失败: {e}"))?;
     conn.execute("INSERT OR IGNORE INTO tag_categories (name, created_at) VALUES ('', ?1)", params![now])

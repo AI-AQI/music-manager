@@ -71,6 +71,7 @@ let databasePath = "";
 let importAlbumRefreshTimer = null;
 let importAlbumNameScrollTimer = null;
 let importAlbumNameScrollElement = null;
+let locationSyncPromise = null;
 
 function stopImportAlbumNameScroll() {
     if (importAlbumNameScrollTimer) clearInterval(importAlbumNameScrollTimer);
@@ -258,6 +259,31 @@ const dbDelete = async (storeName, id) =>
 async function initDB() {
 
     await invoke("init_db");
+
+    // 先用 macOS 文件书签修正 Finder 中的移动/改名，再读取音乐库。
+    // 其中以文件夹识别的专辑会在这里同步为最新父文件夹名称。
+    await invoke("sync_library_locations");
+}
+
+async function refreshLocationsAfterFinderChanges() {
+    if (locationSyncPromise) return locationSyncPromise;
+
+    locationSyncPromise = (async () => {
+        const result = await invoke("sync_library_locations");
+        if (!result.updatedPaths && !result.updatedAlbums) return;
+
+        const selectedMusicId = state.selectedMusic?.id;
+        await updateCounts();
+        await renderSidebarTags();
+        await render();
+        if (selectedMusicId) await openDetail(selectedMusicId);
+    })();
+
+    try {
+        await locationSyncPromise;
+    } finally {
+        locationSyncPromise = null;
+    }
 }
 
 async function setupDatabasePath() {
@@ -1856,6 +1882,15 @@ async function openDetail(id) {
                     >
                 </label>
 
+                <label class="album-source-field">
+                    专辑来源
+                    <select id="detailEditAlbumSource">
+                        <option value="folder" ${music.albumSource === "folder" ? "selected" : ""}>文件夹名称（随 Finder 同步）</option>
+                        <option value="metadata" ${music.albumSource === "metadata" ? "selected" : ""}>MP3 专辑属性</option>
+                        <option value="manual" ${music.albumSource === "manual" ? "selected" : ""}>手动填写（不自动同步）</option>
+                    </select>
+                </label>
+
                 <label>
                     音乐类型
                     <input
@@ -2216,6 +2251,21 @@ async function openDetail(id) {
             }
         );
 
+    $("detailEditAlbumSource")
+        .addEventListener(
+            "change",
+            async () => {
+                const albumSource = $("detailEditAlbumSource").value;
+                const info = await invoke("probe_file", { path: music.path });
+                const album = !info.exists || albumSource === "manual"
+                    ? music.album
+                    : albumSource === "folder"
+                        ? info.folderAlbum
+                        : info.album;
+                await saveDetailEdit({ album, albumSource });
+            }
+        );
+
 
     $("detailEditArtist")
         .addEventListener(
@@ -2510,6 +2560,15 @@ async function saveDetailEdit(changes) {
 
         music.album =
             changes.album;
+
+        // 单独编辑专辑名称代表手动覆盖；切换来源时由调用方指定来源。
+        if (changes.albumSource === undefined) {
+            music.albumSource = "manual";
+        }
+    }
+
+    if (changes.albumSource !== undefined) {
+        music.albumSource = changes.albumSource;
     }
 
     if (changes.artist !== undefined) {
@@ -2587,6 +2646,10 @@ async function revealInFinder(music) {
     }
 
     try {
+
+        // 应用保持打开时，Finder 仍可能刚刚移动了文件；访问前再解析一次书签。
+        await invoke("sync_library_locations");
+        music = (await dbGet("music", music.id)) || music;
 
         const exists =
             await invoke("file_exists", {
@@ -2822,6 +2885,10 @@ async function loadAndPlay(music, segment = null) {
     const p = state.player;
 
     const a = getAudio();
+
+    // 队列中的对象可能是在 Finder 移动文件前生成的，播放前总是取最新地址。
+    await invoke("sync_library_locations");
+    music = (await dbGet("music", music.id)) || music;
 
     p.loading = true;
 
@@ -4234,6 +4301,9 @@ async function importSelectedFiles() {
                 album:
                     item.album || "",
 
+                albumSource:
+                    state.importAlbumSource,
+
                 artist:
                     item.artist || "",
 
@@ -5311,6 +5381,14 @@ function closeMusicContextPanels() {
 ========================================================= */
 
 function setupEvents() {
+
+    // Finder 完成改名后，用户切回应用即自动同步并刷新已渲染的专辑。
+    window.addEventListener("focus", () => {
+        void refreshLocationsAfterFinderChanges().catch(console.error);
+    });
+    document.addEventListener("visibilitychange", () => {
+        if (!document.hidden) void refreshLocationsAfterFinderChanges().catch(console.error);
+    });
 
     $("sidebarCollapseBtn").addEventListener("click", () => {
         setSidebarCollapsed(

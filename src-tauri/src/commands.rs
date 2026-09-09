@@ -10,6 +10,53 @@ use std::{
 };
 use tauri::Manager;
 
+#[cfg(target_os = "macos")]
+fn create_file_bookmark(path: &str) -> Result<Vec<u8>, String> {
+    use objc2_foundation::{NSString, NSURL, NSURLBookmarkCreationOptions};
+
+    if !Path::new(path).is_file() {
+        return Err("无法为不存在的文件创建书签".into());
+    }
+    let path = NSString::from_str(path);
+    let url = NSURL::fileURLWithPath(&path);
+    url.bookmarkDataWithOptions_includingResourceValuesForKeys_relativeToURL_error(
+        NSURLBookmarkCreationOptions::empty(), None, None,
+    )
+    .map(|data| data.to_vec())
+    .map_err(|error| format!("创建文件书签失败: {error}"))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn create_file_bookmark(_path: &str) -> Result<Vec<u8>, String> {
+    Ok(Vec::new())
+}
+
+#[cfg(target_os = "macos")]
+fn resolve_file_bookmark(bookmark: &[u8]) -> Result<(String, bool), String> {
+    use objc2_foundation::{NSData, NSURL, NSURLBookmarkResolutionOptions};
+
+    if bookmark.is_empty() {
+        return Err("没有可用的文件书签".into());
+    }
+    let data = NSData::with_bytes(bookmark);
+    let url = unsafe {
+        NSURL::URLByResolvingBookmarkData_options_relativeToURL_bookmarkDataIsStale_error(
+            &data,
+            NSURLBookmarkResolutionOptions::WithoutUI,
+            None,
+            std::ptr::null_mut(),
+        )
+    }
+    .map_err(|error| format!("解析文件书签失败: {error}"))?;
+    let path = url.path().ok_or_else(|| "书签没有返回本地路径".to_string())?.to_string();
+    Ok((path, false))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn resolve_file_bookmark(_bookmark: &[u8]) -> Result<(String, bool), String> {
+    Err("当前系统不支持 macOS 文件书签".into())
+}
+
 macro_rules! lock_db {
     ($state:ident) => {
         $state
@@ -328,6 +375,7 @@ pub struct Music {
     file_name: String,
     path: String,
     album: String,
+    album_source: String,
     artist: String,
     genre: String,
     year: String,
@@ -351,6 +399,7 @@ impl Music {
             file_name: row.get("file_name")?,
             path: row.get("path")?,
             album: row.get("album")?,
+            album_source: row.get("album_source")?,
             artist: row.get("artist")?,
             genre: row.get("genre")?,
             year: row.get("year")?,
@@ -376,6 +425,7 @@ pub struct MusicInput {
     file_name: String,
     path: String,
     album: String,
+    album_source: String,
     artist: String,
     genre: String,
     year: String,
@@ -399,15 +449,18 @@ pub fn create_music(
     let mut conn = lock_db!(state);
     let tx = conn.transaction().map_err(|e| format!("开启事务失败: {e}"))?;
 
+    let bookmark = create_file_bookmark(&music.path)?;
     tx.execute(
-        "INSERT INTO music (id, name, file_name, path, album, artist, genre, year, channels, sample_rate, bitrate, duration, file_size, mime_type, cover_art, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+        "INSERT INTO music (id, name, file_name, path, file_bookmark, album, album_source, artist, genre, year, channels, sample_rate, bitrate, duration, file_size, mime_type, cover_art, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
         params![
             music.id,
             music.name,
             music.file_name,
             music.path,
+            bookmark,
             music.album,
+            music.album_source,
             music.artist,
             music.genre,
             music.year,
@@ -439,13 +492,16 @@ pub fn update_music(
     let mut conn = lock_db!(state);
     let tx = conn.transaction().map_err(|e| format!("开启事务失败: {e}"))?;
 
+    let bookmark = create_file_bookmark(&music.path)?;
     tx.execute(
-        "UPDATE music SET name=?1, file_name=?2, path=?3, album=?4, artist=?5, genre=?6, year=?7, channels=?8, sample_rate=?9, bitrate=?10, duration=?11, file_size=?12, mime_type=?13, cover_art=?14, updated_at=?15 WHERE id=?16",
+        "UPDATE music SET name=?1, file_name=?2, path=?3, file_bookmark=?4, album=?5, album_source=?6, artist=?7, genre=?8, year=?9, channels=?10, sample_rate=?11, bitrate=?12, duration=?13, file_size=?14, mime_type=?15, cover_art=?16, updated_at=?17 WHERE id=?18",
         params![
             music.name,
             music.file_name,
             music.path,
+            bookmark,
             music.album,
+            music.album_source,
             music.artist,
             music.genre,
             music.year,
@@ -948,6 +1004,72 @@ pub fn clear_candidates(state: tauri::State<'_, AppState>) -> Result<(), String>
 #[tauri::command]
 pub fn file_exists(path: String) -> bool {
     Path::new(&path).is_file()
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LocationSyncResult {
+    updated_paths: usize,
+    updated_albums: usize,
+}
+
+/// Resolve persisted macOS file bookmarks at launch. A Finder move or rename
+/// changes the resolved URL, so the database can be repaired without watching
+/// every directory continuously.
+#[tauri::command]
+pub fn sync_library_locations(state: tauri::State<'_, AppState>) -> Result<LocationSyncResult, String> {
+    let mut conn = lock_db!(state);
+    let entries = {
+        let mut stmt = conn.prepare("SELECT id, path, album, album_source, file_bookmark FROM music")
+            .map_err(|e| format!("准备位置同步失败: {e}"))?;
+        let rows = stmt.query_map([], |row| Ok((
+            row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?, row.get::<_, Option<Vec<u8>>>(4)?,
+        )))
+        .map_err(|e| format!("读取位置同步数据失败: {e}"))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("读取位置同步数据失败: {e}"))?
+    };
+
+    let tx = conn.transaction().map_err(|e| format!("开启位置同步事务失败: {e}"))?;
+    let mut result = LocationSyncResult { updated_paths: 0, updated_albums: 0 };
+    for (id, old_path, old_album, old_source, bookmark) in entries {
+        let mut source = old_source.clone();
+        let resolved = match bookmark.as_deref().filter(|data| !data.is_empty()) {
+            Some(data) => resolve_file_bookmark(data).ok().map(|(path, _)| path),
+            None if Path::new(&old_path).is_file() => Some(old_path.clone()),
+            None => None,
+        };
+        let Some(path) = resolved.filter(|path| Path::new(path).is_file()) else { continue };
+        let folder_album = Path::new(&path).parent().and_then(Path::file_name)
+            .and_then(|name| name.to_str()).unwrap_or_default().to_string();
+        if source == "legacy" || source.is_empty() {
+            source = "folder".into();
+        }
+        let album = if source == "folder" { folder_album } else { old_album.clone() };
+        let file_name = Path::new(&path).file_name().and_then(|name| name.to_str()).unwrap_or_default();
+        let path_changed = path != old_path;
+        let album_changed = album != old_album;
+        let source_changed = source != old_source;
+        // Keep a valid bookmark unchanged; rebuilding is only needed for old
+        // records that lacked one or when resolving revealed a moved location.
+        let refreshed_bookmark = if bookmark.as_deref().unwrap_or_default().is_empty() || path_changed {
+            create_file_bookmark(&path).unwrap_or_else(|_| bookmark.clone().unwrap_or_default())
+        } else {
+            bookmark.clone().unwrap_or_default()
+        };
+        let bookmark_changed = bookmark.as_deref().unwrap_or_default() != refreshed_bookmark.as_slice();
+        if path_changed || album_changed || source_changed || bookmark_changed {
+            tx.execute(
+                "UPDATE music SET path=?1, file_name=?2, file_bookmark=?3, album=?4, album_source=?5, updated_at=?6 WHERE id=?7",
+                params![path, file_name, refreshed_bookmark, album, source, now_ms(), id],
+            ).map_err(|e| format!("写入同步位置失败: {e}"))?;
+            result.updated_paths += usize::from(path_changed);
+            result.updated_albums += usize::from(album_changed);
+        }
+    }
+    tx.commit().map_err(|e| format!("提交位置同步失败: {e}"))?;
+    Ok(result)
 }
 
 #[tauri::command]

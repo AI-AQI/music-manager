@@ -6228,3 +6228,44 @@ body.sidebar-collapsed .sidebar-tag {
 @media (max-width: 760px) {
     .sidebar-controls { display: none; }
 }
+
+/* 专辑来源是状态选择，不做成笨重的原生表单块。 */
+.detail-edit .album-source-field {
+    display: grid;
+    grid-template-columns: 68px minmax(0, 1fr);
+    align-items: center;
+    gap: 9px;
+    margin: 14px 0 16px;
+    color: var(--subtext);
+    font-size: 11px;
+    font-weight: 700;
+}
+
+.detail-edit .album-source-field select {
+    width: 100%;
+    height: 31px;
+    appearance: none;
+    cursor: pointer;
+    color: var(--text);
+    background-color: rgba(255, 255, 255, 0.62);
+    background-image: linear-gradient(45deg, transparent 50%, var(--subtext) 50%), linear-gradient(135deg, var(--subtext) 50%, transparent 50%);
+    background-position: calc(100% - 14px) 13px, calc(100% - 10px) 13px;
+    background-size: 4px 4px, 4px 4px;
+    background-repeat: no-repeat;
+    border: 1px solid var(--border);
+    border-radius: 7px;
+    padding: 0 29px 0 10px;
+    font: 600 11px/1 var(--font-ui);
+    transition: border-color .16s ease, background-color .16s ease, box-shadow .16s ease;
+}
+
+.detail-edit .album-source-field select:hover {
+    border-color: var(--primary);
+    background-color: rgba(255, 255, 255, 0.9);
+}
+
+.detail-edit .album-source-field select:focus {
+    border-color: var(--primary);
+    box-shadow: 0 0 0 3px var(--ring);
+    outline: none;
+}

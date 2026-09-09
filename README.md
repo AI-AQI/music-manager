@@ -57,7 +57,8 @@
 
 - 数据库文件:`~/Library/Application Support/com.musicmanager.app/library.db`
 - **音频文件不复制、不移动**,还在你原来的文件夹里
-- 音乐库 = 元数据 + 音频文件的路径;删掉或移动了音频文件,列表里这条会提示文件不存在
+- 新导入的音乐会保存 macOS 文件书签。即使随后在 Finder 中移动或重命名文件，下次打开应用或播放前会自动更新库内路径；文件被删除或跨磁盘复制后再删除时才可能需要重新绑定。
+- 若导入时选择「以文件夹名称为准」，每次启动同步路径时也会同步最新父文件夹名称为专辑名。升级前已有音乐会默认迁移为此来源，可在详情中改成 MP3 属性或手动填写；手动填写的音乐不受文件夹改名影响。
 
 ### 注意
 
@@ -139,12 +140,12 @@ cd src-tauri && cargo tauri build --target x86_64-apple-darwin
 
 | 命令 | app / dmg |
 |---|---|
-| `--target aarch64-apple-darwin` | `target/aarch64-apple-darwin/release/bundle/macos/声场档案.app`<br>`target/aarch64-apple-darwin/release/bundle/dmg/声场档案_0.1.0_aarch64.dmg` |
-| `--target x86_64-apple-darwin` | `target/x86_64-apple-darwin/release/bundle/macos/声场档案.app`<br>`target/x86_64-apple-darwin/release/bundle/dmg/声场档案_0.1.0_x64.dmg` |
+| `--target aarch64-apple-darwin` | `target/aarch64-apple-darwin/release/bundle/macos/声场档案.app`<br>`target/aarch64-apple-darwin/release/bundle/dmg/声场档案_0.1.1_aarch64.dmg` |
+| `--target x86_64-apple-darwin` | `target/x86_64-apple-darwin/release/bundle/macos/声场档案.app`<br>`target/x86_64-apple-darwin/release/bundle/dmg/声场档案_0.1.1_x64.dmg` |
 
 发给朋友时说一句:M 芯片的 Mac 装 `aarch64` 版、老 Intel 的装 `x64` 版。
 
-> 备选:也可以打 Universal Binary(一个 dmg 通吃两种 Mac),`cargo tauri build --target universal-apple-darwin`,产物为 `声场档案_0.1.0_universal.dmg`,但体积约大一倍。我们默认用上面的分架构方式。
+> 备选:也可以打 Universal Binary(一个 dmg 通吃两种 Mac),`cargo tauri build --target universal-apple-darwin`,产物为 `声场档案_0.1.1_universal.dmg`,但体积约大一倍。我们默认用上面的分架构方式。
 
 发布 GitHub Release 时，同时上传 `aarch64` 和 `x64` 两个 `.dmg`，以及仓库中的 `scripts/install-macos.sh`。未签名应用从浏览器下载后可能显示“已损坏”；按上方「给使用者的说明」运行安装脚本。要彻底免提示需 Apple 开发者账号签名与公证($99/年)。
 

@@ -53,6 +53,7 @@ pub fn run() {
             commands::file_exists,
             commands::get_database_path,
             commands::get_audio_base_url,
+            commands::sync_library_locations,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
