@@ -9,9 +9,51 @@ on:
 permissions:
   contents: write
 
+# 同一分支或 tag 只保留最新一次运行，避免重复推送 tag 时并发修改同一个 Release
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
+  validate:
+    name: Validate version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Validate release version
+        id: version
+        shell: bash
+        run: |
+          cargo_version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' src-tauri/Cargo.toml | head -n 1)"
+          tauri_version="$(sed -n 's/^[[:space:]]*"version":[[:space:]]*"\([^"]*\)".*/\1/p' src-tauri/tauri.conf.json | head -n 1)"
+
+          if [[ -z "$cargo_version" || -z "$tauri_version" ]]; then
+            echo "无法读取 Cargo.toml 或 tauri.conf.json 中的版本号" >&2
+            exit 1
+          fi
+
+          if [[ "$cargo_version" != "$tauri_version" ]]; then
+            echo "版本不一致：Cargo.toml=$cargo_version, tauri.conf.json=$tauri_version" >&2
+            exit 1
+          fi
+
+          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+            tag_version="${GITHUB_REF_NAME#v}"
+            if [[ "$GITHUB_REF_NAME" == "$tag_version" || "$tag_version" != "$cargo_version" ]]; then
+              echo "版本不一致：tag=$GITHUB_REF_NAME, 应用版本=$cargo_version" >&2
+              exit 1
+            fi
+          fi
+
+          echo "version=${cargo_version}" >> "$GITHUB_OUTPUT"
+
   # 按 CPU 架构分两个原生 runner 构建，避免交叉编译的坑
   build:
+    needs: validate
     strategy:
       fail-fast: false
       matrix:
@@ -51,10 +93,9 @@ jobs:
       - name: Rename to ASCII asset name
         id: rename
         run: |
-          version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' src-tauri/Cargo.toml | head -n 1)"
           dmg_dir="src-tauri/target/${{ matrix.target }}/release/bundle/dmg"
           src_dmg="$(ls "$dmg_dir"/*.dmg | head -n 1)"
-          dst="music-manager_${version}_${{ matrix.arch }}.dmg"
+          dst="music-manager_${{ needs.validate.outputs.version }}_${{ matrix.arch }}.dmg"
           cp "$src_dmg" "$dst"
           echo "asset=${dst}" >> "$GITHUB_OUTPUT"
 
@@ -66,7 +107,7 @@ jobs:
 
   # 打 tag 时才创建 release；workflow_dispatch 只用来测试构建、不发布
   release:
-    needs: build
+    needs: [validate, build]
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     permissions:
@@ -79,13 +120,6 @@ jobs:
         with:
           path: dist
           merge-multiple: true
-
-      # 资产名里的版本号取自 Cargo.toml（不带 v），和 build job 的命名保持一致
-      - name: Read version
-        id: version
-        run: |
-          v="$(sed -n 's/^version = "\([^"]*\)"/\1/p' src-tauri/Cargo.toml | head -n 1)"
-          echo "version=${v}" >> "$GITHUB_OUTPUT"
 
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v3
@@ -102,8 +136,8 @@ jobs:
 
             | 设备 | 下载文件 |
             | --- | --- |
-            | M1 / M2 / M3 / M4 等 Apple Silicon Mac | `music-manager_${{ steps.version.outputs.version }}_aarch64.dmg` |
-            | Intel Mac | `music-manager_${{ steps.version.outputs.version }}_x64.dmg` |
+            | M1 / M2 / M3 / M4 等 Apple Silicon Mac | `music-manager_${{ needs.validate.outputs.version }}_aarch64.dmg` |
+            | Intel Mac | `music-manager_${{ needs.validate.outputs.version }}_x64.dmg` |
 
             ### 安装
 
@@ -112,13 +146,13 @@ jobs:
             Apple Silicon Mac：
 
             ```sh
-            bash "$HOME/Downloads/install-macos.sh" "$HOME/Downloads/music-manager_${{ steps.version.outputs.version }}_aarch64.dmg"
+            bash "$HOME/Downloads/install-macos.sh" "$HOME/Downloads/music-manager_${{ needs.validate.outputs.version }}_aarch64.dmg"
             ```
 
             Intel Mac：
 
             ```sh
-            bash "$HOME/Downloads/install-macos.sh" "$HOME/Downloads/music-manager_${{ steps.version.outputs.version }}_x64.dmg"
+            bash "$HOME/Downloads/install-macos.sh" "$HOME/Downloads/music-manager_${{ needs.validate.outputs.version }}_x64.dmg"
             ```
 
             脚本会校验 DMG、将应用复制到“应用程序”文件夹，并移除该应用的下载隔离标记。首次运行会要求输入 Mac 管理员密码。
@@ -126,7 +160,7 @@ jobs:
             已有旧版本时，在命令最后加上 `--replace`：
 
             ```sh
-            bash "$HOME/Downloads/install-macos.sh" "$HOME/Downloads/music-manager_${{ steps.version.outputs.version }}_aarch64.dmg" --replace
+            bash "$HOME/Downloads/install-macos.sh" "$HOME/Downloads/music-manager_${{ needs.validate.outputs.version }}_aarch64.dmg" --replace
             ```
 
             ### 注意
