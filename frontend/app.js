@@ -68,6 +68,37 @@ let state = {
 let visibleQueueMusic = [];
 let visibleClipIds = [];
 let databasePath = "";
+let importAlbumRefreshTimer = null;
+let importAlbumNameScrollTimer = null;
+let importAlbumNameScrollElement = null;
+
+function stopImportAlbumNameScroll() {
+    if (importAlbumNameScrollTimer) clearInterval(importAlbumNameScrollTimer);
+    if (importAlbumNameScrollElement) importAlbumNameScrollElement.scrollLeft = 0;
+    importAlbumNameScrollTimer = null;
+    importAlbumNameScrollElement = null;
+}
+
+function startImportAlbumNameScroll(element) {
+    stopImportAlbumNameScroll();
+    if (element.scrollWidth <= element.clientWidth) return;
+    importAlbumNameScrollElement = element;
+    let direction = 1;
+    let pauseUntil = Date.now() + 500;
+    importAlbumNameScrollTimer = setInterval(() => {
+        if (!importAlbumNameScrollElement) return;
+        if (Date.now() < pauseUntil) return;
+        const max = element.scrollWidth - element.clientWidth;
+        if (element.scrollLeft >= max) {
+            direction = -1;
+            pauseUntil = Date.now() + 700;
+        } else if (element.scrollLeft <= 0 && direction < 0) {
+            direction = 1;
+            pauseUntil = Date.now() + 700;
+        }
+        element.scrollLeft = Math.max(0, Math.min(max, element.scrollLeft + direction * 0.8));
+    }, 16);
+}
 
 
 /* =========================================================
@@ -82,10 +113,38 @@ const $ = id => document.getElementById(id);
 ========================================================= */
 
 const THEME_STORAGE_KEY = "music-library-theme";
+const SIDEBAR_COLLAPSED_STORAGE_KEY = "music-library-sidebar-collapsed";
 const THEMES = {
     archive: { label: "档案室" },
     sky: { label: "云雾" }
 };
+
+function setSidebarCollapsed(collapsed, { persist = true } = {}) {
+    document.body.classList.toggle("sidebar-collapsed", collapsed);
+
+    const button = $("sidebarCollapseBtn");
+    button.setAttribute("aria-expanded", String(!collapsed));
+    button.title = collapsed ? "展开导航" : "收起导航";
+    button.querySelector("span:last-child").textContent = collapsed
+        ? "展开导航"
+        : "收起导航";
+
+    if (persist) {
+        try {
+            localStorage.setItem(SIDEBAR_COLLAPSED_STORAGE_KEY, String(collapsed));
+        } catch (_) {
+            // 仅本次运行保持当前状态。
+        }
+    }
+}
+
+function getSavedSidebarCollapsed() {
+    try {
+        return localStorage.getItem(SIDEBAR_COLLAPSED_STORAGE_KEY) === "true";
+    } catch (_) {
+        return false;
+    }
+}
 
 function getSavedTheme() {
     try {
@@ -468,16 +527,17 @@ async function renderSidebarTags() {
             (b.musicCount ?? 0) - (a.musicCount ?? 0) ||
             a.name.localeCompare(b.name, "zh-Hans-CN")
         )
-        .slice(0, 30)
         .map(tag => {
 
             return `
                 <button
                     class="sidebar-tag"
                     data-tag="${escapeHTML(tag.name)}"
+                    title="# ${escapeHTML(tag.name)}"
                 >
-                    <span class="sidebar-tag-name"># ${escapeHTML(tag.name)}</span>
-                    <span class="nav-count sidebar-tag-count">${tag.musicCount ?? 0}</span>
+                    <span class="sidebar-tag-icon" aria-hidden="true">#</span>
+                    <span class="sidebar-tag-name">${escapeHTML(tag.name)}</span>
+                    <span class="nav-count sidebar-tag-count"><span class="nav-count-value">${tag.musicCount ?? 0}</span></span>
                 </button>
             `;
 
@@ -583,8 +643,8 @@ async function updateCounts() {
     const music = await dbGetAll("music");
     const clips = await dbGetAll("clips");
 
-    $("allCount").textContent = music.length;
-    $("clipCount").textContent = clips.length;
+    $("allCount").querySelector(".nav-count-value").textContent = music.length;
+    $("clipCount").querySelector(".nav-count-value").textContent = clips.length;
 }
 
 
@@ -2380,9 +2440,6 @@ async function renderDetailTagSuggestions(query = "") {
                         ))
         );
 
-    suggestions =
-        suggestions.slice(0, 20);
-
     if (!suggestions.length) {
 
         container.innerHTML = "";
@@ -3804,7 +3861,9 @@ async function chooseFiles() {
         }
 
 
-        state.importFiles = await getNewImportItems(selected.map(String));
+        appendImportItems(
+            await getNewImportItems(selected.map(String))
+        );
 
 
         renderSelectedFiles();
@@ -3819,7 +3878,9 @@ async function chooseFolders() {
     try {
         const selected = await __TAURI__.dialog.open({ multiple: true, directory: true });
         if (!selected) return;
-        state.importFiles = await getNewImportItems(selected.map(String));
+        appendImportItems(
+            await getNewImportItems(selected.map(String))
+        );
         renderSelectedFiles();
     } catch (error) {
         console.error(error);
@@ -3847,6 +3908,23 @@ function makeImportItems(infos) {
         coverArt: info.coverArt || "",
         tags: []
     }));
+}
+
+function appendImportItems(items) {
+    const pendingPaths = new Set(
+        state.importFiles.map(item => item.path)
+    );
+    const newItems = items.filter(item => {
+        if (pendingPaths.has(item.path)) return false;
+        pendingPaths.add(item.path);
+        return true;
+    });
+
+    state.importFiles.push(...newItems);
+
+    if (items.length > newItems.length) {
+        showToast(`已忽略 ${items.length - newItems.length} 个重复的待导入文件`);
+    }
 }
 
 async function getNewImportItems(paths) {
@@ -3923,10 +4001,11 @@ function setupDropZone() {
 
                 zoneRemove();
 
-                state.importFiles =
+                appendImportItems(
                     await probePaths(
                         event.payload.paths
-                    );
+                    )
+                );
 
                 renderSelectedFiles();
             }
@@ -3946,6 +4025,11 @@ async function renderSelectedFiles(focusTagIndex) {
 
     const button =
         $("confirmImportBtn");
+
+    $("dropZone").classList.toggle(
+        "has-import-files",
+        state.importFiles.length > 0
+    );
 
 
     if (!state.importFiles.length) {
@@ -3971,9 +4055,9 @@ async function renderSelectedFiles(focusTagIndex) {
     if (!groups.has(state.importSelectedAlbum)) state.importSelectedAlbum = groups.keys().next().value;
     const visibleItems = groups.get(state.importSelectedAlbum) || [];
     const renderTrack = ({ item, index }, order) => {
-        const suggestions = allTags.filter(tag => !(item.tags || []).includes(tag)).slice(0, 10);
+        const suggestions = allTags.filter(tag => !(item.tags || []).includes(tag));
         return `<article class="import-track" data-file-index="${index}">
-            <div class="import-track-summary"><span class="import-track-number">${String(order + 1).padStart(2, "0")}</span><div class="import-track-main"><strong>${escapeHTML(item.name)}</strong><span>${escapeHTML(item.artist || "未知作者")} · ${item.duration ? formatTime(item.duration) : "时长读取中"}</span></div><span class="import-track-format">${item.sampleRate ? `${(item.sampleRate / 1000).toFixed(1)} kHz` : "MP3"}${item.bitrate ? ` · ${item.bitrate} kbps` : ""}</span></div>
+            <div class="import-track-summary"><span class="import-track-number">${String(order + 1).padStart(2, "0")}</span><div class="import-track-main"><strong>${escapeHTML(item.name)}</strong><span>${escapeHTML(item.artist || "未知作者")} · ${item.duration ? formatTime(item.duration) : "时长读取中"}</span></div><span class="import-track-format">${item.sampleRate ? `${(item.sampleRate / 1000).toFixed(1)} kHz` : "MP3"}${item.bitrate ? ` · ${item.bitrate} kbps` : ""}</span><button class="icon-action import-track-remove" data-remove-import-file="${index}" title="不导入这首音乐" aria-label="不导入这首音乐">×</button></div>
             <details class="import-edit-details"><summary>编辑曲目资料</summary><div class="selected-file-fields import-edit-fields">
                 <div class="import-basic-fields">
                     <label>音乐名称<input type="text" data-file-field="name" value="${escapeHTML(item.name)}"></label>
@@ -4017,7 +4101,8 @@ async function renderSelectedFiles(focusTagIndex) {
             .filter(Boolean)
     );
 
-    container.innerHTML = `<div class="import-review"><aside class="import-album-list"><div class="import-review-label">本次识别到 ${groups.size} 张专辑 · ${state.importFiles.length} 首音乐</div>${[...groups.entries()].map(([album, items]) => `<button class="import-album-item ${album === state.importSelectedAlbum ? "active" : ""}" data-import-album="${escapeHTML(album)}"><span>${escapeHTML(album)}</span><b>${items.length}</b></button>`).join("")}</aside><section class="import-album-detail"><header><div><span>正在审阅</span><h3>${escapeHTML(state.importSelectedAlbum)}</h3></div><strong>${visibleItems.length} 首</strong></header><div class="import-track-list">${visibleItems.map(renderTrack).join("")}</div></section></div>`;
+    stopImportAlbumNameScroll();
+    container.innerHTML = `<div class="import-review"><aside class="import-album-list"><div class="import-review-label">本次识别到 ${groups.size} 张专辑 · ${state.importFiles.length} 首音乐</div>${[...groups.entries()].map(([album, items]) => `<button class="import-album-item ${album === state.importSelectedAlbum ? "active" : ""}" data-import-album="${escapeHTML(album)}" title="${escapeHTML(album)}"><span>${escapeHTML(album)}</span><b>${items.length}</b></button>`).join("")}</aside><section class="import-album-detail"><header><div><span>正在审阅</span><h3>${escapeHTML(state.importSelectedAlbum)}</h3></div><strong>${visibleItems.length} 首</strong></header><div class="import-track-list">${visibleItems.map(renderTrack).join("")}</div></section></div>`;
     openDetails.forEach(index => {
         const details = container.querySelector(`[data-file-index="${index}"] details.import-edit-details`);
         if (details) details.open = true;
@@ -4401,10 +4486,11 @@ async function renderClipTagSuggestions() {
         $("clipTagSuggestions");
 
     const tags = await getAllTags();
+    const suggestions = tags.filter(tag => !state.clipTags.includes(tag));
 
 
     container.innerHTML =
-        tags
+        suggestions
             .map(
                 tag => `
 
@@ -5226,6 +5312,12 @@ function closeMusicContextPanels() {
 
 function setupEvents() {
 
+    $("sidebarCollapseBtn").addEventListener("click", () => {
+        setSidebarCollapsed(
+            !document.body.classList.contains("sidebar-collapsed")
+        );
+    });
+
     const saveTagAction = async () => {
         const action = state.tagAction;
         const name = normalizeTag($("tagActionName").value);
@@ -5357,6 +5449,19 @@ function setupEvents() {
 
             if (["name", "album", "artist", "genre", "year", "channels"].includes(field)) {
                 item[field] = event.target.value.replace(/\s+/g, " ").trim();
+                if (field === "album") {
+                    const selectionStart = event.target.selectionStart;
+                    clearTimeout(importAlbumRefreshTimer);
+                    importAlbumRefreshTimer = setTimeout(async () => {
+                        state.importSelectedAlbum = item.album || "未归档音乐";
+                        await renderSelectedFiles();
+                        const input = fileList.querySelector(`[data-file-index="${index}"] [data-file-field="album"]`);
+                        if (input) {
+                            input.focus();
+                            input.setSelectionRange(selectionStart, selectionStart);
+                        }
+                    }, 350);
+                }
             }
         }
     );
@@ -5364,12 +5469,21 @@ function setupEvents() {
 
     fileList.addEventListener(
         "click",
-        event => {
+        async event => {
 
             const albumButton = event.target.closest("[data-import-album]");
             if (albumButton) {
                 state.importSelectedAlbum = albumButton.dataset.importAlbum;
                 renderSelectedFiles();
+                return;
+            }
+
+            const removeImportFile = event.target.closest("[data-remove-import-file]");
+            if (removeImportFile) {
+                const index = Number(removeImportFile.dataset.removeImportFile);
+                clearTimeout(importAlbumRefreshTimer);
+                state.importFiles.splice(index, 1);
+                await renderSelectedFiles();
                 return;
             }
 
@@ -5485,6 +5599,15 @@ function setupEvents() {
             }
         }
     );
+
+    fileList.addEventListener("mouseover", event => {
+        const name = event.target.closest(".import-album-item span");
+        if (name && !name.contains(event.relatedTarget)) startImportAlbumNameScroll(name);
+    });
+    fileList.addEventListener("mouseout", event => {
+        const name = event.target.closest(".import-album-item span");
+        if (name && !name.contains(event.relatedTarget)) stopImportAlbumNameScroll();
+    });
 
 
     fileList.addEventListener(
@@ -6836,6 +6959,7 @@ async function init() {
 
         renderCandidateBadge();
 
+        setSidebarCollapsed(getSavedSidebarCollapsed(), { persist: false });
         setupThemeSwitcher();
         setupEvents();
 

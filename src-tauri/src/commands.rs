@@ -769,8 +769,9 @@ pub struct TagRecord {
 pub fn list_tags(state: tauri::State<'_, AppState>) -> Result<Vec<TagRecord>, String> {
     let conn = lock_db!(state);
     let mut stmt = conn.prepare(
-        "SELECT t.id, t.name, t.category, COUNT(mt.music_id) AS music_count \
+        "SELECT t.id, t.name, t.category, COUNT(DISTINCT mt.music_id) + COUNT(DISTINCT ct.clip_id) AS music_count \
          FROM tags t LEFT JOIN music_tags mt ON mt.tag_id = t.id \
+         LEFT JOIN clip_tags ct ON ct.tag_id = t.id \
          GROUP BY t.id, t.name, t.category \
          ORDER BY t.category, t.name COLLATE NOCASE"
     )

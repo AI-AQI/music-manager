@@ -69,19 +69,26 @@
         <!-- 左侧 -->
         <aside class="sidebar">
 
+            <div class="sidebar-controls">
+                <button id="sidebarCollapseBtn" class="sidebar-collapse-btn" type="button" aria-expanded="true" title="收起导航">
+                    <span aria-hidden="true">‹</span>
+                    <span>收起导航</span>
+                </button>
+            </div>
+
             <div class="sidebar-section">
                 <div class="sidebar-title">音乐库</div>
 
                 <button class="nav-item active" data-view="all">
                     <span>♫</span>
                     <span>全部音乐</span>
-                    <span class="nav-count" id="allCount">0</span>
+                    <span class="nav-count" id="allCount"><span class="nav-count-value">0</span></span>
                 </button>
 
                 <button class="nav-item" data-view="clips">
                     <span>◈</span>
                     <span>音乐片段</span>
-                    <span class="nav-count" id="clipCount">0</span>
+                    <span class="nav-count" id="clipCount"><span class="nav-count-value">0</span></span>
                 </button>
 
                 <button class="nav-item" data-view="recent">
@@ -382,6 +389,10 @@
                     可选择多个文件夹，自动扫描其中的 MP3 文件
                 </div>
 
+                <div class="drop-append-hint">
+                    再次选择会追加到本次导入，重复文件自动忽略
+                </div>
+
                 <div class="import-source-actions">
                     <button id="chooseFileBtn" class="secondary-btn">选择文件</button>
                     <button id="chooseFolderBtn" class="primary-btn">选择文件夹</button>
@@ -390,6 +401,7 @@
 
             <fieldset class="album-source-control">
                 <legend>专辑识别方式</legend>
+                <span class="album-source-label">专辑</span>
                 <label><input type="radio" name="albumSource" value="metadata" checked> 以 MP3 属性为准</label>
                 <label><input type="radio" name="albumSource" value="folder"> 以文件夹名称为准</label>
             </fieldset>
