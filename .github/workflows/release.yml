@@ -17,12 +17,12 @@ jobs:
       matrix:
         include:
           # Apple Silicon 原生构建 arm64
-          - runner: macos-14
+          - runner: macos-latest
             target: aarch64-apple-darwin
             arch: aarch64
-          # Intel 原生构建 x64（macos-13 是最后一个 Intel runner）
-          # 若 macos-13 退役，可改为在 macos-14 上交叉编译：rustup target add x86_64-apple-darwin
-          - runner: macos-13
+          # Intel 原生构建 x64（macos-13 已退役；macos-15-intel / macos-26-intel 是当前 GA 的 Intel 标签）
+          # 若将来 Intel 标签也退役，改为在 arm64 上交叉编译：rustup target add x86_64-apple-darwin
+          - runner: macos-15-intel
             target: x86_64-apple-darwin
             arch: x64
 
