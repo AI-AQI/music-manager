@@ -42,12 +42,12 @@
 1. 双击 `.dmg`，把「声场档案」拖进「应用程序」。
 2. 请按 Mac 芯片选择 DMG：M1/M2/M3/M4 下载文件名含 `aarch64` 的版本；Intel Mac 下载文件名含 `x64` 的版本。若 macOS 显示“已损坏”或阻止打开，请从同一个 GitHub Release 一并下载 `install-macos.sh`，然后在终端运行（DMG 路径按实际下载位置填写）：
    ```bash
-   bash "$HOME/Downloads/install-macos.sh" "$HOME/Downloads/music-manager_0.1.0_aarch64.dmg"
+   bash "$HOME/Downloads/install-macos.sh" "$HOME/Downloads/music-manager_0.1.2_aarch64.dmg"
    ```
    脚本会校验 DMG、复制应用并移除**该应用**的下载隔离标记；它会要求输入 Mac 管理员密码。
    已有旧版本时，在命令末尾加 `--replace`。
    ```bash
-   bash "$HOME/Downloads/install-macos.sh" "$HOME/Downloads/music-manager_0.1.0_aarch64.dmg" --replace
+   bash "$HOME/Downloads/install-macos.sh" "$HOME/Downloads/music-manager_0.1.2_aarch64.dmg" --replace
    ```
 3. 打开后点击右上角 **「＋ 导入音乐」**,选择或拖入你的音频文件。
 
@@ -118,7 +118,7 @@ cd src-tauri && cargo tauri dev
 
 ### 打包
 
-> **发布新版本前先更新版本号**：在 `src-tauri/Cargo.toml` 中修改 `version`，例如发布 `v0.1.1` 时设为 `version = "0.1.1"`。打包生成的 dmg 会使用这个版本号；GitHub Release 的 Tag 则使用带 `v` 的 `v0.1.1`。
+> **发布新版本前先更新版本号**：在 `src-tauri/Cargo.toml` 中修改 `version`，例如发布 `v0.1.2` 时设为 `version = "0.1.2"`。打包生成的 dmg 会使用这个版本号；GitHub Release 的 Tag 则使用带 `v` 的 `v0.1.2`。
 
 先确保装有两个 Mac 架构的 Rust 目标(仅需执行一次):
 
@@ -140,12 +140,12 @@ cd src-tauri && cargo tauri build --target x86_64-apple-darwin
 
 | 命令 | app / dmg |
 |---|---|
-| `--target aarch64-apple-darwin` | `target/aarch64-apple-darwin/release/bundle/macos/声场档案.app`<br>`target/aarch64-apple-darwin/release/bundle/dmg/声场档案_0.1.1_aarch64.dmg` |
-| `--target x86_64-apple-darwin` | `target/x86_64-apple-darwin/release/bundle/macos/声场档案.app`<br>`target/x86_64-apple-darwin/release/bundle/dmg/声场档案_0.1.1_x64.dmg` |
+| `--target aarch64-apple-darwin` | `target/aarch64-apple-darwin/release/bundle/macos/声场档案.app`<br>`target/aarch64-apple-darwin/release/bundle/dmg/声场档案_0.1.2_aarch64.dmg` |
+| `--target x86_64-apple-darwin` | `target/x86_64-apple-darwin/release/bundle/macos/声场档案.app`<br>`target/x86_64-apple-darwin/release/bundle/dmg/声场档案_0.1.2_x64.dmg` |
 
 发给朋友时说一句:M 芯片的 Mac 装 `aarch64` 版、老 Intel 的装 `x64` 版。
 
-> 备选:也可以打 Universal Binary(一个 dmg 通吃两种 Mac),`cargo tauri build --target universal-apple-darwin`,产物为 `声场档案_0.1.1_universal.dmg`,但体积约大一倍。我们默认用上面的分架构方式。
+> 备选:也可以打 Universal Binary(一个 dmg 通吃两种 Mac),`cargo tauri build --target universal-apple-darwin`,产物为 `声场档案_0.1.2_universal.dmg`,但体积约大一倍。我们默认用上面的分架构方式。
 
 发布 GitHub Release 时，同时上传 `aarch64` 和 `x64` 两个 `.dmg`，以及仓库中的 `scripts/install-macos.sh`。未签名应用从浏览器下载后可能显示“已损坏”；按上方「给使用者的说明」运行安装脚本。要彻底免提示需 Apple 开发者账号签名与公证($99/年)。
 
@@ -163,7 +163,9 @@ cd src-tauri && cargo tauri build --target x86_64-apple-darwin
 
 ### 数据模型
 
-数据库为 SQLite(文件 `library.db`,WAL 模式、外键开启),当前 `SCHEMA_VERSION = 8`,共 7 张表。所有 `*_at` 时间字段均为毫秒时间戳(INTEGER)。
+数据库为 SQLite(文件 `library.db`,WAL 模式、外键开启),当前 schema 版本为 `2`,共 7 张表。所有 `*_at` 时间字段均为毫秒时间戳(INTEGER)。
+
+旧版 Tag 数据库首次升级时会先通过 SQLite 生成 `library.pre-tag-tree-v1.db` 完整备份，再在事务中迁移。升级后的数据库不支持由旧版程序直接写入；如需降级，请先关闭应用并恢复该备份。程序检测到高于自身支持范围的 schema 版本时会停止写入。
 
 **music**(主键 `id`,音乐元数据;只存路径,不存音频文件本身)
 
@@ -200,22 +202,24 @@ cd src-tauri && cargo tauri build --target x86_64-apple-darwin
 
 索引:`music_id`、`created_at`。
 
-**tags / tag_categories**(标签与分类)
+**tags / tag_categories**(树形标签与筛选维度)
 
 `tags`:
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
 | id | INTEGER PK AUTOINCREMENT | 标签 id |
-| name | TEXT NOT NULL UNIQUE COLLATE NOCASE | 标签名(不区分大小写) |
-| category | TEXT NOT NULL DEFAULT '自定义' FK→tag_categories(name) | 所属分类 |
+| name | TEXT NOT NULL COLLATE NOCASE | 标签名；同一父节点内不区分大小写且唯一 |
+| category_id | INTEGER NOT NULL FK→tag_categories(id) ON DELETE RESTRICT | 所属筛选维度 |
+| parent_id | INTEGER NULL FK→tags(id) ON DELETE RESTRICT | 父 Tag；NULL 表示维度根节点 |
 | created_at | INTEGER NOT NULL | ms 时间戳 |
 
 `tag_categories`:
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
-| name | TEXT PK COLLATE NOCASE | 分类名 |
+| id | INTEGER PK AUTOINCREMENT | 筛选维度 id |
+| name | TEXT NOT NULL UNIQUE COLLATE NOCASE | 筛选维度名 |
 | created_at | INTEGER NOT NULL | ms 时间戳 |
 
 **music_tags / clip_tags**(音乐/片段与标签的多对多关联)

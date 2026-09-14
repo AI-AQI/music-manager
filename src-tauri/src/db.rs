@@ -1,9 +1,10 @@
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use std::fs;
 use std::path::PathBuf;
 use tauri::Manager;
 
 pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+const SCHEMA_VERSION: i64 = 2;
 
 pub fn db_path(app: &tauri::App) -> Result<PathBuf, String> {
     let dir = app
@@ -20,7 +21,7 @@ pub fn db_path(app: &tauri::App) -> Result<PathBuf, String> {
 pub fn init(app: &tauri::App) -> Result<Connection, String> {
     let path = db_path(app)?;
 
-    let conn = Connection::open(&path)
+    let mut conn = Connection::open(&path)
         .map_err(|e| format!("无法打开数据库: {e}"))?;
 
     conn.pragma_update(None, "journal_mode", "WAL")
@@ -29,12 +30,27 @@ pub fn init(app: &tauri::App) -> Result<Connection, String> {
     conn.pragma_update(None, "foreign_keys", "ON")
         .map_err(|e| format!("设置外键失败: {e}"))?;
 
-    migrate(&conn)?;
+    if has_column(&conn, "tags", "category")
+        || has_column(&conn, "music", "tags")
+        || has_column(&conn, "clips", "tags")
+    {
+        backup_legacy_database(&conn, &path)?;
+    }
+
+    migrate(&mut conn)?;
 
     Ok(conn)
 }
 
-fn migrate(conn: &Connection) -> Result<(), String> {
+fn backup_legacy_database(conn: &Connection, path: &std::path::Path) -> Result<(), String> {
+    let backup = path.with_file_name("library.pre-tag-tree-v1.db");
+    if backup.exists() { return Ok(()); }
+    conn.execute("VACUUM main INTO ?1", params![backup.to_string_lossy().as_ref()])
+        .map_err(|e| format!("备份旧数据库失败: {e}"))?;
+    Ok(())
+}
+
+fn migrate(conn: &mut Connection) -> Result<(), String> {
     conn.execute_batch(
         r#"
         CREATE TABLE IF NOT EXISTS music (
@@ -92,14 +108,16 @@ fn migrate(conn: &Connection) -> Result<(), String> {
         );
 
         CREATE TABLE IF NOT EXISTS tag_categories (
-            name        TEXT PRIMARY KEY COLLATE NOCASE,
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            name        TEXT NOT NULL UNIQUE COLLATE NOCASE,
             created_at  INTEGER NOT NULL
         );
 
         CREATE TABLE IF NOT EXISTS tags (
             id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            name        TEXT NOT NULL UNIQUE COLLATE NOCASE,
-            category    TEXT NOT NULL DEFAULT '' COLLATE NOCASE REFERENCES tag_categories(name),
+            name        TEXT NOT NULL COLLATE NOCASE,
+            category_id INTEGER NOT NULL REFERENCES tag_categories(id) ON DELETE RESTRICT,
+            parent_id   INTEGER REFERENCES tags(id) ON DELETE RESTRICT,
             created_at  INTEGER NOT NULL
         );
 
@@ -132,21 +150,34 @@ fn migrate(conn: &Connection) -> Result<(), String> {
     )
     .map_err(|e| format!("建表失败: {e}"))?;
 
-    // 尚未发版，开发期仅做一次幂等初始化；不维护内部 schema 版本序列。
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as i64;
-    for category in ["情绪", "节奏", "用途", "人声", "风格", "结构", ""] {
-        conn.execute("INSERT OR IGNORE INTO tag_categories (name, created_at) VALUES (?1, ?2)", params![category, now])
-            .map_err(|e| format!("初始化 Tag 分类失败: {e}"))?;
+    // 旧版本的分类表以 name 为主键，tags 以 category 文本引用。先在保留
+    // Tag ID 的前提下重建为维度 + 自关联节点，关联表无需改写数据。
+    let recorded_schema = conn.query_row(
+        "SELECT value FROM app_metadata WHERE key='schema_version'",
+        [],
+        |row| row.get::<_, String>(0),
+    ).optional().map_err(|e| format!("读取数据库版本失败: {e}"))?
+        .and_then(|value| value.parse::<i64>().ok()).unwrap_or(0);
+    if recorded_schema > SCHEMA_VERSION {
+        return Err(format!("数据库版本 {recorded_schema} 高于当前程序支持的版本 {SCHEMA_VERSION}，已停止写入"));
     }
+
+    if has_column(conn, "tags", "category") { migrate_legacy_tag_tree(conn)?; }
+    conn.execute_batch("CREATE UNIQUE INDEX IF NOT EXISTS idx_tags_sibling_name ON tags(category_id, COALESCE(parent_id, -1), name COLLATE NOCASE); CREATE INDEX IF NOT EXISTS idx_tags_category_parent ON tags(category_id, parent_id);")
+        .map_err(|e| format!("建立 Tag 树索引失败: {e}"))?;
     if has_column(conn, "music", "tags") {
-        migrate_json_tags(conn, "music", "id", "music_tags", "music_id")?;
-        conn.execute("ALTER TABLE music DROP COLUMN tags", [])
+        let tx = conn.transaction().map_err(|e| format!("开启音乐 Tag 迁移事务失败: {e}"))?;
+        migrate_json_tags(&tx, "music", "id", "music_tags", "music_id")?;
+        tx.execute("ALTER TABLE music DROP COLUMN tags", [])
             .map_err(|e| format!("移除旧音乐 Tag 列失败: {e}"))?;
+        tx.commit().map_err(|e| format!("提交音乐 Tag 迁移失败: {e}"))?;
     }
     if has_column(conn, "clips", "tags") {
-        migrate_json_tags(conn, "clips", "id", "clip_tags", "clip_id")?;
-        conn.execute("ALTER TABLE clips DROP COLUMN tags", [])
+        let tx = conn.transaction().map_err(|e| format!("开启片段 Tag 迁移事务失败: {e}"))?;
+        migrate_json_tags(&tx, "clips", "id", "clip_tags", "clip_id")?;
+        tx.execute("ALTER TABLE clips DROP COLUMN tags", [])
             .map_err(|e| format!("移除旧片段 Tag 列失败: {e}"))?;
+        tx.commit().map_err(|e| format!("提交片段 Tag 迁移失败: {e}"))?;
     }
     for (column, definition) in [
         ("file_bookmark", "BLOB"), ("album_source", "TEXT NOT NULL DEFAULT 'folder'"),
@@ -163,14 +194,6 @@ fn migrate(conn: &Connection) -> Result<(), String> {
     // 以便启动同步后直接反映 Finder 中的专辑文件夹改名。
     conn.execute("UPDATE music SET album_source='folder' WHERE album_source IS NULL OR album_source='' OR album_source='legacy'", [])
         .map_err(|e| format!("迁移专辑来源失败: {e}"))?;
-    conn.execute("INSERT OR IGNORE INTO tag_categories (name, created_at) SELECT DISTINCT category, created_at FROM tags", [])
-        .map_err(|e| format!("初始化 Tag 分类失败: {e}"))?;
-    conn.execute("INSERT OR IGNORE INTO tag_categories (name, created_at) VALUES ('', ?1)", params![now])
-        .map_err(|e| format!("初始化未分类 Tag 失败: {e}"))?;
-    conn.execute("UPDATE tags SET category='' WHERE category='自定义'", [])
-        .map_err(|e| format!("迁移自定义 Tag 分类失败: {e}"))?;
-    conn.execute("DELETE FROM tag_categories WHERE name='自定义'", [])
-        .map_err(|e| format!("移除自定义 Tag 分类失败: {e}"))?;
     conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_music_path ON music(path)", [])
         .map_err(|e| format!("建立音乐路径唯一索引失败: {e}"))?;
     seed_standard_tags(conn)?;
@@ -178,6 +201,10 @@ fn migrate(conn: &Connection) -> Result<(), String> {
         "INSERT INTO app_metadata (key, value) VALUES ('app_version', ?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
         params![APP_VERSION],
     ).map_err(|e| format!("记录应用版本失败: {e}"))?;
+    conn.execute(
+        "INSERT INTO app_metadata (key, value) VALUES ('schema_version', ?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        params![SCHEMA_VERSION.to_string()],
+    ).map_err(|e| format!("记录数据库版本失败: {e}"))?;
 
     Ok(())
 }
@@ -199,7 +226,7 @@ fn seed_standard_tags(conn: &Connection) -> Result<(), String> {
     }
 
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as i64;
-    for category in ["情绪", "节奏", "用途", "人声", "风格", "结构", ""] {
+    for category in ["情绪", "节奏", "用途", "人声", "风格", "结构", "未分类"] {
         conn.execute("INSERT OR IGNORE INTO tag_categories (name, created_at) VALUES (?1, ?2)", params![category, now])
             .map_err(|e| format!("初始化 Tag 分类失败: {e}"))?;
     }
@@ -217,7 +244,7 @@ fn seed_standard_tags(conn: &Connection) -> Result<(), String> {
         // 剪辑结构
         "渐强", "高潮", "铺底", "循环友好",
     ] {
-        conn.execute("INSERT OR IGNORE INTO tags (name, category, created_at) VALUES (?1, ?2, ?3)", params![name, tag_category(name), now])
+        conn.execute("INSERT OR IGNORE INTO tags (name, category_id, created_at) VALUES (?1, (SELECT id FROM tag_categories WHERE name=?2), ?3)", params![name, tag_category(name), now])
             .map_err(|e| format!("初始化预设 Tag 失败: {e}"))?;
     }
     Ok(())
@@ -235,13 +262,67 @@ pub(crate) fn tag_category(name: &str) -> &'static str {
     }
 }
 
-fn ensure_tag(conn: &Connection, name: &str, created_at: i64) -> Result<i64, String> {
+fn ensure_tag(conn: &Connection, name: &str, created_at: i64) -> Result<i64, String> {    /* 先复用同名 Tag，避免迁移时给已有 Tag 再造一份副本（维度不同也算同一个名字）。 */
+    let existing: Option<i64> = conn
+        .query_row(
+            "SELECT t.id FROM tags t JOIN tag_categories c ON c.id=t.category_id
+             WHERE t.name=?1 COLLATE NOCASE
+             ORDER BY c.name='未分类', t.parent_id IS NOT NULL, t.id
+             LIMIT 1",
+            params![name],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| format!("读取 Tag 失败: {e}"))?;
+    if let Some(id) = existing {
+        return Ok(id);
+    }
+
+    /* 预设名单里的 Tag 落到它所属的维度；名单外的（用户自建）进「未分类」，
+       不能拿 tag_category 的空串去建维度，否则会多出一个没名字的维度。 */
+    let standard = tag_category(name);
+    let category = if standard.is_empty() { "未分类" } else { standard };
+    conn.execute("INSERT OR IGNORE INTO tag_categories (name, created_at) VALUES (?1, ?2)", params![category, created_at])
+        .map_err(|e| format!("创建 Tag 维度失败: {e}"))?;
     conn.execute(
-        "INSERT OR IGNORE INTO tags (name, category, created_at) VALUES (?1, ?2, ?3)",
-        params![name, tag_category(name), created_at],
+        "INSERT OR IGNORE INTO tags (name, category_id, created_at) VALUES (?1, (SELECT id FROM tag_categories WHERE name=?2), ?3)",
+        params![name, category, created_at],
     ).map_err(|e| format!("迁移 Tag 失败: {e}"))?;
-    conn.query_row("SELECT id FROM tags WHERE name=?1", params![name], |row| row.get(0))
+    conn.query_row("SELECT id FROM tags WHERE name=?1 AND category_id=(SELECT id FROM tag_categories WHERE name=?2)", params![name, category], |row| row.get(0))
         .map_err(|e| format!("读取 Tag 失败: {e}"))
+}
+
+fn migrate_legacy_tag_tree(conn: &mut Connection) -> Result<(), String> {
+    conn.pragma_update(None, "foreign_keys", "OFF").map_err(|e| format!("关闭外键失败: {e}"))?;
+    let result = (|| -> Result<(), String> {
+        let old_tag_count: i64 = conn.query_row("SELECT COUNT(*) FROM tags", [], |row| row.get(0))
+            .map_err(|e| format!("统计旧 Tag 失败: {e}"))?;
+        let tx = conn.transaction().map_err(|e| format!("开启 Tag 迁移事务失败: {e}"))?;
+        tx.execute_batch("DROP TABLE IF EXISTS tag_categories_v2; DROP TABLE IF EXISTS tags_v2;")
+            .map_err(|e| format!("准备 Tag 迁移失败: {e}"))?;
+        tx.execute_batch("CREATE TABLE tag_categories_v2 (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE COLLATE NOCASE, created_at INTEGER NOT NULL); CREATE TABLE tags_v2 (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL COLLATE NOCASE, category_id INTEGER NOT NULL REFERENCES tag_categories_v2(id) ON DELETE RESTRICT, parent_id INTEGER REFERENCES tags_v2(id) ON DELETE RESTRICT, created_at INTEGER NOT NULL);")
+            .map_err(|e| format!("创建新版 Tag 表失败: {e}"))?;
+        tx.execute("INSERT INTO tag_categories_v2 (name, created_at) SELECT CASE WHEN name='' OR name='自定义' THEN '未分类' ELSE name END, MIN(created_at) FROM tag_categories GROUP BY CASE WHEN name='' OR name='自定义' THEN '未分类' ELSE name END", [])
+            .map_err(|e| format!("迁移 Tag 维度失败: {e}"))?;
+        tx.execute("INSERT OR IGNORE INTO tag_categories_v2 (name, created_at) SELECT CASE WHEN category='' OR category='自定义' THEN '未分类' ELSE category END, MIN(created_at) FROM tags GROUP BY CASE WHEN category='' OR category='自定义' THEN '未分类' ELSE category END", [])
+            .map_err(|e| format!("补齐 Tag 维度失败: {e}"))?;
+        tx.execute("INSERT INTO tags_v2 (id, name, category_id, parent_id, created_at) SELECT t.id, t.name, c.id, NULL, t.created_at FROM tags t JOIN tag_categories_v2 c ON c.name=CASE WHEN t.category='' OR t.category='自定义' THEN '未分类' ELSE t.category END", [])
+            .map_err(|e| format!("迁移 Tag 节点失败: {e}"))?;
+        let new_tag_count: i64 = tx.query_row("SELECT COUNT(*) FROM tags_v2", [], |row| row.get(0))
+            .map_err(|e| format!("验证新版 Tag 失败: {e}"))?;
+        if new_tag_count != old_tag_count { return Err("Tag 迁移数量校验失败".into()); }
+        tx.execute_batch("DROP TABLE tags; DROP TABLE tag_categories; ALTER TABLE tag_categories_v2 RENAME TO tag_categories; ALTER TABLE tags_v2 RENAME TO tags; CREATE UNIQUE INDEX idx_tags_sibling_name ON tags(category_id, COALESCE(parent_id, -1), name COLLATE NOCASE); CREATE INDEX idx_tags_category_parent ON tags(category_id, parent_id);")
+            .map_err(|e| format!("切换新版 Tag 表失败: {e}"))?;
+        let mut check = tx.prepare("PRAGMA foreign_key_check").map_err(|e| format!("准备外键校验失败: {e}"))?;
+        if check.query([]).map_err(|e| format!("执行外键校验失败: {e}"))?.next().map_err(|e| format!("读取外键校验失败: {e}"))?.is_some() {
+            return Err("Tag 迁移后的外键校验失败".into());
+        }
+        drop(check);
+        tx.commit().map_err(|e| format!("提交 Tag 迁移失败: {e}"))?;
+        Ok(())
+    })();
+    conn.pragma_update(None, "foreign_keys", "ON").map_err(|e| format!("恢复外键失败: {e}"))?;
+    result
 }
 
 fn migrate_json_tags(conn: &Connection, table: &str, id_column: &str, join_table: &str, join_id: &str) -> Result<(), String> {
@@ -263,4 +344,118 @@ fn migrate_json_tags(conn: &Connection, table: &str, id_column: &str, join_table
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_backup_contains_committed_data() {
+        let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let dir = std::env::temp_dir().join(format!("music-manager-backup-test-{}-{nonce}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("library.db");
+        let conn = Connection::open(&source).unwrap();
+        conn.execute_batch("CREATE TABLE sample(value TEXT); INSERT INTO sample VALUES ('ok');").unwrap();
+
+        backup_legacy_database(&conn, &source).unwrap();
+
+        let backup = Connection::open(dir.join("library.pre-tag-tree-v1.db")).unwrap();
+        let value: String = backup.query_row("SELECT value FROM sample", [], |row| row.get(0)).unwrap();
+        assert_eq!(value, "ok");
+        drop(backup);
+        drop(conn);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn add_tag(conn: &Connection, name: &str, category: &str, parent_id: Option<i64>) -> i64 {
+        conn.execute(
+            "INSERT INTO tags (name, category_id, parent_id, created_at)
+             VALUES (?1, (SELECT id FROM tag_categories WHERE name=?2), ?3, 0)",
+            params![name, category, parent_id],
+        ).unwrap();
+        conn.last_insert_rowid()
+    }
+
+    fn tag_count(conn: &Connection, name: &str) -> i64 {
+        conn.query_row("SELECT COUNT(*) FROM tags WHERE name=?1", params![name], |r| r.get(0)).unwrap()
+    }
+
+    #[test]
+    fn migrates_legacy_tag_schema_and_preserves_ids() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        conn.execute_batch(
+            r#"
+            CREATE TABLE tag_categories (
+                name TEXT PRIMARY KEY COLLATE NOCASE,
+                created_at INTEGER NOT NULL
+            );
+            CREATE TABLE tags (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL UNIQUE COLLATE NOCASE,
+                category TEXT NOT NULL DEFAULT '' COLLATE NOCASE REFERENCES tag_categories(name),
+                created_at INTEGER NOT NULL
+            );
+            INSERT INTO tag_categories (name, created_at) VALUES ('情绪', 1), ('', 2);
+            INSERT INTO tags (id, name, category, created_at) VALUES (42, '温暖', '情绪', 3), (77, '自建', '', 4);
+            "#,
+        ).unwrap();
+
+        migrate(&mut conn).unwrap();
+
+        assert!(!has_column(&conn, "tags", "category"));
+        assert!(has_column(&conn, "tags", "category_id"));
+        let rows: Vec<(i64, String)> = conn.prepare(
+            "SELECT t.id, c.name FROM tags t JOIN tag_categories c ON c.id=t.category_id WHERE t.id IN (42,77) ORDER BY t.id"
+        ).unwrap().query_map([], |row| Ok((row.get(0)?, row.get(1)?))).unwrap()
+            .collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!(rows, vec![(42, "情绪".into()), (77, "未分类".into())]);
+        let version: String = conn.query_row("SELECT value FROM app_metadata WHERE key='schema_version'", [], |row| row.get(0)).unwrap();
+        assert_eq!(version, SCHEMA_VERSION.to_string());
+    }
+
+    #[test]
+    fn legacy_tag_migration_preserves_join_rows() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            r#"
+            CREATE TABLE tag_categories (name TEXT PRIMARY KEY COLLATE NOCASE, created_at INTEGER NOT NULL);
+            CREATE TABLE tags (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE COLLATE NOCASE, category TEXT NOT NULL DEFAULT '' COLLATE NOCASE REFERENCES tag_categories(name), created_at INTEGER NOT NULL);
+            CREATE TABLE music_tags (music_id TEXT NOT NULL, tag_id INTEGER NOT NULL REFERENCES tags(id) ON DELETE CASCADE, PRIMARY KEY (music_id, tag_id));
+            CREATE TABLE clip_tags (clip_id TEXT NOT NULL, tag_id INTEGER NOT NULL REFERENCES tags(id) ON DELETE CASCADE, PRIMARY KEY (clip_id, tag_id));
+            INSERT INTO tag_categories (name, created_at) VALUES ('情绪', 1);
+            INSERT INTO tags (id, name, category, created_at) VALUES (42, '温暖', '情绪', 2);
+            INSERT INTO music_tags (music_id, tag_id) VALUES ('m1', 42);
+            INSERT INTO clip_tags (clip_id, tag_id) VALUES ('c1', 42);
+            "#,
+        ).unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+
+        migrate_legacy_tag_tree(&mut conn).unwrap();
+
+        let music_tag: i64 = conn.query_row("SELECT tag_id FROM music_tags WHERE music_id='m1'", [], |row| row.get(0)).unwrap();
+        let clip_tag: i64 = conn.query_row("SELECT tag_id FROM clip_tags WHERE clip_id='c1'", [], |row| row.get(0)).unwrap();
+        assert_eq!((music_tag, clip_tag), (42, 42));
+    }
+
+    #[test]
+    fn newer_schema_is_rejected() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        migrate(&mut conn).unwrap();
+        conn.execute("UPDATE app_metadata SET value='999' WHERE key='schema_version'", []).unwrap();
+        let error = migrate(&mut conn).unwrap_err();
+        assert!(error.contains("高于当前程序支持"));
+    }
+
+    #[test]
+    fn same_name_tags_in_different_categories_are_preserved() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        migrate(&mut conn).unwrap();
+        add_tag(&conn, "现场", "情绪", None);
+        add_tag(&conn, "现场", "未分类", None);
+        migrate(&mut conn).unwrap();
+        assert_eq!(tag_count(&conn, "现场"), 2);
+    }
 }

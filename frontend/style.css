@@ -285,6 +285,43 @@ body[data-theme="sky"] .top-actions .candidate-panel-trigger.is-active {
     text-transform: uppercase;
 }
 
+.tag-section .sidebar-title {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+}
+
+.tag-section .sidebar-title-actions {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+
+#sidebarTagManageBtn,
+#sidebarTagClearBtn {
+    border: 1px solid var(--border);
+    border-radius: var(--r-pill);
+    padding: 2px 9px;
+    min-height: 0;
+
+    background: transparent;
+    color: var(--subtext);
+    cursor: pointer;
+    font: inherit;
+    font-size: 11px;
+    font-weight: 500;
+    letter-spacing: normal;
+    text-transform: none;
+    white-space: nowrap;
+}
+
+#sidebarTagManageBtn:hover,
+#sidebarTagClearBtn:hover {
+    border-color: var(--primary);
+    color: var(--primary-strong);
+}
+
 .nav-item {
     position: relative;
 
@@ -371,16 +408,205 @@ body[data-theme="sky"] .top-actions .candidate-panel-trigger.is-active {
 .sidebar-tags {
     display: flex;
     flex-direction: column;
-    gap: 2px;
+
+    /* 与上方 .sidebar-title / .nav-item 的内容盒对齐：左侧 12px 内缩让维度名、
+       Tag 行与导航项站在同一条左对齐线上，右侧 8px 让 Tag 计数徽标、维度开合与
+       导航计数徽标落在同一条右对齐线上（徽标本身还带 4px 行内边距）。 */
+    padding: 0 8px 0 12px;
+}
+
+
+/* 侧边栏 Tag 树：Musicbed 式分面列表——维度整宽行 + checkbox Tag 行 */
+
+.sidebar-tag-tree {
+    display: flex;
+    flex-direction: column;
+}
+
+.sidebar-tag-dimension {
+    border-bottom: 1px solid var(--border);
+}
+
+.sidebar-tag-dimension-row {
+    display: flex;
+    align-items: center;
+
+    /* 与 .nav-item 一致：18px 图标列 + 11px 间距，维度名正好落在导航文字那一列。 */
+    gap: 11px;
+
+    /* 行高贴近导航项（32px）而不是原来的 46px，维度行才像同一套侧栏组件。 */
+    min-height: 38px;
+
+    /* 左右内缩由 .sidebar-tags 统一提供，只在这里保留 4px，
+       让维度开合按钮与上方导航计数徽标右对齐。 */
+    padding: 6px 4px 6px 0;
+
+    cursor: pointer;
+}
+
+/* 维度图标沿用导航项「图标 + 文案」的排布，避免维度行显得孤立。 */
+.sidebar-tag-dimension-icon {
+    flex-shrink: 0;
+    width: 18px;
+
+    color: var(--text);
+    text-align: center;
+    font-size: 13px;
+    opacity: .9;
+}
+
+.sidebar-tag-dimension-name {
+    flex-shrink: 0;
+
+    /* 字号、字重与 .nav-item 看齐，不再比导航项更抢眼。 */
+    color: var(--text);
+    font-size: 13px;
+    font-weight: 500;
+}
+
+/* 维度名右侧截断显示该维度已选中的 Tag 名（收起态也保留）。 */
+.sidebar-tag-dimension-selected {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+
+    color: var(--subtext);
+    font-size: 12px;
+}
+
+.sidebar-tag-dimension-pill {
+    flex-shrink: 0;
+
+    min-width: 18px;
+    height: 18px;
+    padding: 0 5px;
+
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+
+    border-radius: 99px;
+
+    background: var(--primary-strong);
+    color: #ffffff;
+    font-size: 11px;
+    font-weight: 600;
+    line-height: 1;
+}
+
+/* 维度开合：1.5px 圆头细线箭头（markup 里是 <svg class="chevron">）。
+   不用「＋/×」——× 会被读成删除，而管理态里维度行本来就有 ＋（新增根 Tag）和
+   ×（删除维度）两个按钮；也不用实心三角 ▼/▶ 或字符字形，那个尺寸下太笨重 /
+   太糊，细线圆头描边只有 SVG 画得出。 */
+.sidebar-tag-dimension-toggle {
+    border: 0;
+    background: transparent;
+    padding: 0;
+    width: 22px;
+    height: 22px;
+    flex-shrink: 0;
+
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+
+    color: var(--subtext);
+    cursor: pointer;
+}
+
+/* 展开向下「⌄」；收起时整枚箭头转 -90° 变成向右「›」。
+   方向只看 aria-expanded，所以 JS 侧不需要再输出或替换任何字形。 */
+.sidebar-tag-dimension-toggle .chevron,
+.sidebar-tag-caret .chevron {
+    display: block;
+    width: 12px;
+    height: 12px;
+    transition: transform 0.16s ease;
+}
+
+.sidebar-tag-caret .chevron { width: 10px; height: 10px; }
+
+.sidebar-tag-dimension-toggle[aria-expanded="false"] .chevron,
+.sidebar-tag-caret[aria-expanded="false"] .chevron {
+    transform: rotate(-90deg);
+}
+
+.sidebar-tag-dimension-row:hover .sidebar-tag-dimension-toggle,
+.sidebar-tag-dimension-toggle:hover {
+    color: var(--text);
+}
+
+.sidebar-tag-dimension-body {
+    display: flex;
+    flex-direction: column;
+    padding: 0 0 10px;
+}
+
+.sidebar-tag-dimension.is-collapsed .sidebar-tag-dimension-body {
+    display: none;
+}
+
+/* 有子级的 Tag 行在 checkbox 左侧放同一款细线箭头，尺寸比维度那枚小一档。 */
+.sidebar-tag-caret {
+    border: 0;
+    background: transparent;
+    padding: 0;
+    width: 17px;
+    height: 17px;
+    flex-shrink: 0;
+
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+
+    border-radius: var(--r-sm);
+
+    color: var(--subtext);
+    cursor: pointer;
+}
+
+.sidebar-tag-caret:hover {
+    background: var(--hover);
+    color: var(--text);
+}
+
+.sidebar-tag-caret-spacer {
+    width: 17px;
+    flex-shrink: 0;
+}
+
+.sidebar-tag-row {
+    display: flex;
+    align-items: center;
+
+    /* 层级越深缩进越多，但侧栏宽度就这么多：缩进到第 3 层就不再增长，
+       否则深层级的 Tag 名（连同 checkbox）会被右侧操作按钮挤到看不见。 */
+    margin-left: min(calc(var(--tag-depth, 0) * 12px), 36px);
+
+    border-radius: var(--r-sm);
+}
+
+.sidebar-tag-children {
+    display: flex;
+    flex-direction: column;
+}
+
+.sidebar-tag-children.is-collapsed {
+    display: none;
 }
 
 .sidebar-tag {
+    flex: 1;
+    min-width: 0;
+
     border: 0;
     background: transparent;
 
-    padding: 8px 12px;
+    padding: 6px 4px;
 
-    border-radius: 9px;
+    border-radius: var(--r-sm);
 
     display: flex;
     align-items: center;
@@ -390,10 +616,102 @@ body[data-theme="sky"] .top-actions .candidate-panel-trigger.is-active {
 
     cursor: pointer;
 
-    color: #5a6073;
+    color: var(--text);
+    font: inherit;
     font-size: 13px;
 
-    transition: background 0.15s, color 0.15s;
+    touch-action: none;
+    user-select: none;
+    -webkit-user-select: none;
+}
+
+/* ---------- 侧栏内联编辑（新增/重命名维度与 Tag） ---------- */
+
+/* 原位输入框：底下一道强调色细线，其余和所在行保持同一排版。
+   高度锁成 18px（= 文字行高），下划线算在盒内，这样切到编辑态时
+   这一行不会比只读态高出来几个像素。 */
+.sidebar-tag-input {
+    flex: 1;
+    min-width: 0;
+
+    box-sizing: border-box;
+    height: 18px;
+    padding: 0;
+
+    border: 0;
+    border-bottom: 1px solid var(--primary);
+    border-radius: 0;
+    background: transparent;
+
+    color: inherit;
+    font: inherit;
+    font-size: 13px;
+    line-height: 18px;
+
+    user-select: text;
+    -webkit-user-select: text;
+    outline: none;
+}
+
+.sidebar-tag-input::placeholder {
+    color: var(--subtext);
+    opacity: .85;
+}
+
+/* 维度名本身是 500 字重，重命名时输入框别掉回 400。 */
+.sidebar-tag-dimension-row .sidebar-tag-input {
+    font-weight: 500;
+}
+
+/* 重命名的那一行整体变成可输入状态：不要按钮手势，也不要禁止选中文字。 */
+.sidebar-tag.is-editing {
+    cursor: default;
+    touch-action: auto;
+    user-select: auto;
+    -webkit-user-select: auto;
+}
+
+/* 新增时的空 checkbox 只作为占位，画出位置不画对勾。 */
+.sidebar-tag-checkbox.is-draft {
+    opacity: .5;
+}
+
+.sidebar-tag-dimension-row.is-draft .sidebar-tag-dimension-icon {
+    opacity: .5;
+}
+
+.sidebar-tag:hover {
+    background: var(--hover);
+}
+
+.sidebar-tag-checkbox {
+    width: 15px;
+    height: 15px;
+    flex-shrink: 0;
+
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+
+    border: 1px solid var(--border-strong);
+    border-radius: 3px;
+
+    background: transparent;
+    color: transparent;
+    font-size: 10px;
+    line-height: 1;
+
+    transition: background 0.15s, border-color 0.15s, color 0.15s;
+}
+
+.sidebar-tag.is-selected .sidebar-tag-checkbox {
+    background: var(--primary-strong);
+    border-color: var(--primary-strong);
+    color: #ffffff;
+}
+
+.sidebar-tag.is-selected .sidebar-tag-name {
+    font-weight: 600;
 }
 
 .sidebar-tag-name {
@@ -404,9 +722,112 @@ body[data-theme="sky"] .top-actions .candidate-panel-trigger.is-active {
     white-space: nowrap;
 }
 
-.sidebar-tag:hover {
-    background: var(--hover);
-    color: var(--text);
+.sidebar-tag-count {
+    flex-shrink: 0;
+
+    color: var(--subtext);
+    font-size: 11px;
+    font-variant-numeric: tabular-nums;
+}
+
+.sidebar-tag-ops {
+    display: none;
+    align-items: center;
+    gap: 1px;
+
+    padding-right: 4px;
+}
+
+.sidebar-tag-dimension-row .sidebar-tag-ops {
+    padding-right: 0;
+}
+
+.sidebar-tag-tree.is-managing .sidebar-tag-ops {
+    display: inline-flex;
+}
+
+/* 管理态下每行右侧已经有三个操作按钮，再挂一个数量会把 Tag 名挤没，
+   而且这时候用户关注的是结构而不是曲目数。 */
+.sidebar-tag-tree.is-managing .sidebar-tag-count {
+    display: none;
+}
+
+.sidebar-tag-ops button {
+    border: 0;
+    background: transparent;
+    padding: 0;
+    width: 17px;
+    height: 17px;
+
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+
+    color: var(--subtext);
+    cursor: pointer;
+    font-size: 13px;
+    line-height: 1;
+}
+
+.sidebar-tag-ops button:hover {
+    color: var(--primary-strong);
+}
+
+.sidebar-tag-ops button[data-sidebar-tag-delete]:hover,
+.sidebar-tag-ops button[data-dimension-delete]:hover {
+    color: var(--danger);
+}
+
+.sidebar-tag-row.is-dragging {
+    opacity: 0.45;
+}
+
+.sidebar-tag-row.is-drop-target {
+    outline: 2px solid var(--primary);
+    outline-offset: -2px;
+    background: var(--primary-light);
+}
+
+.sidebar-tag-dimension-row.is-drop-target {
+    outline: 2px solid var(--primary);
+    outline-offset: -2px;
+    background: var(--primary-light);
+}
+
+.sidebar-tag-add-dimension {
+    align-self: flex-start;
+    border: 1px dashed var(--primary);
+    border-radius: var(--r-pill);
+    padding: 4px 10px;
+    margin: 8px 0 0;
+
+    background: transparent;
+    color: var(--primary-strong);
+    cursor: pointer;
+    font: inherit;
+    font-size: 12px;
+}
+
+.sidebar-tag-add-dimension:hover {
+    background: var(--primary-light);
+}
+
+
+/* 打 Tag 时按维度分组的「已有 Tag」列表 */
+
+.tag-pick-group {
+    margin-bottom: 8px;
+}
+
+.tag-pick-group-title {
+    margin-bottom: 4px;
+    color: var(--subtext);
+    font-size: 11px;
+}
+
+.tag-pick-group-tags {
+    display: flex;
+    flex-wrap: wrap;
 }
 
 .empty-small {
@@ -473,9 +894,7 @@ body[data-theme="sky"] .top-actions .candidate-panel-trigger.is-active {
 .filter-panel-header,
 .bulk-toolbar,
 .bulk-tag-controls,
-.active-filter-tags,
-.recommended-tag-group,
-.recommended-tag-list {
+.active-filter-tags {
     display: flex;
     align-items: center;
     gap: 10px;
@@ -485,41 +904,7 @@ body[data-theme="sky"] .top-actions .candidate-panel-trigger.is-active {
 .filter-panel-header span { margin-left: 8px; font-size: 12px; color: var(--subtext); }
 .active-filter-tags { min-height: 0; flex-wrap: wrap; margin: 12px 0 4px; }
 .active-filter-tag { border: 0; border-radius: var(--r-pill); padding: 8px 12px; background: var(--primary-light); color: var(--primary-strong); cursor: pointer; font-size: 14px; }
-.recommended-tags { display: grid; gap: 9px; margin-top: 12px; }
-.recommended-tag-group { align-items: flex-start; min-height: 40px; width: 100%; box-sizing: border-box; }
-.recommended-tag-title { display: flex; align-items: center; gap: 2px; min-width: 42px; flex-shrink: 0; padding-top: 6px; color: var(--subtext); font-size: 12px; white-space: nowrap; }
-.recommended-tag-list { flex-wrap: wrap; }
-.recommended-tag { border: 1px solid var(--border-strong); border-radius: var(--r-pill); padding: 7px 12px; background: #fff; color: #5a6073; cursor: pointer; font-size: 14px; }
-.recommended-tag.active { color: var(--primary-strong); border-color: var(--primary); background: var(--primary-light); }
-.tag-manage-item { position: relative; display: inline-flex; align-items: center; }
-.tag-inline-edit, .tag-inline-delete, .category-inline-edit, .category-inline-delete, .category-add-btn { border: 0; background: transparent; cursor: pointer; color: var(--subtext); }
-.tag-inline-edit, .tag-inline-delete, .category-inline-edit, .category-inline-delete { display: none; width: 18px; padding: 0; font-size: 11px; }
-.is-managing .tag-manage-item:hover .tag-inline-edit, .is-managing .tag-manage-item:hover .tag-inline-delete { display: inline-flex; align-items: center; justify-content: center; }
-.is-managing .recommended-tag-title:hover .category-inline-edit, .is-managing .recommended-tag-title:hover .category-inline-delete { display: inline-flex; align-items: center; justify-content: center; }
-.tag-inline-delete:hover, .category-inline-delete:hover { color: var(--danger); }
-.category-add-btn { margin-left: 3px; color: var(--primary-strong); font-size: 15px; vertical-align: middle; }
-.tag-management-tools { display: flex; align-items: center; gap: 9px; }
-.tag-management-hint { color: var(--subtext); font-size: 11px; }
-.add-category-btn { align-self: start; border: 1px dashed var(--primary); border-radius: var(--r-pill); padding: 5px 10px; background: var(--primary-light); color: var(--primary-strong); cursor: pointer; font: inherit; font-size: 12px; }
-.is-managing .recommended-tag { cursor: grab; touch-action: none; user-select: none; -webkit-user-select: none; }
-.is-managing .recommended-tag.is-dragging { opacity: .45; cursor: grabbing; }
-.recommended-tag-group.is-drop-target { outline: 2px solid var(--primary); outline-offset: 3px; border-radius: var(--r-md); background: var(--primary-light); box-shadow: 0 0 0 4px var(--primary-light); }
 .tag-drag-ghost { position: fixed; z-index: 1000; pointer-events: none; padding: 6px 10px; border: 1px solid var(--primary); border-radius: var(--r-pill); background: #fff; color: var(--primary-strong); box-shadow: var(--shadow-md); font-size: 12px; transform: translate(-50%, -50%); }
-.tag-manager { margin-top: 16px; padding-top: 14px; border-top: 1px solid var(--border); }
-.tag-manager-heading { margin-bottom: 10px; font-size: 13px; font-weight: 700; }
-.tag-create-row, .tag-manager-row { display: flex; align-items: center; gap: 8px; }
-.tag-create-row input, .tag-create-row select, .tag-manager-row input, .tag-manager-row select { height: 34px; border: 1px solid var(--border-strong); border-radius: 8px; padding: 0 8px; background: #fff; font: inherit; font-size: 12px; }
-.tag-create-row input { width: 180px; }
-.tag-manager-list { display: grid; gap: 7px; margin-top: 12px; max-height: 260px; overflow-y: auto; }
-.tag-manager-row { padding: 7px; border: 1px solid var(--border); border-radius: var(--r-sm); background: #fafbfe; }
-.tag-manager-row input { flex: 1; min-width: 100px; }
-.tag-manager-row select { width: 82px; }
-.tag-manager-row .text-btn { color: var(--danger); }
-.tag-manager-group { display: grid; grid-template-columns: 58px 1fr; gap: 8px; align-items: start; }
-.tag-manager-group > span { padding-top: 6px; color: var(--subtext); font-size: 11px; }
-.tag-manager-group > div { display: flex; flex-wrap: wrap; gap: 6px; }
-.tag-manager-chip { border: 1px solid var(--border-strong); border-radius: var(--r-pill); padding: 5px 9px; background: #fff; color: #5a6073; cursor: pointer; font: inherit; font-size: 12px; }
-.tag-manager-chip:hover, .tag-manager-chip.active { border-color: var(--primary); background: var(--primary-light); color: var(--primary-strong); }
 .text-btn { border: 0; background: transparent; color: var(--primary-strong); cursor: pointer; font: inherit; font-size: 12px; white-space: nowrap; }
 .bulk-toolbar { justify-content: flex-start; background: var(--primary-light); }
 .bulk-toolbar #selectionCount { font-weight: 600; color: var(--primary-strong); }
@@ -2895,8 +3280,7 @@ body::before {
     font-size: 13px;
 }
 
-.nav-item:hover,
-.sidebar-tag:hover { background: rgba(255, 252, 244, 0.62); }
+.nav-item:hover { background: rgba(255, 252, 244, 0.62); }
 
 .nav-item.active {
     color: #f8f4e9;
@@ -2919,13 +3303,6 @@ body::before {
     color: inherit;
     border-radius: 2px;
 }
-
-.sidebar-tag {
-    border-radius: 3px;
-    color: #66746b;
-}
-
-.sidebar-tag::first-letter { color: var(--primary); }
 
 .content {
     position: relative;
@@ -3019,7 +3396,6 @@ body::before {
 .clip-library,
 .filter-panel,
 .bulk-toolbar,
-.tag-manager-row,
 .clip-item,
 .candidate-item,
 .selected-file-card,
@@ -3062,8 +3438,6 @@ body::before {
 
 .tag,
 .active-filter-tag,
-.recommended-tag,
-.tag-manager-chip,
 .editing-tag,
 .suggestion-tag {
     border-radius: 2px;
@@ -3073,13 +3447,6 @@ body::before {
     letter-spacing: 0.02em;
 }
 
-.recommended-tag.active,
-.tag-manager-chip:hover,
-.tag-manager-chip.active {
-    background: #d2dfd8;
-    color: #205b60;
-    border-color: #6e9389;
-}
 
 .primary-btn {
     border: 1px solid #184d53;
@@ -3185,11 +3552,7 @@ body::before {
 .detail-edit input,
 .tag-input-row input,
 .bulk-tag-controls input,
-.timeline-time input,
-.tag-create-row input,
-.tag-create-row select,
-.tag-manager-row input,
-.tag-manager-row select {
+.timeline-time input {
     border-radius: 3px;
     border-color: #bdb5a6;
     background: rgba(255, 253, 247, 0.74);
@@ -3369,10 +3732,9 @@ body::before {
 }
 
 .sidebar-title { color: #86a4ad; }
-.nav-item, .sidebar-tag { color: #6f8992; }
+.nav-item { color: #6f8992; }
 
-.nav-item:hover,
-.sidebar-tag:hover {
+.nav-item:hover {
     background: rgba(255,255,255,.55);
     color: #4d7785;
 }
@@ -3443,7 +3805,6 @@ body::before {
 .clip-library,
 .filter-panel,
 .bulk-toolbar,
-.tag-manager-row,
 .clip-item,
 .candidate-item,
 .selected-file-card,
@@ -3483,8 +3844,6 @@ body::before {
 
 .tag,
 .active-filter-tag,
-.recommended-tag,
-.tag-manager-chip,
 .editing-tag,
 .suggestion-tag {
     border-radius: var(--r-pill);
@@ -3493,13 +3852,6 @@ body::before {
     border-color: rgba(218, 165, 100, 0.25);
 }
 
-.recommended-tag.active,
-.tag-manager-chip:hover,
-.tag-manager-chip.active {
-    background: rgba(158, 213, 219, 0.32);
-    color: #4c8390;
-    border-color: rgba(91, 160, 174, .42);
-}
 
 .primary-btn {
     border-color: rgba(204, 113, 65, .42);
@@ -3598,11 +3950,7 @@ body::before {
 .detail-edit input,
 .tag-input-row input,
 .bulk-tag-controls input,
-.timeline-time input,
-.tag-create-row input,
-.tag-create-row select,
-.tag-manager-row input,
-.tag-manager-row select {
+.timeline-time input {
     border-radius: 10px;
     border-color: rgba(105, 153, 166, .32);
     background: rgba(255,255,255,.7);
@@ -3689,8 +4037,7 @@ body {
     font-weight: 700;
 }
 
-.nav-item,
-.sidebar-tag {
+.nav-item {
     color: #4f6d79;
     font-weight: 500;
 }
@@ -3714,8 +4061,6 @@ body {
 .result-info,
 .catalog-detail-count,
 .filter-panel-header span,
-.recommended-tag-title,
-.tag-manager-group > span,
 .detail-edit-hint {
     color: #607985;
 }
@@ -3756,7 +4101,6 @@ body {
 .music-card,
 .clip-library,
 .filter-panel,
-.tag-manager-row,
 .clip-item,
 .candidate-item,
 .selected-file-card,
@@ -3773,8 +4117,6 @@ body {
 
 .tag,
 .active-filter-tag,
-.recommended-tag,
-.tag-manager-chip,
 .editing-tag,
 .suggestion-tag {
     color: #87542f;
@@ -3872,8 +4214,6 @@ body {
 
 .tag,
 .active-filter-tag,
-.recommended-tag,
-.tag-manager-chip,
 .editing-tag,
 .suggestion-tag {
     background: rgba(218, 218, 243, 0.56);
@@ -3881,13 +4221,6 @@ body {
     border-color: rgba(127, 132, 190, 0.25);
 }
 
-.recommended-tag.active,
-.tag-manager-chip:hover,
-.tag-manager-chip.active {
-    background: rgba(176, 207, 231, 0.48);
-    color: #4e6999;
-    border-color: rgba(102, 126, 184, .4);
-}
 
 .primary-btn {
     border-color: rgba(85, 101, 166, .38);
@@ -4037,8 +4370,7 @@ body {
     letter-spacing: 0.12em;
 }
 
-.nav-item,
-.sidebar-tag {
+.nav-item {
     font-size: 13.5px;
     font-weight: 600;
 }
@@ -4088,8 +4420,6 @@ body {
 
 .tag,
 .active-filter-tag,
-.recommended-tag,
-.tag-manager-chip,
 .editing-tag,
 .suggestion-tag,
 .text-btn {
@@ -4115,8 +4445,7 @@ body {
 }
 
 .detail-section-title,
-.suggestion-title,
-.tag-manager-heading {
+.suggestion-title {
     font-size: 12px;
     font-weight: 700;
     letter-spacing: 0.04em;
@@ -4201,10 +4530,7 @@ button {
 
 .icon-action,
 .icon-btn,
-.player-btn,
-.category-add-btn,
-.tag-inline-edit,
-.tag-inline-delete {
+.player-btn {
     flex: 0 0 auto;
     overflow: visible;
     color: #355d70;
@@ -4285,12 +4611,9 @@ button {
 
 .text-btn,
 .active-filter-tag,
-.recommended-tag,
-.tag-manager-chip,
 .suggestion-tag,
 .tag-result-tab,
 .tag-page-item,
-.add-category-btn,
 .tag-drop-zone {
     min-height: 32px;
     height: auto;
@@ -4309,23 +4632,9 @@ button {
     white-space: nowrap;
 }
 
-.category-add-btn,
-.tag-inline-edit,
-.tag-inline-delete {
-    min-width: 28px;
-    min-height: 28px;
-    align-items: center;
-    justify-content: center;
-    color: #4c639f;
-    font-size: 17px;
-    font-weight: 700;
-}
-
 .filter-panel-header,
 .bulk-toolbar,
 .bulk-tag-controls,
-.tag-create-row,
-.tag-manager-row,
 .file-location,
 .timeline-buttons,
 .clip-editor-preview,
@@ -4338,13 +4647,6 @@ button {
 
 .bulk-toolbar { row-gap: 10px; }
 .bulk-tag-controls { margin-left: auto; }
-
-.tag-create-row input,
-.tag-create-row select {
-    flex: 1 1 150px;
-    width: auto;
-    min-width: 120px;
-}
 
 .file-location button {
     flex: 1 1 132px;
@@ -4531,7 +4833,6 @@ body::before {
 
 .sidebar-title,
 .nav-item,
-.sidebar-tag,
 .empty-small,
 .page-description,
 .music-meta,
@@ -4547,8 +4848,6 @@ body::before {
 .clip-current-time,
 .catalog-detail-count,
 .filter-panel-header span,
-.recommended-tag-title,
-.tag-manager-group > span,
 .detail-edit-hint,
 .detail-section-title,
 .suggestion-title {
@@ -4556,7 +4855,6 @@ body::before {
 }
 
 .nav-item:hover,
-.sidebar-tag:hover,
 .music-row:hover,
 .clip-item:hover,
 .candidate-item:hover,
@@ -4589,11 +4887,7 @@ body::before {
 .detail-edit input,
 .tag-input-row input,
 .bulk-tag-controls input,
-.timeline-time input,
-.tag-create-row input,
-.tag-create-row select,
-.tag-manager-row input,
-.tag-manager-row select {
+.timeline-time input {
     background: rgba(255, 255, 255, 0.78);
     border-color: var(--border);
     color: var(--text);
@@ -4634,7 +4928,6 @@ body::before {
 .clip-library,
 .filter-panel,
 .bulk-toolbar,
-.tag-manager-row,
 .clip-item,
 .candidate-item,
 .selected-file-card,
@@ -4663,22 +4956,16 @@ body::before {
 
 .tag,
 .active-filter-tag,
-.recommended-tag,
-.tag-manager-chip,
 .editing-tag,
 .suggestion-tag,
 .tag-result-tab,
 .tag-page-item,
-.add-category-btn,
 .tag-drop-zone {
     background: var(--tag);
     border-color: rgba(95, 174, 195, 0.24);
     color: var(--tag-text);
 }
 
-.recommended-tag.active,
-.tag-manager-chip:hover,
-.tag-manager-chip.active,
 .suggestion-tag:hover,
 .tag-result-tab.active {
     background: var(--primary-grad);
@@ -4974,8 +5261,7 @@ body::before {
     font-size: 13px;
     font-weight: 500;
 }
-.nav-item:hover,
-.sidebar-tag:hover { color: #fffaf0; background: #282724; }
+.nav-item:hover { color: #fffaf0; background: #282724; }
 .nav-item.active {
     color: var(--ink);
     background: #f5f0e6;
@@ -5006,15 +5292,49 @@ body::before {
     border-radius: 99px;
     font-size: 9px;
 }
-.sidebar-tags { gap: 0; }
-.sidebar-tag {
-    padding: 8px 12px;
-    color: #969289;
-    border-radius: 2px;
-    font-size: 12px;
-    font-weight: 500;
-}
 .empty-small { color: #6f6b64; }
+
+/* 侧边栏 Tag 树：黑底上的浅米色文字（默认 --text 是深色，会融进 --ink 背景） */
+.sidebar-tag-dimension { border-color: rgba(238, 233, 223, .12); }
+/* 维度行与 .nav-item 同色同字号，只有 hover 才提亮。 */
+.sidebar-tag-dimension-icon,
+.sidebar-tag-dimension-name { color: #aaa69d; }
+.sidebar-tag-dimension-row:hover .sidebar-tag-dimension-icon,
+.sidebar-tag-dimension-row:hover .sidebar-tag-dimension-name { color: #fffaf0; }
+.sidebar-tag-dimension-selected { color: #716e67; }
+/* 开合箭头是控件，用和维度名同一档的亮度；原来的 #716e67 在深色侧栏上几乎看不见。 */
+.sidebar-tag-dimension-toggle { color: #aaa69d; }
+.sidebar-tag-dimension-row:hover .sidebar-tag-dimension-toggle,
+.sidebar-tag-dimension-toggle:hover { color: #f8f4ea; }
+.sidebar-tag { color: #c9c3b6; }
+.sidebar-tag:hover { background: #282724; color: #fffaf0; }
+.sidebar-tag.is-selected .sidebar-tag-name { color: #fffaf0; }
+/* 内联输入框在深色侧栏里用最亮的一档文字，placeholder 压到最暗的一档。 */
+.sidebar-tag-input { color: #fffaf0; }
+.sidebar-tag-input::placeholder { color: #716e67; opacity: 1; }
+.sidebar-tag-count { color: #716e67; }
+.sidebar-tag:hover .sidebar-tag-count,
+.sidebar-tag.is-selected .sidebar-tag-count { color: #a39c90; }
+.sidebar-tag-caret { color: #aaa69d; }
+.sidebar-tag-caret:hover { background: #282724; color: #f8f4ea; }
+.sidebar-tag-checkbox { border-color: #57534a; }
+.sidebar-tag.is-selected .sidebar-tag-checkbox {
+    background: var(--primary);
+    border-color: var(--primary);
+    color: var(--ink);
+}
+.sidebar-tag-ops button { color: #716e67; }
+.sidebar-tag-ops button:hover { color: var(--primary-2); }
+.sidebar-tag-add-dimension {
+    border-color: #57534a;
+    color: #c9c3b6;
+}
+.sidebar-tag-add-dimension:hover { background: #282724; color: #fffaf0; }
+.sidebar-tag-row.is-drop-target,
+.sidebar-tag-dimension-row.is-drop-target {
+    outline-color: var(--primary);
+    background: rgba(228, 81, 54, .12);
+}
 
 .content {
     position: relative;
@@ -5211,13 +5531,10 @@ body::before {
 .music-tags { margin-top: 7px; }
 .tag,
 .active-filter-tag,
-.recommended-tag,
-.tag-manager-chip,
 .editing-tag,
 .suggestion-tag,
 .tag-result-tab,
 .tag-page-item,
-.add-category-btn,
 .tag-drop-zone {
     min-height: 22px;
     padding: 4px 8px;
@@ -5378,9 +5695,6 @@ body::before {
     box-shadow: none;
 }
 .bulk-toolbar { background: #dce78a; }
-.recommended-tag.active,
-.tag-manager-chip:hover,
-.tag-manager-chip.active,
 .suggestion-tag:hover,
 .tag-result-tab.active {
     color: #fff;
@@ -5478,11 +5792,7 @@ body::before {
 .detail-edit input,
 .tag-input-row input,
 .bulk-tag-controls input,
-.timeline-time input,
-.tag-create-row input,
-.tag-create-row select,
-.tag-manager-row input,
-.tag-manager-row select {
+.timeline-time input {
     color: var(--text);
     background: #fffaf0;
     border: 1px solid #aaa294;
@@ -5691,10 +6001,33 @@ body[data-theme="sky"] .theme-menu-label { color: var(--subtext); }
 body[data-theme="sky"] .content { background: transparent; }
 body[data-theme="sky"] .sidebar { color: var(--text); background: linear-gradient(180deg, rgba(232,247,250,.82), rgba(246,249,250,.86)); border-right: 1px solid var(--border); }
 body[data-theme="sky"] .sidebar-title { color: var(--subtext); }
-body[data-theme="sky"] .nav-item,
-body[data-theme="sky"] .sidebar-tag { color: #4f6d79; border-radius: 9px; }
-body[data-theme="sky"] .nav-item:hover,
+body[data-theme="sky"] .nav-item { color: #4f6d79; border-radius: 9px; }
+/* 维度行跟随导航项配色，不再比导航更亮更大。 */
+body[data-theme="sky"] .sidebar-tag-dimension-icon,
+body[data-theme="sky"] .sidebar-tag-dimension-name { color: #4f6d79; }
+body[data-theme="sky"] .sidebar-tag-dimension-row:hover .sidebar-tag-dimension-icon,
+body[data-theme="sky"] .sidebar-tag-dimension-row:hover .sidebar-tag-dimension-name { color: var(--text); }
+/* Tag 行也要跟着换配色：档案室那档米白（#c9c3b6）放在浅色侧栏上对比度只有 1.6:1，
+   等于看不见。这里沿用 HEAD 里 .sidebar-tag 的天空色，并补齐 hover / 选中态。 */
+body[data-theme="sky"] .sidebar-tag { color: #4f6d79; }
 body[data-theme="sky"] .sidebar-tag:hover { color: var(--text); background: var(--hover); }
+body[data-theme="sky"] .sidebar-tag.is-selected .sidebar-tag-name { color: var(--text); }
+body[data-theme="sky"] .sidebar-tag-count { color: var(--subtext); }
+body[data-theme="sky"] .sidebar-tag:hover .sidebar-tag-count,
+body[data-theme="sky"] .sidebar-tag.is-selected .sidebar-tag-count { color: var(--text); }
+body[data-theme="sky"] .sidebar-tag-checkbox { border-color: var(--border); }
+body[data-theme="sky"] .sidebar-tag-ops button { color: var(--subtext); }
+body[data-theme="sky"] .sidebar-tag-ops button:hover { color: var(--primary-strong); }
+/* 开合箭头别继承档案室的暖灰/深色 hover，用天空主题自己的次级色。 */
+body[data-theme="sky"] .sidebar-tag-dimension-toggle,
+body[data-theme="sky"] .sidebar-tag-caret { color: var(--subtext); }
+body[data-theme="sky"] .sidebar-tag-dimension-row:hover .sidebar-tag-dimension-toggle,
+body[data-theme="sky"] .sidebar-tag-dimension-toggle:hover,
+body[data-theme="sky"] .sidebar-tag-caret:hover { color: var(--text); background: var(--hover); }
+/* 内联输入框在浅色主题下用主题正文色，别继承档案室的米白。 */
+body[data-theme="sky"] .sidebar-tag-input { color: var(--text); }
+body[data-theme="sky"] .sidebar-tag-input::placeholder { color: var(--subtext); opacity: 1; }
+body[data-theme="sky"] .nav-item:hover { color: var(--text); background: var(--hover); }
 body[data-theme="sky"] .nav-item.active { color: #fff; background: var(--primary-grad); box-shadow: 0 10px 24px rgba(58,126,159,.18); }
 body[data-theme="sky"] .nav-item.active::before { width: 3px; height: 24px; background: var(--primary-strong); }
 body[data-theme="sky"] .nav-count,
@@ -5723,27 +6056,20 @@ body[data-theme="sky"] .music-icon::after { display: none; }
 body[data-theme="sky"] .music-meta > span + span::before { display: none; }
 body[data-theme="sky"] .tag,
 body[data-theme="sky"] .active-filter-tag,
-body[data-theme="sky"] .recommended-tag,
-body[data-theme="sky"] .tag-manager-chip,
 body[data-theme="sky"] .editing-tag,
 body[data-theme="sky"] .suggestion-tag,
 body[data-theme="sky"] .tag-result-tab,
 body[data-theme="sky"] .tag-page-item,
-body[data-theme="sky"] .add-category-btn,
 body[data-theme="sky"] .tag-drop-zone { color: var(--tag-text); background: var(--tag); border-color: rgba(95,174,195,.24); border-radius: 99px; }
 
 /* 筛选面板的 Tag 需要比列表内的 Tag 更易扫读。 */
-#filterPanel .active-filter-tag,
-#filterPanel .recommended-tag {
+#filterPanel .active-filter-tag {
     font-size: 13px;
     padding: 5px 10px;
     min-height: 0;
     line-height: 1.25;
 }
 
-#filterPanel .recommended-tag-title {
-    font-size: 13px;
-}
 body[data-theme="sky"] .music-actions { opacity: 1; }
 body[data-theme="sky"] .icon-action,
 body[data-theme="sky"] .icon-btn { color: var(--primary-strong); background: rgba(255,255,255,.82); border-color: var(--border-strong); border-radius: 9px; }
@@ -5807,6 +6133,191 @@ body[data-theme="sky"] .player-play:hover { color: var(--primary-strong); backgr
     scroll-behavior: smooth;
     scrollbar-gutter: stable;
 }
+.pagination {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-wrap: nowrap;
+    gap: 10px;
+    width: fit-content;
+    max-width: 100%;
+    margin: 0 auto;
+    min-width: 0;
+    padding: 18px 8px 4px;
+    color: var(--subtext);
+    font-size: 12px;
+    white-space: nowrap;
+}
+.pagination button {
+    height: 34px;
+    min-height: 34px;
+    box-sizing: border-box;
+    padding: 0 14px;
+    color: var(--text);
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    cursor: pointer;
+}
+.pagination button:hover:not(:disabled) {
+    color: var(--primary-strong);
+    border-color: var(--primary);
+}
+.pagination button:disabled {
+    opacity: .38;
+    cursor: default;
+}
+.pagination > span {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+.pagination-size {
+    display: inline-flex;
+    align-items: center;
+    align-self: center;
+    height: 34px;
+    margin: 0 !important;
+    color: inherit;
+    font-size: inherit;
+    font-weight: inherit;
+    line-height: 1;
+}
+.pagination-size > span {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip: rect(0 0 0 0);
+}
+.pagination-size select {
+    display: block;
+    height: 34px;
+    min-height: 34px;
+    box-sizing: border-box;
+    margin: 0;
+    padding: 0 26px 0 10px;
+    color: var(--text);
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    cursor: pointer;
+    font: inherit;
+}
+.pagination-size select:hover,
+.pagination-size select:focus {
+    border-color: var(--primary);
+    outline: none;
+}
+.pagination-compact {
+    gap: 6px;
+    padding-inline: 0;
+}
+.pagination-compact button {
+    width: 30px;
+    min-width: 30px;
+    height: 30px;
+    min-height: 30px;
+    padding: 0;
+    font-size: 18px;
+    line-height: 1;
+}
+.pagination-compact .pagination-size select {
+    height: 30px;
+    min-height: 30px;
+    padding-left: 7px;
+    padding-right: 20px;
+}
+.pagination-compact .pagination-size { height: 30px; }
+.main-scroll-area:has(.catalog-view) { overflow: hidden; }
+.main-scroll-area:has(.catalog-view) > .content-area {
+    flex: 1;
+    min-height: 0;
+    overflow: hidden;
+    padding-bottom: 22px;
+}
+.catalog-view {
+    height: 100%;
+    min-height: 0;
+    align-items: stretch;
+}
+.catalog-list,
+.catalog-detail {
+    min-height: 0;
+    max-height: none;
+    overflow-x: hidden;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    scrollbar-gutter: stable;
+}
+.catalog-list {
+    position: relative;
+    top: auto;
+    align-self: stretch;
+    padding-right: 8px;
+}
+.catalog-detail { padding-right: 8px; }
+.catalog-filter {
+    position: sticky;
+    top: 0;
+    z-index: 5;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-height: 42px;
+    margin-bottom: 8px;
+    padding: 5px 8px;
+    background: color-mix(in srgb, var(--bg) 94%, transparent);
+    border: 1px solid var(--border-strong);
+    border-radius: 4px;
+    backdrop-filter: blur(10px);
+}
+.catalog-filter-icon {
+    width: 13px;
+    height: 13px;
+    flex: 0 0 13px;
+    border: 1.5px solid var(--subtext);
+    border-radius: 50%;
+    opacity: .72;
+}
+.catalog-filter-icon::after {
+    content: "";
+    display: block;
+    width: 5px;
+    height: 1.5px;
+    margin: 10px 0 0 9px;
+    background: var(--subtext);
+    transform: rotate(45deg);
+    transform-origin: left center;
+}
+.catalog-filter input {
+    width: 100%;
+    min-width: 0;
+    padding: 5px 0;
+    color: var(--text);
+    background: transparent;
+    border: 0;
+    outline: 0;
+    font: inherit;
+}
+.catalog-filter input::-webkit-search-cancel-button { display: none; }
+.catalog-filter button {
+    width: 26px;
+    height: 26px;
+    flex: 0 0 26px;
+    color: var(--subtext);
+    background: transparent;
+    border: 0;
+    border-radius: 50%;
+    cursor: pointer;
+}
+.catalog-filter button:hover { color: var(--text); background: var(--hover); }
+.catalog-filter-empty {
+    padding: 18px 8px;
+    color: var(--subtext);
+    font-size: 12px;
+    text-align: center;
+}
 .music-list,
 .catalog-detail .music-list,
 .clip-library,
@@ -5819,6 +6330,17 @@ body[data-theme="sky"] .player-play:hover { color: var(--primary-strong); backgr
 
 @media (max-width: 700px) {
     .content-area { padding-top: 16px; }
+    .pagination { gap: 8px; }
+    .pagination button { padding: 0 10px; }
+    .main-scroll-area:has(.catalog-view) { overflow-y: auto; }
+    .main-scroll-area:has(.catalog-view) > .content-area { overflow: visible; padding-bottom: 30px; }
+    .catalog-view { display: block; }
+    .catalog-view { height: auto; }
+    .catalog-list,
+    .catalog-detail { overflow: visible; scrollbar-gutter: auto; }
+    .catalog-list { position: static; width: 100%; margin-bottom: 18px; padding-right: 0; }
+    .catalog-detail { padding-right: 0; }
+    .catalog-filter { position: relative; }
 }
 
 /* 导入审阅：专辑导航 + 当前专辑曲目，不让大批量导入变成 100 张表单。 */
@@ -6090,9 +6612,12 @@ body.sidebar-collapsed .sidebar-controls {
 body.sidebar-collapsed .sidebar-collapse-btn > span:last-child,
 body.sidebar-collapsed .sidebar-title,
 body.sidebar-collapsed .nav-item > span:not(:first-child),
-body.sidebar-collapsed .sidebar-tag-name,
-body.sidebar-collapsed .sidebar-tag-count,
 body.sidebar-collapsed .empty-small {
+    display: none;
+}
+
+/* 收起态宽度不足以承载分面 Tag 列表，整个「全部 Tag」区直接隐藏。 */
+body.sidebar-collapsed .tag-section {
     display: none;
 }
 
@@ -6100,8 +6625,7 @@ body.sidebar-collapsed .sidebar-collapse-btn > span:first-child {
     transform: rotate(180deg);
 }
 
-body.sidebar-collapsed .nav-item,
-body.sidebar-collapsed .sidebar-tag {
+body.sidebar-collapsed .nav-item {
     justify-content: center;
     padding-right: 0;
     padding-left: 0;
@@ -6113,11 +6637,6 @@ body.sidebar-collapsed .nav-item.active::before {
 
 body.sidebar-collapsed .topbar::after {
     left: 68px;
-}
-
-.sidebar-tag-icon {
-    color: var(--primary);
-    font-weight: 800;
 }
 
 /* 导航与 Tag 都使用同一枚椭圆数量徽标。 */
@@ -6146,20 +6665,6 @@ body.sidebar-collapsed .topbar::after {
 #clipCount .nav-count-value {
     position: relative;
     top: 1px;
-}
-
-/* 收起时仍保留 Tag 的首字，便于在图标栏直接筛选。 */
-body.sidebar-collapsed .sidebar-tag-name,
-body.sidebar-collapsed .sidebar-tag-name {
-    display: block;
-    flex: 0 0 1em;
-    max-width: 1em;
-    overflow: hidden;
-    white-space: nowrap;
-}
-
-body.sidebar-collapsed .sidebar-tag {
-    gap: 2px;
 }
 
 /* 右侧面板按窗口宽度收缩，主列表仍优先保留可阅读空间。 */
@@ -6268,4 +6773,140 @@ body.sidebar-collapsed .sidebar-tag {
     border-color: var(--primary);
     box-shadow: 0 0 0 3px var(--ring);
     outline: none;
+}
+
+/* 大图模式优先展示音乐内嵌的专辑封面；没有封面时才保留默认占位图。 */
+.card-icon.has-artwork {
+    background: transparent !important;
+}
+
+.card-icon.has-artwork::before {
+    display: none;
+}
+
+.card-icon.has-artwork img {
+    display: block;
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+}
+
+.catalog-music-grid {
+    min-width: 0;
+}
+
+/* 收起筛选面板后，仍以醒目标记提示当前有 Tag 条件生效。 */
+.filter-active-indicator {
+    width: 8px;
+    height: 8px;
+    flex: 0 0 8px;
+    border-radius: 50%;
+    background: var(--primary);
+    box-shadow: 0 0 0 2px var(--panel), 0 0 0 3px var(--primary);
+}
+
+.filter-active-indicator.hidden {
+    display: none;
+}
+
+#filterToggleBtn.has-active-filters {
+    border-color: var(--primary);
+}
+
+/* 图标操作统一显示即时提示，避免只靠图形猜测用途。 */
+.icon-action[title] {
+    position: relative;
+}
+
+.icon-action[title]::after {
+    content: attr(title);
+    position: absolute;
+    z-index: 120;
+    bottom: calc(100% + 8px);
+    left: 50%;
+    padding: 5px 8px;
+    color: #fff;
+    background: var(--ink);
+    border-radius: 4px;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.18);
+    font: 600 10px/1.2 var(--font-ui);
+    line-height: 1.2;
+    white-space: nowrap;
+    pointer-events: none;
+    opacity: 0;
+    visibility: hidden;
+    transform: translate(-50%, 4px);
+    transition: opacity 0.15s ease, transform 0.15s ease, visibility 0.15s ease;
+}
+
+.icon-action[title]:hover::after,
+.icon-action[title]:focus-visible::after {
+    opacity: 1;
+    visibility: visible;
+    transform: translate(-50%, 0);
+}
+
+/* 列表内的快速 Tag：就地输入并回车保存，不打断选歌流程。 */
+.quick-tag-button {
+    height: 22px;
+    padding: 0 8px;
+    color: var(--subtext);
+    background: transparent;
+    border: 1px dashed var(--border-strong);
+    border-radius: 3px;
+    cursor: pointer;
+    font: 700 10px/1 var(--font-ui);
+    white-space: nowrap;
+}
+
+.quick-tag-button:hover,
+.quick-tag-button:focus-visible {
+    color: var(--primary-strong);
+    border-color: var(--primary);
+    outline: none;
+}
+
+.quick-tag-editor {
+    display: inline-flex;
+    align-items: center;
+    height: 22px;
+    overflow: hidden;
+    border: 1px solid var(--primary);
+    border-radius: 3px;
+    background: var(--panel);
+}
+
+.quick-tag-editor input {
+    width: 110px;
+    min-width: 0;
+    height: 100%;
+    padding: 0 6px;
+    color: var(--text);
+    background: transparent;
+    border: 0;
+    font: 600 10px/1 var(--font-ui);
+    outline: none;
+}
+
+.quick-tag-editor select {
+    width: 118px;
+    min-width: 0;
+    height: 100%;
+    padding: 0 4px;
+    color: var(--text);
+    background: rgba(255, 255, 255, 0.45);
+    border: 0;
+    border-right: 1px solid var(--border);
+    font: 600 10px/1 var(--font-ui);
+    outline: none;
+}
+
+.quick-tag-editor button {
+    align-self: stretch;
+    padding: 0 7px;
+    color: #fff;
+    background: var(--primary);
+    border: 0;
+    cursor: pointer;
+    font: 700 10px/1 var(--font-ui);
 }

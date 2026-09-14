@@ -114,7 +114,11 @@
 
             <div class="sidebar-section tag-section">
                 <div class="sidebar-title">
-                    常用 Tag
+                    <span>全部 Tag</span>
+                    <span class="sidebar-title-actions">
+                        <button id="sidebarTagClearBtn" class="hidden" type="button">清空</button>
+                        <button id="sidebarTagManageBtn" type="button">管理</button>
+                    </span>
                 </div>
 
                 <div id="sidebarTags" class="sidebar-tags">
@@ -136,13 +140,13 @@
                     <input
                         id="searchInput"
                         type="text"
-                        placeholder="搜索音乐名称、专辑、Tag..."
+                        placeholder="搜索音乐名、专辑、作者、类型、年份或 Tag"
                     >
                     <button id="clearSearch" class="clear-search">×</button>
                     <span class="search-key" aria-hidden="true">/ </span>
                 </div>
 
-                <div class="view-buttons">
+                <div id="viewButtons" class="view-buttons">
                     <button class="view-btn active" data-layout="list" title="列表视图" aria-label="列表视图">
                         ☰
                     </button>
@@ -152,7 +156,7 @@
                 </div>
 
                 <button id="filterToggleBtn" class="secondary-btn toolbar-btn" aria-expanded="false">
-                    ⌘ 筛选
+                    ⌘ 筛选 <span id="filterActiveIndicator" class="filter-active-indicator hidden" aria-hidden="true"></span>
                 </button>
 
                 <button id="selectionToggleBtn" class="secondary-btn toolbar-btn">
@@ -169,33 +173,19 @@
             <section id="filterPanel" class="filter-panel hidden" aria-label="标签筛选">
                 <div class="filter-panel-header">
                     <div>
-                        <strong>快速筛选</strong>
-                        <span>可组合多个 Tag 精准找歌</span>
+                        <strong>当前筛选</strong>
+                        <span id="filterEmptyHint">还没选中任何 Tag，在左侧点 Tag 即可筛选</span>
                     </div>
                     <div>
-                        <button id="manageTagsBtn" class="text-btn">管理 Tag</button>
                         <button id="clearFiltersBtn" class="text-btn">清空筛选</button>
                     </div>
                 </div>
                 <div id="activeFilterTags" class="active-filter-tags"></div>
-                <div id="recommendedTags" class="recommended-tags"></div>
-                <div id="tagManager" class="tag-manager hidden">
-                    <div class="tag-manager-heading">Tag 管理</div>
-                    <div class="tag-create-row">
-                        <input id="newTagName" type="text" placeholder="新 Tag 名称">
-                        <select id="newTagCategory"></select>
-                        <input id="newTagCustomCategory" class="hidden" placeholder="新分类名称">
-                        <button id="createTagBtn" class="primary-btn">新建 Tag</button>
-                        <button id="resetTagEditorBtn" class="text-btn hidden">取消</button>
-                        <button id="deleteEditingTagBtn" class="text-btn hidden">删除</button>
-                    </div>
-                    <div id="tagManagerList" class="tag-manager-list"></div>
-                </div>
             </section>
 
             <section id="bulkToolbar" class="bulk-toolbar hidden">
                 <span id="selectionCount">已选择 0 首</span>
-                <button id="selectAllVisibleBtn" class="text-btn">全选当前结果</button>
+                <button id="selectAllVisibleBtn" class="text-btn">全选本页</button>
                 <div id="bulkTagControls" class="bulk-tag-controls">
                     <input id="bulkTagInput" type="text" placeholder="输入 Tag">
                     <button id="bulkAddTagBtn" class="secondary-btn">添加 Tag</button>
@@ -492,36 +482,7 @@
 </div>
 
 
-<!-- Tag 管理操作浮层 -->
-<div id="tagActionModal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="tagActionTitle">
-
-    <div class="modal-box small">
-
-        <div class="modal-header">
-            <h2 id="tagActionTitle">编辑 Tag</h2>
-            <button id="closeTagAction" class="icon-btn" type="button" aria-label="关闭">×</button>
-        </div>
-
-        <div class="modal-body">
-            <label id="tagActionNameLabel">
-                <span id="tagActionNameText">Tag 名称</span>
-                <input id="tagActionName" type="text" autocomplete="off">
-            </label>
-            <label id="tagActionCategoryLabel" class="hidden">
-                分类
-                <select id="tagActionCategory"></select>
-            </label>
-            <p id="tagActionHint" class="form-hint"></p>
-        </div>
-
-        <div class="modal-footer">
-            <button id="cancelTagAction" class="secondary-btn" type="button">取消</button>
-            <button id="saveTagAction" class="primary-btn" type="button">保存</button>
-        </div>
-
-    </div>
-
-</div>
+<!-- 维度的新增/重命名、Tag 的新增/重命名都在侧栏原位输入，不再有操作浮层 -->
 
 
 <!-- ============================= -->

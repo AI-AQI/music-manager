@@ -1,4 +1,3 @@
-use crate::db::tag_category;
 use crate::AppState;
 use rusqlite::{params, params_from_iter, OptionalExtension};
 use serde::{Deserialize, Serialize};
@@ -89,10 +88,66 @@ fn sync_tags(conn: &rusqlite::Connection, owner_id: &str, tags: &[String], join_
     let delete = format!("DELETE FROM {join_table} WHERE {owner_column}=?1");
     conn.execute(&delete, params![owner_id]).map_err(|e| format!("清理 Tag 关联失败: {e}"))?;
     for name in tags.iter().map(|tag| tag.trim()).filter(|tag| !tag.is_empty()) {
-        conn.execute("INSERT OR IGNORE INTO tags (name, category, created_at) VALUES (?1, ?2, ?3)", params![name, tag_category(name), now_ms()])
-            .map_err(|e| format!("保存 Tag 失败: {e}"))?;
-        let tag_id: i64 = conn.query_row("SELECT id FROM tags WHERE name=?1", params![name], |row| row.get(0))
+        /* 先按名字复用已有 Tag：调用方（列表里的「＋ Tag」、批量打 Tag）只传名字，
+           拿到名字不代表要新建。同名 Tag 可能存在于任意维度下，按「不在未分类维度
+           → 根层优先 → id 最小」挑一个最像正主的；确实没有同名才新建到「未分类」。
+           过去这里无条件往「未分类」插一条，于是给音乐打一个已有 Tag 就会多出一份副本。 */
+        let existing: Option<i64> = conn
+            .query_row(
+                "SELECT t.id FROM tags t JOIN tag_categories c ON c.id=t.category_id
+                 WHERE t.name=?1 COLLATE NOCASE
+                 ORDER BY c.name='未分类', t.parent_id IS NOT NULL, t.id
+                 LIMIT 1",
+                params![name],
+                |row| row.get(0),
+            )
+            .optional()
             .map_err(|e| format!("读取 Tag 失败: {e}"))?;
+
+        let tag_id = match existing {
+            Some(id) => id,
+            None => {
+                conn.execute("INSERT OR IGNORE INTO tag_categories (name, created_at) VALUES ('未分类', ?1)", params![now_ms()])
+                    .map_err(|e| format!("创建未分类维度失败: {e}"))?;
+                conn.execute("INSERT OR IGNORE INTO tags (name, category_id, created_at) VALUES (?1, (SELECT id FROM tag_categories WHERE name='未分类'), ?2)", params![name, now_ms()])
+                    .map_err(|e| format!("保存 Tag 失败: {e}"))?;
+                conn.query_row("SELECT id FROM tags WHERE name=?1 AND category_id=(SELECT id FROM tag_categories WHERE name='未分类') AND parent_id IS NULL", params![name], |row| row.get(0))
+                    .map_err(|e| format!("读取 Tag 失败: {e}"))?
+            }
+        };
+
+        let insert = format!("INSERT OR IGNORE INTO {join_table} ({owner_column}, tag_id) VALUES (?1, ?2)");
+        conn.execute(&insert, params![owner_id, tag_id]).map_err(|e| format!("保存 Tag 关联失败: {e}"))?;
+    }
+    Ok(())
+}
+
+fn sync_tag_ids(conn: &rusqlite::Connection, owner_id: &str, tag_ids: &[i64], new_tags: &[String], join_table: &str, owner_column: &str) -> Result<(), String> {
+    let delete = format!("DELETE FROM {join_table} WHERE {owner_column}=?1");
+    conn.execute(&delete, params![owner_id]).map_err(|e| format!("清理 Tag 关联失败: {e}"))?;
+    for tag_id in tag_ids {
+        let exists: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM tags WHERE id=?1)", params![tag_id], |row| row.get(0))
+            .map_err(|e| format!("读取 Tag 失败: {e}"))?;
+        if !exists { return Err("所选 Tag 不存在".into()); }
+        let insert = format!("INSERT OR IGNORE INTO {join_table} ({owner_column}, tag_id) VALUES (?1, ?2)");
+        conn.execute(&insert, params![owner_id, tag_id]).map_err(|e| format!("保存 Tag 关联失败: {e}"))?;
+    }
+    for name in new_tags.iter().map(|tag| tag.trim()).filter(|tag| !tag.is_empty()) {
+        let existing: Option<i64> = conn.query_row(
+            "SELECT t.id FROM tags t JOIN tag_categories c ON c.id=t.category_id WHERE t.name=?1 COLLATE NOCASE ORDER BY c.name='未分类', t.parent_id IS NOT NULL, t.id LIMIT 1",
+            params![name],
+            |row| row.get(0),
+        ).optional().map_err(|e| format!("读取 Tag 失败: {e}"))?;
+        let tag_id = if let Some(id) = existing {
+            id
+        } else {
+            conn.execute("INSERT OR IGNORE INTO tag_categories (name, created_at) VALUES ('未分类', ?1)", params![now_ms()])
+                .map_err(|e| format!("创建未分类维度失败: {e}"))?;
+            conn.execute("INSERT OR IGNORE INTO tags (name, category_id, created_at) VALUES (?1, (SELECT id FROM tag_categories WHERE name='未分类'), ?2)", params![name, now_ms()])
+                .map_err(|e| format!("保存 Tag 失败: {e}"))?;
+            conn.query_row("SELECT id FROM tags WHERE name=?1 COLLATE NOCASE AND category_id=(SELECT id FROM tag_categories WHERE name='未分类') AND parent_id IS NULL", params![name], |row| row.get(0))
+                .map_err(|e| format!("读取 Tag 失败: {e}"))?
+        };
         let insert = format!("INSERT OR IGNORE INTO {join_table} ({owner_column}, tag_id) VALUES (?1, ?2)");
         conn.execute(&insert, params![owner_id, tag_id]).map_err(|e| format!("保存 Tag 关联失败: {e}"))?;
     }
@@ -104,13 +159,23 @@ fn now_ms() -> i64 {
 }
 
 fn load_tags(conn: &rusqlite::Connection, owner_id: &str, join_table: &str, owner_column: &str) -> Result<Vec<String>, String> {
-    let sql = format!("SELECT t.name FROM tags t JOIN {join_table} j ON j.tag_id=t.id WHERE j.{owner_column}=?1 ORDER BY t.name COLLATE NOCASE");
+    let sql = format!("SELECT t.name FROM tags t JOIN {join_table} j ON j.tag_id=t.id WHERE j.{owner_column}=?1 ORDER BY t.name COLLATE NOCASE, t.id");
     let mut stmt = conn.prepare(&sql).map_err(|e| format!("读取 Tag 失败: {e}"))?;
     let tags = stmt.query_map(params![owner_id], |row| row.get(0))
         .map_err(|e| format!("读取 Tag 失败: {e}"))?
         .collect::<Result<Vec<String>, _>>()
         .map_err(|e| format!("读取 Tag 失败: {e}"))?;
     Ok(tags)
+}
+
+fn load_tag_ids(conn: &rusqlite::Connection, owner_id: &str, join_table: &str, owner_column: &str) -> Result<Vec<i64>, String> {
+    let sql = format!("SELECT t.id FROM tags t JOIN {join_table} j ON j.tag_id=t.id WHERE j.{owner_column}=?1 ORDER BY t.name COLLATE NOCASE, t.id");
+    let mut stmt = conn.prepare(&sql).map_err(|e| format!("读取 Tag ID 失败: {e}"))?;
+    let ids = stmt.query_map(params![owner_id], |row| row.get(0))
+        .map_err(|e| format!("读取 Tag ID 失败: {e}"))?
+        .collect::<Result<Vec<i64>, _>>()
+        .map_err(|e| format!("读取 Tag ID 失败: {e}"))?;
+    Ok(ids)
 }
 
 fn validate_clip_range(start: f64, end: f64) -> Result<(), String> {
@@ -124,7 +189,7 @@ fn validate_clip_range(start: f64, end: f64) -> Result<(), String> {
 }
 
 fn load_all_tags(conn: &rusqlite::Connection, join_table: &str, owner_column: &str) -> Result<HashMap<String, Vec<String>>, String> {
-    let sql = format!("SELECT j.{owner_column}, t.name FROM tags t JOIN {join_table} j ON j.tag_id = t.id ORDER BY t.name COLLATE NOCASE");
+    let sql = format!("SELECT j.{owner_column}, t.name FROM tags t JOIN {join_table} j ON j.tag_id = t.id ORDER BY t.name COLLATE NOCASE, t.id");
     let mut stmt = conn.prepare(&sql).map_err(|e| format!("读取 Tag 失败: {e}"))?;
     let rows = stmt
         .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
@@ -135,6 +200,18 @@ fn load_all_tags(conn: &rusqlite::Connection, join_table: &str, owner_column: &s
     for (owner, tag) in rows {
         map.entry(owner).or_default().push(tag);
     }
+    Ok(map)
+}
+
+fn load_all_tag_ids(conn: &rusqlite::Connection, join_table: &str, owner_column: &str) -> Result<HashMap<String, Vec<i64>>, String> {
+    let sql = format!("SELECT j.{owner_column}, t.id FROM tags t JOIN {join_table} j ON j.tag_id=t.id ORDER BY t.name COLLATE NOCASE, t.id");
+    let mut stmt = conn.prepare(&sql).map_err(|e| format!("读取 Tag ID 失败: {e}"))?;
+    let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))
+        .map_err(|e| format!("读取 Tag ID 失败: {e}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("读取 Tag ID 失败: {e}"))?;
+    let mut map: HashMap<String, Vec<i64>> = HashMap::new();
+    for (owner, tag_id) in rows { map.entry(owner).or_default().push(tag_id); }
     Ok(map)
 }
 
@@ -383,12 +460,27 @@ pub struct Music {
     sample_rate: u32,
     bitrate: u32,
     tags: Vec<String>,
+    tag_ids: Vec<i64>,
     duration: f64,
     file_size: u64,
     mime_type: String,
     cover_art: String,
     created_at: i64,
     updated_at: i64,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LibraryCounts {
+    music: i64,
+    clips: i64,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MusicCoverArt {
+    id: String,
+    cover_art: String,
 }
 
 impl Music {
@@ -407,6 +499,7 @@ impl Music {
             sample_rate: row.get("sample_rate")?,
             bitrate: row.get("bitrate")?,
             tags: Vec::new(),
+            tag_ids: Vec::new(),
             duration: row.get("duration")?,
             file_size: row.get("file_size")?,
             mime_type: row.get("mime_type")?,
@@ -433,6 +526,10 @@ pub struct MusicInput {
     sample_rate: u32,
     bitrate: u32,
     tags: Vec<String>,
+    #[serde(default)]
+    tag_ids: Option<Vec<i64>>,
+    #[serde(default)]
+    new_tags: Vec<String>,
     duration: f64,
     file_size: u64,
     mime_type: String,
@@ -477,7 +574,10 @@ pub fn create_music(
     )
     .map_err(|e| format!("插入音乐失败: {e}"))?;
 
-    sync_tags(&tx, &music.id, &music.tags, "music_tags", "music_id")?;
+    match music.tag_ids.as_deref() {
+        Some(ids) => sync_tag_ids(&tx, &music.id, ids, &music.new_tags, "music_tags", "music_id")?,
+        None => sync_tags(&tx, &music.id, &music.tags, "music_tags", "music_id")?,
+    }
 
     tx.commit().map_err(|e| format!("提交事务失败: {e}"))?;
 
@@ -518,7 +618,10 @@ pub fn update_music(
     )
     .map_err(|e| format!("更新音乐失败: {e}"))?;
 
-    sync_tags(&tx, &music.id, &music.tags, "music_tags", "music_id")?;
+    match music.tag_ids.as_deref() {
+        Some(ids) => sync_tag_ids(&tx, &music.id, ids, &music.new_tags, "music_tags", "music_id")?,
+        None => sync_tags(&tx, &music.id, &music.tags, "music_tags", "music_id")?,
+    }
 
     tx.commit().map_err(|e| format!("提交事务失败: {e}"))?;
 
@@ -571,6 +674,7 @@ pub fn get_music(
 
     if let Some(item) = music.as_mut() {
         item.tags = load_tags(&conn, &item.id, "music_tags", "music_id")?;
+        item.tag_ids = load_tag_ids(&conn, &item.id, "music_tags", "music_id")?;
     }
     Ok(music)
 }
@@ -582,7 +686,12 @@ pub fn list_music(
     let conn = lock_db!(state);
 
     let mut stmt = conn
-        .prepare("SELECT * FROM music ORDER BY created_at ASC")
+        // 列表快照不携带可能很大的 base64 封面。当前页封面由
+        // get_music_cover_arts 按需加载，避免数千首音乐在一次 IPC 中传输。
+        .prepare("SELECT id, name, file_name, path, album, album_source, artist, genre, year,
+                         channels, sample_rate, bitrate, duration, file_size, mime_type,
+                         '' AS cover_art, created_at, updated_at
+                  FROM music ORDER BY created_at ASC")
         .map_err(|e| format!("准备查询失败: {e}"))?;
 
     let mut music = stmt
@@ -592,10 +701,45 @@ pub fn list_music(
         .map_err(|e| format!("读取音乐失败: {e}"))?;
 
     let tag_map = load_all_tags(&conn, "music_tags", "music_id")?;
+    let tag_id_map = load_all_tag_ids(&conn, "music_tags", "music_id")?;
     for item in &mut music {
         item.tags = tag_map.get(&item.id).cloned().unwrap_or_default();
+        item.tag_ids = tag_id_map.get(&item.id).cloned().unwrap_or_default();
     }
     Ok(music)
+}
+
+#[tauri::command]
+pub fn get_library_counts(state: tauri::State<'_, AppState>) -> Result<LibraryCounts, String> {
+    let conn = lock_db!(state);
+    let music = conn.query_row("SELECT COUNT(*) FROM music", [], |row| row.get(0))
+        .map_err(|e| format!("统计音乐失败: {e}"))?;
+    let clips = conn.query_row("SELECT COUNT(*) FROM clips", [], |row| row.get(0))
+        .map_err(|e| format!("统计片段失败: {e}"))?;
+    Ok(LibraryCounts { music, clips })
+}
+
+#[tauri::command]
+pub fn get_music_cover_arts(
+    state: tauri::State<'_, AppState>,
+    ids: Vec<String>,
+) -> Result<Vec<MusicCoverArt>, String> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let conn = lock_db!(state);
+    let mut result = Vec::new();
+    for batch in ids.chunks(900) {
+        let placeholders = std::iter::repeat("?").take(batch.len()).collect::<Vec<_>>().join(", ");
+        let query = format!("SELECT id, cover_art FROM music WHERE id IN ({placeholders})");
+        let mut stmt = conn.prepare(&query).map_err(|e| format!("准备封面查询失败: {e}"))?;
+        let rows = stmt.query_map(params_from_iter(batch.iter()), |row| Ok(MusicCoverArt {
+            id: row.get(0)?,
+            cover_art: row.get(1)?,
+        })).map_err(|e| format!("查询封面失败: {e}"))?;
+        result.extend(rows.collect::<Result<Vec<_>, _>>().map_err(|e| format!("读取封面失败: {e}"))?);
+    }
+    Ok(result)
 }
 
 #[tauri::command]
@@ -641,6 +785,7 @@ pub struct Clip {
     start: f64,
     end: f64,
     tags: Vec<String>,
+    tag_ids: Vec<i64>,
     created_at: i64,
     updated_at: i64,
 }
@@ -654,6 +799,7 @@ impl Clip {
             start: row.get("start")?,
             end: row.get("end")?,
             tags: Vec::new(),
+            tag_ids: Vec::new(),
             created_at: row.get("created_at")?,
             updated_at: row.get("updated_at")?,
         })
@@ -669,6 +815,10 @@ pub struct ClipInput {
     start: f64,
     end: f64,
     tags: Vec<String>,
+    #[serde(default)]
+    tag_ids: Option<Vec<i64>>,
+    #[serde(default)]
+    new_tags: Vec<String>,
     created_at: i64,
     updated_at: i64,
 }
@@ -697,7 +847,10 @@ pub fn create_clip(
     )
     .map_err(|e| format!("插入片段失败: {e}"))?;
 
-    sync_tags(&tx, &clip.id, &clip.tags, "clip_tags", "clip_id")?;
+    match clip.tag_ids.as_deref() {
+        Some(ids) => sync_tag_ids(&tx, &clip.id, ids, &clip.new_tags, "clip_tags", "clip_id")?,
+        None => sync_tags(&tx, &clip.id, &clip.tags, "clip_tags", "clip_id")?,
+    }
 
     tx.commit().map_err(|e| format!("提交事务失败: {e}"))?;
 
@@ -725,7 +878,10 @@ pub fn update_clip(
     )
     .map_err(|e| format!("更新片段失败: {e}"))?;
 
-    sync_tags(&tx, &clip.id, &clip.tags, "clip_tags", "clip_id")?;
+    match clip.tag_ids.as_deref() {
+        Some(ids) => sync_tag_ids(&tx, &clip.id, ids, &clip.new_tags, "clip_tags", "clip_id")?,
+        None => sync_tags(&tx, &clip.id, &clip.tags, "clip_tags", "clip_id")?,
+    }
 
     tx.commit().map_err(|e| format!("提交事务失败: {e}"))?;
 
@@ -778,6 +934,7 @@ pub fn get_clip(
 
     if let Some(item) = clip.as_mut() {
         item.tags = load_tags(&conn, &item.id, "clip_tags", "clip_id")?;
+        item.tag_ids = load_tag_ids(&conn, &item.id, "clip_tags", "clip_id")?;
     }
     Ok(clip)
 }
@@ -799,8 +956,31 @@ pub fn list_clips(
         .map_err(|e| format!("读取片段失败: {e}"))?;
 
     let tag_map = load_all_tags(&conn, "clip_tags", "clip_id")?;
+    let tag_id_map = load_all_tag_ids(&conn, "clip_tags", "clip_id")?;
     for item in &mut clips {
         item.tags = tag_map.get(&item.id).cloned().unwrap_or_default();
+        item.tag_ids = tag_id_map.get(&item.id).cloned().unwrap_or_default();
+    }
+    Ok(clips)
+}
+
+#[tauri::command]
+pub fn list_clips_for_music(
+    state: tauri::State<'_, AppState>,
+    music_id: String,
+) -> Result<Vec<Clip>, String> {
+    let conn = lock_db!(state);
+    let mut stmt = conn
+        .prepare("SELECT * FROM clips WHERE music_id=?1 ORDER BY start ASC, created_at ASC")
+        .map_err(|e| format!("准备音乐片段查询失败: {e}"))?;
+    let mut clips = stmt
+        .query_map(params![music_id], Clip::from_row)
+        .map_err(|e| format!("查询音乐片段失败: {e}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("读取音乐片段失败: {e}"))?;
+    for item in &mut clips {
+        item.tags = load_tags(&conn, &item.id, "clip_tags", "clip_id")?;
+        item.tag_ids = load_tag_ids(&conn, &item.id, "clip_tags", "clip_id")?;
     }
     Ok(clips)
 }
@@ -817,7 +997,10 @@ pub struct CandidateEntry {
 pub struct TagRecord {
     id: i64,
     name: String,
+    category_id: i64,
     category: String,
+    parent_id: Option<i64>,
+    path: String,
     music_count: i64,
 }
 
@@ -825,56 +1008,109 @@ pub struct TagRecord {
 pub fn list_tags(state: tauri::State<'_, AppState>) -> Result<Vec<TagRecord>, String> {
     let conn = lock_db!(state);
     let mut stmt = conn.prepare(
-        "SELECT t.id, t.name, t.category, COUNT(DISTINCT mt.music_id) + COUNT(DISTINCT ct.clip_id) AS music_count \
+        "WITH RECURSIVE tree(id, path) AS (SELECT t.id, t.name FROM tags t WHERE t.parent_id IS NULL UNION ALL SELECT t.id, tree.path || ' / ' || t.name FROM tags t JOIN tree ON t.parent_id=tree.id) \
+         SELECT t.id, t.name, t.category_id, CASE WHEN c.name='未分类' THEN '' ELSE c.name END, t.parent_id, tree.path, COUNT(DISTINCT mt.music_id) + COUNT(DISTINCT ct.clip_id) AS music_count \
          FROM tags t LEFT JOIN music_tags mt ON mt.tag_id = t.id \
          LEFT JOIN clip_tags ct ON ct.tag_id = t.id \
-         GROUP BY t.id, t.name, t.category \
-         ORDER BY t.category, t.name COLLATE NOCASE"
+         JOIN tag_categories c ON c.id=t.category_id JOIN tree ON tree.id=t.id \
+         GROUP BY t.id, t.name, t.category_id, c.name, t.parent_id, tree.path \
+         ORDER BY c.name COLLATE NOCASE, tree.path COLLATE NOCASE"
     )
         .map_err(|e| format!("准备 Tag 查询失败: {e}"))?;
-    let records = stmt.query_map([], |row| Ok(TagRecord { id: row.get(0)?, name: row.get(1)?, category: row.get(2)?, music_count: row.get(3)? }))
+    let records = stmt.query_map([], |row| Ok(TagRecord { id: row.get(0)?, name: row.get(1)?, category_id: row.get(2)?, category: row.get(3)?, parent_id: row.get(4)?, path: row.get(5)?, music_count: row.get(6)? }))
         .map_err(|e| format!("查询 Tag 失败: {e}"))?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| format!("读取 Tag 失败: {e}"))?;
     Ok(records)
 }
 
-fn validate_tag(name: &str, category: &str) -> Result<(String, String), String> {
+fn validate_tag(name: &str) -> Result<String, String> {
     let name = name.trim().to_string();
-    let category = category.trim().to_string();
     if name.is_empty() { return Err("Tag 名称不能为空".into()); }
-    Ok((name, category))
+    Ok(name)
 }
 
 #[tauri::command]
-pub fn create_tag(state: tauri::State<'_, AppState>, name: String, category: String) -> Result<TagRecord, String> {
-    let (name, category) = validate_tag(&name, &category)?;
+pub fn create_tag(state: tauri::State<'_, AppState>, name: String, category_id: Option<i64>, category: Option<String>, parent_id: Option<i64>) -> Result<TagRecord, String> {
+    let name = validate_tag(&name)?;
     let conn = lock_db!(state);
-    conn.execute("INSERT OR IGNORE INTO tag_categories (name, created_at) VALUES (?1, ?2)", params![category, now_ms()])
-        .map_err(|e| format!("创建 Tag 分类失败: {e}"))?;
-    conn.execute("INSERT OR IGNORE INTO tags (name, category, created_at) VALUES (?1, ?2, ?3)", params![name, category, now_ms()])
+    let category_id = if let Some(parent) = parent_id {
+        let parent_category: i64 = conn.query_row("SELECT category_id FROM tags WHERE id=?1", params![parent], |row| row.get(0)).map_err(|_| "父 Tag 不存在")?;
+        if category_id.is_some_and(|id| id != parent_category) { return Err("父 Tag 必须属于同一筛选维度".into()); }
+        parent_category
+    } else if let Some(id) = category_id {
+        id
+    } else {
+        let category = category.unwrap_or_else(|| "未分类".into());
+        let category = if category.trim().is_empty() { "未分类" } else { category.trim() };
+        conn.execute("INSERT OR IGNORE INTO tag_categories (name, created_at) VALUES (?1, ?2)", params![category, now_ms()])
+            .map_err(|e| format!("创建 Tag 分类失败: {e}"))?;
+        conn.query_row("SELECT id FROM tag_categories WHERE name=?1", params![category], |row| row.get(0))
+            .map_err(|e| format!("读取 Tag 分类失败: {e}"))?
+    };
+    conn.execute("INSERT INTO tags (name, category_id, parent_id, created_at) VALUES (?1, ?2, ?3, ?4)", params![name, category_id, parent_id, now_ms()])
         .map_err(|e| format!("创建 Tag 失败: {e}"))?;
-    let (id, category) = conn.query_row("SELECT id, category FROM tags WHERE name=?1", params![name], |row| Ok((row.get(0)?, row.get(1)?)))
-        .map_err(|e| format!("读取 Tag 失败: {e}"))?;
-    Ok(TagRecord { id, name, category, music_count: 0 })
+    let id = conn.last_insert_rowid();
+    let category: String = conn.query_row("SELECT CASE WHEN name='未分类' THEN '' ELSE name END FROM tag_categories WHERE id=?1", params![category_id], |row| row.get(0)).map_err(|_| "筛选维度不存在")?;
+    let path = if let Some(parent) = parent_id { conn.query_row("WITH RECURSIVE tree(id,path) AS (SELECT id,name FROM tags WHERE parent_id IS NULL UNION ALL SELECT t.id, tree.path || ' / ' || t.name FROM tags t JOIN tree ON t.parent_id=tree.id) SELECT path FROM tree WHERE id=?1", params![parent], |r| r.get::<_, String>(0)).map(|p| format!("{p} / {name}")).unwrap_or(name.clone()) } else { name.clone() };
+    Ok(TagRecord { id, name, category_id, category, parent_id, path, music_count: 0 })
 }
 
 #[tauri::command]
-pub fn update_tag(state: tauri::State<'_, AppState>, id: i64, name: String, category: String) -> Result<(), String> {
-    let (name, category) = validate_tag(&name, &category)?;
-    let conn = lock_db!(state);
-    conn.execute("INSERT OR IGNORE INTO tag_categories (name, created_at) VALUES (?1, ?2)", params![category, now_ms()])
-        .map_err(|e| format!("创建 Tag 分类失败: {e}"))?;
-    let changed = conn.execute("UPDATE tags SET name=?1, category=?2 WHERE id=?3", params![name, category, id])
+pub fn update_tag(state: tauri::State<'_, AppState>, id: i64, name: String, category: Option<String>) -> Result<(), String> {
+    let name = validate_tag(&name)?;
+    let mut conn = lock_db!(state);
+    let tx = conn.transaction().map_err(|e| format!("开启 Tag 更新事务失败: {e}"))?;
+    let changed = tx.execute("UPDATE tags SET name=?1 WHERE id=?2", params![name, id])
         .map_err(|e| format!("更新 Tag 失败: {e}"))?;
     if changed == 0 { return Err("Tag 不存在".into()); }
+    if let Some(category) = category {
+        let category = if category.trim().is_empty() { "未分类" } else { category.trim() };
+        tx.execute("INSERT OR IGNORE INTO tag_categories (name, created_at) VALUES (?1, ?2)", params![category, now_ms()])
+            .map_err(|e| format!("创建 Tag 分类失败: {e}"))?;
+        let target: i64 = tx.query_row("SELECT id FROM tag_categories WHERE name=?1", params![category], |row| row.get(0))
+            .map_err(|e| format!("读取 Tag 分类失败: {e}"))?;
+        let current: i64 = tx.query_row("SELECT category_id FROM tags WHERE id=?1", params![id], |row| row.get(0))
+            .map_err(|e| format!("读取 Tag 失败: {e}"))?;
+        let clash: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM tags WHERE category_id=?1 AND parent_id IS NULL AND name=?2 COLLATE NOCASE AND id<>?3)",
+            params![target, name, id],
+            |row| row.get(0),
+        ).map_err(|e| format!("校验目标位置失败: {e}"))?;
+        if clash { return Err(format!("目标位置已有同名 Tag「{name}」")); }
+        tx.execute("UPDATE tags SET parent_id=NULL, category_id=?1 WHERE id=?2", params![target, id])
+            .map_err(|e| format!("移动 Tag 失败: {e}"))?;
+        if target != current {
+            tx.execute(
+                "WITH RECURSIVE subtree(id) AS (SELECT id FROM tags WHERE parent_id=?1 UNION ALL SELECT t.id FROM tags t JOIN subtree s ON t.parent_id=s.id) UPDATE tags SET category_id=?2 WHERE id IN (SELECT id FROM subtree)",
+                params![id, target],
+            ).map_err(|e| format!("同步子 Tag 维度失败: {e}"))?;
+        }
+    }
+    tx.commit().map_err(|e| format!("提交 Tag 更新失败: {e}"))?;
     Ok(())
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TagCategory { id: i64, name: String }
+
+#[tauri::command]
+pub fn list_tag_category_records(state: tauri::State<'_, AppState>) -> Result<Vec<TagCategory>, String> {
+    let conn = lock_db!(state);
+    let mut stmt = conn.prepare("SELECT id, name FROM tag_categories ORDER BY name COLLATE NOCASE")
+        .map_err(|e| format!("准备分类查询失败: {e}"))?;
+    let categories = stmt.query_map([], |row| Ok(TagCategory { id: row.get(0)?, name: row.get(1)? }))
+        .map_err(|e| format!("查询分类失败: {e}"))?
+        .collect::<Result<Vec<TagCategory>, _>>()
+        .map_err(|e| format!("读取分类失败: {e}"))?;
+    Ok(categories)
 }
 
 #[tauri::command]
 pub fn list_tag_categories(state: tauri::State<'_, AppState>) -> Result<Vec<String>, String> {
     let conn = lock_db!(state);
-    let mut stmt = conn.prepare("SELECT name FROM tag_categories WHERE name != '' ORDER BY name COLLATE NOCASE")
+    let mut stmt = conn.prepare("SELECT name FROM tag_categories WHERE name != '未分类' ORDER BY name COLLATE NOCASE")
         .map_err(|e| format!("准备分类查询失败: {e}"))?;
     let categories = stmt.query_map([], |row| row.get(0))
         .map_err(|e| format!("查询分类失败: {e}"))?
@@ -900,21 +1136,9 @@ pub fn update_tag_category(state: tauri::State<'_, AppState>, old_name: String, 
     if old_name.is_empty() || name.is_empty() { return Err("分类名称不能为空".into()); }
     if old_name.eq_ignore_ascii_case(name) { return Ok(()); }
 
-    let mut conn = lock_db!(state);
-    let tx = conn.transaction().map_err(|e| format!("开启分类更新事务失败: {e}"))?;
-    let exists: bool = tx.query_row(
-        "SELECT EXISTS(SELECT 1 FROM tag_categories WHERE name=?1)",
-        params![old_name],
-        |row| row.get(0),
-    ).map_err(|e| format!("读取分类失败: {e}"))?;
-    if !exists { return Err("分类不存在".into()); }
-    tx.execute("INSERT INTO tag_categories (name, created_at) VALUES (?1, ?2)", params![name, now_ms()])
-        .map_err(|e| format!("创建新分类失败: {e}"))?;
-    tx.execute("UPDATE tags SET category=?1 WHERE category=?2", params![name, old_name])
-        .map_err(|e| format!("迁移分类下 Tag 失败: {e}"))?;
-    tx.execute("DELETE FROM tag_categories WHERE name=?1", params![old_name])
-        .map_err(|e| format!("删除旧分类失败: {e}"))?;
-    tx.commit().map_err(|e| format!("保存分类修改失败: {e}"))?;
+    let conn = lock_db!(state);
+    let changed = conn.execute("UPDATE tag_categories SET name=?1 WHERE name=?2", params![name, old_name]).map_err(|e| format!("更新筛选维度失败: {e}"))?;
+    if changed == 0 { return Err("分类不存在".into()); }
     Ok(())
 }
 
@@ -923,29 +1147,76 @@ pub fn delete_tag_category(state: tauri::State<'_, AppState>, name: String) -> R
     let name = name.trim();
     if name.is_empty() { return Err("分类名称不能为空".into()); }
 
-    let mut conn = lock_db!(state);
-    let tx = conn.transaction().map_err(|e| format!("开启分类删除事务失败: {e}"))?;
-    let exists: bool = tx.query_row(
-        "SELECT EXISTS(SELECT 1 FROM tag_categories WHERE name=?1)",
-        params![name],
-        |row| row.get(0),
-    ).map_err(|e| format!("读取分类失败: {e}"))?;
-    if !exists { return Err("分类不存在".into()); }
-    tx.execute("INSERT OR IGNORE INTO tag_categories (name, created_at) VALUES ('', ?1)", params![now_ms()])
-        .map_err(|e| format!("确保未分类 Tag 失败: {e}"))?;
-    tx.execute("UPDATE tags SET category='' WHERE category=?1", params![name])
-        .map_err(|e| format!("迁移分类下 Tag 失败: {e}"))?;
-    tx.execute("DELETE FROM tag_categories WHERE name=?1", params![name])
-        .map_err(|e| format!("删除分类失败: {e}"))?;
-    tx.commit().map_err(|e| format!("保存分类删除失败: {e}"))?;
+    let conn = lock_db!(state);
+    let id: i64 = conn.query_row("SELECT id FROM tag_categories WHERE name=?1", params![name], |row| row.get(0)).map_err(|_| "分类不存在")?;
+    let count: i64 = conn.query_row("SELECT COUNT(*) FROM tags WHERE category_id=?1", params![id], |row| row.get(0)).map_err(|e| format!("读取 Tag 失败: {e}"))?;
+    if count > 0 { return Err("非空筛选维度不能删除，请先移动或删除其中的 Tag".into()); }
+    conn.execute("DELETE FROM tag_categories WHERE id=?1", params![id]).map_err(|e| format!("删除筛选维度失败: {e}"))?;
     Ok(())
 }
 
 #[tauri::command]
 pub fn delete_tag(state: tauri::State<'_, AppState>, id: i64) -> Result<(), String> {
-    let conn = lock_db!(state);
-    conn.execute("DELETE FROM tags WHERE id=?1", params![id])
+    let mut conn = lock_db!(state);
+    let tx = conn.transaction().map_err(|e| format!("开启删除 Tag 事务失败: {e}"))?;
+    let parent_id: Option<i64> = tx.query_row("SELECT parent_id FROM tags WHERE id=?1", params![id], |row| row.get(0)).map_err(|_| "Tag 不存在")?;
+    tx.execute("UPDATE tags SET parent_id=?1 WHERE parent_id=?2", params![parent_id, id]).map_err(|e| format!("上移子 Tag 失败: {e}"))?;
+    tx.execute("DELETE FROM tags WHERE id=?1", params![id])
         .map_err(|e| format!("删除 Tag 失败: {e}"))?;
+    tx.commit().map_err(|e| format!("保存 Tag 删除失败: {e}"))?;
+    Ok(())
+}
+
+#[tauri::command]
+pub fn move_tag(state: tauri::State<'_, AppState>, id: i64, parent_id: Option<i64>, category_id: Option<i64>) -> Result<(), String> {
+    let mut conn = lock_db!(state);
+    move_tag_in(&mut conn, id, parent_id, category_id)
+}
+
+/* 移动 Tag 的实逻辑，和 Tauri State 解耦以便测试。
+   parent_id 给定时挂成那个 Tag 的子级；为 None 时落到 category_id（缺省为原维度）的根层。 */
+fn move_tag_in(conn: &mut rusqlite::Connection, id: i64, parent_id: Option<i64>, category_id: Option<i64>) -> Result<(), String> {
+    if parent_id == Some(id) { return Err("不能移动到自身".into()); }
+
+    let (current_category, name): (i64, String) = conn
+        .query_row("SELECT category_id, name FROM tags WHERE id=?1", params![id], |row| Ok((row.get(0)?, row.get(1)?)))
+        .map_err(|_| "Tag 不存在")?;
+
+    /* 目标维度：挂到某个 Tag 下面时，跟随那个父 Tag 所属的维度（维度由位置决定，
+       不接受调用方另传一个不一致的维度）；放到维度根层时才用调用方指定的维度。
+       老调用只传 parentId，此时沿用原维度，行为与之前一致。 */
+    let target_category = match parent_id {
+        Some(parent) => {
+            let parent_category: i64 = conn.query_row("SELECT category_id FROM tags WHERE id=?1", params![parent], |row| row.get(0)).map_err(|_| "父 Tag 不存在")?;
+            let descendant: bool = conn.query_row("WITH RECURSIVE descendants(id) AS (SELECT id FROM tags WHERE parent_id=?1 UNION ALL SELECT t.id FROM tags t JOIN descendants d ON t.parent_id=d.id) SELECT EXISTS(SELECT 1 FROM descendants WHERE id=?2)", params![id, parent], |row| row.get(0)).map_err(|e| format!("验证 Tag 层级失败: {e}"))?;
+            if descendant { return Err("不能移动到自己的后代节点".into()); }
+            parent_category
+        }
+        None => category_id.unwrap_or(current_category),
+    };
+
+    /* 目标位置已有同名 Tag 时给一句人话，别把唯一索引的报错原样抛给用户。 */
+    let clash: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM tags WHERE category_id=?1 AND COALESCE(parent_id, -1)=COALESCE(?2, -1) AND name=?3 COLLATE NOCASE AND id<>?4)",
+            params![target_category, parent_id, name, id],
+            |row| row.get(0),
+        )
+        .map_err(|e| format!("校验目标位置失败: {e}"))?;
+    if clash { return Err(format!("目标位置已有同名 Tag「{name}」")); }
+
+    let tx = conn.transaction().map_err(|e| format!("开启移动 Tag 事务失败: {e}"))?;
+    tx.execute("UPDATE tags SET parent_id=?1, category_id=?2 WHERE id=?3", params![parent_id, target_category, id])
+        .map_err(|e| format!("移动 Tag 失败: {e}"))?;
+    /* 子 Tag 要跟着父 Tag 一起换维度，否则会出现「父在 A 维度、子在 B 维度」的错位，
+       列表按维度分组时会露馅。 */
+    if target_category != current_category {
+        tx.execute(
+            "WITH RECURSIVE subtree(id) AS (SELECT id FROM tags WHERE parent_id=?1 UNION ALL SELECT t.id FROM tags t JOIN subtree s ON t.parent_id=s.id) UPDATE tags SET category_id=?2 WHERE id IN (SELECT id FROM subtree)",
+            params![id, target_category],
+        ).map_err(|e| format!("同步子 Tag 维度失败: {e}"))?;
+    }
+    tx.commit().map_err(|e| format!("提交移动 Tag 失败: {e}"))?;
     Ok(())
 }
 
@@ -1018,8 +1289,8 @@ pub struct LocationSyncResult {
 /// every directory continuously.
 #[tauri::command]
 pub fn sync_library_locations(state: tauri::State<'_, AppState>) -> Result<LocationSyncResult, String> {
-    let mut conn = lock_db!(state);
     let entries = {
+        let conn = lock_db!(state);
         let mut stmt = conn.prepare("SELECT id, path, album, album_source, file_bookmark FROM music")
             .map_err(|e| format!("准备位置同步失败: {e}"))?;
         let rows = stmt.query_map([], |row| Ok((
@@ -1031,8 +1302,8 @@ pub fn sync_library_locations(state: tauri::State<'_, AppState>) -> Result<Locat
             .map_err(|e| format!("读取位置同步数据失败: {e}"))?
     };
 
-    let tx = conn.transaction().map_err(|e| format!("开启位置同步事务失败: {e}"))?;
     let mut result = LocationSyncResult { updated_paths: 0, updated_albums: 0 };
+    let mut updates = Vec::new();
     for (id, old_path, old_album, old_source, bookmark) in entries {
         let mut source = old_source.clone();
         let resolved = match bookmark.as_deref().filter(|data| !data.is_empty()) {
@@ -1047,7 +1318,7 @@ pub fn sync_library_locations(state: tauri::State<'_, AppState>) -> Result<Locat
             source = "folder".into();
         }
         let album = if source == "folder" { folder_album } else { old_album.clone() };
-        let file_name = Path::new(&path).file_name().and_then(|name| name.to_str()).unwrap_or_default();
+        let file_name = Path::new(&path).file_name().and_then(|name| name.to_str()).unwrap_or_default().to_string();
         let path_changed = path != old_path;
         let album_changed = album != old_album;
         let source_changed = source != old_source;
@@ -1060,15 +1331,22 @@ pub fn sync_library_locations(state: tauri::State<'_, AppState>) -> Result<Locat
         };
         let bookmark_changed = bookmark.as_deref().unwrap_or_default() != refreshed_bookmark.as_slice();
         if path_changed || album_changed || source_changed || bookmark_changed {
-            tx.execute(
-                "UPDATE music SET path=?1, file_name=?2, file_bookmark=?3, album=?4, album_source=?5, updated_at=?6 WHERE id=?7",
-                params![path, file_name, refreshed_bookmark, album, source, now_ms(), id],
-            ).map_err(|e| format!("写入同步位置失败: {e}"))?;
             result.updated_paths += usize::from(path_changed);
             result.updated_albums += usize::from(album_changed);
+            updates.push((path, file_name, refreshed_bookmark, album, source, id));
         }
     }
-    tx.commit().map_err(|e| format!("提交位置同步失败: {e}"))?;
+    if !updates.is_empty() {
+        let mut conn = lock_db!(state);
+        let tx = conn.transaction().map_err(|e| format!("开启位置同步事务失败: {e}"))?;
+        for (path, file_name, bookmark, album, source, id) in updates {
+            tx.execute(
+                "UPDATE music SET path=?1, file_name=?2, file_bookmark=?3, album=?4, album_source=?5, updated_at=?6 WHERE id=?7",
+                params![path, file_name, bookmark, album, source, now_ms(), id],
+            ).map_err(|e| format!("写入同步位置失败: {e}"))?;
+        }
+        tx.commit().map_err(|e| format!("提交位置同步失败: {e}"))?;
+    }
     Ok(result)
 }
 
@@ -1085,4 +1363,276 @@ pub fn get_database_path(app: tauri::AppHandle) -> Result<String, String> {
 pub fn get_audio_base_url() -> Option<String> {
     // 仅 Plan-B（本地 HTTP 音频流服务）启用时返回。
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_conn() -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            r#"
+            CREATE TABLE tag_categories (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL UNIQUE COLLATE NOCASE,
+                created_at INTEGER NOT NULL
+            );
+            CREATE TABLE tags (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL COLLATE NOCASE,
+                category_id INTEGER NOT NULL REFERENCES tag_categories(id) ON DELETE RESTRICT,
+                parent_id INTEGER REFERENCES tags(id) ON DELETE RESTRICT,
+                created_at INTEGER NOT NULL
+            );
+            CREATE UNIQUE INDEX idx_tags_sibling_name ON tags(category_id, COALESCE(parent_id, -1), name COLLATE NOCASE);
+            CREATE TABLE music_tags (
+                music_id TEXT NOT NULL,
+                tag_id INTEGER NOT NULL REFERENCES tags(id) ON DELETE CASCADE,
+                PRIMARY KEY (music_id, tag_id)
+            );
+            CREATE TABLE clip_tags (
+                clip_id TEXT NOT NULL,
+                tag_id INTEGER NOT NULL REFERENCES tags(id) ON DELETE CASCADE,
+                PRIMARY KEY (clip_id, tag_id)
+            );
+            INSERT INTO tag_categories (name, created_at) VALUES ('情绪', 1), ('未分类', 2);
+            "#,
+        ).unwrap();
+        conn
+    }
+
+    fn add_tag(conn: &rusqlite::Connection, name: &str, category: &str, parent_id: Option<i64>) -> i64 {
+        conn.execute(
+            "INSERT INTO tags (name, category_id, parent_id, created_at)
+             VALUES (?1, (SELECT id FROM tag_categories WHERE name=?2), ?3, 0)",
+            params![name, category, parent_id],
+        ).unwrap();
+        conn.last_insert_rowid()
+    }
+
+    fn count_tags(conn: &rusqlite::Connection, name: &str) -> i64 {
+        conn.query_row("SELECT COUNT(*) FROM tags WHERE name=?1", params![name], |r| r.get(0)).unwrap()
+    }
+
+    /// 就是这个 bug：给音乐打一个已有 Tag，不能再造一份副本出来。
+    #[test]
+    fn sync_tags_reuses_existing_tag_by_name() {
+        let conn = test_conn();
+        let real = add_tag(&conn, "温暖", "情绪", None);
+
+        sync_tags(&conn, "m1", &["温暖".into()], "music_tags", "music_id").unwrap();
+
+        assert_eq!(count_tags(&conn, "温暖"), 1, "不应新建同名 Tag");
+        let tag_id: i64 = conn.query_row("SELECT tag_id FROM music_tags WHERE music_id='m1'", [], |r| r.get(0)).unwrap();
+        assert_eq!(tag_id, real, "应关联到已有的那个 Tag");
+    }
+
+    /// 真·新名字才新建，而且落在「未分类」。
+    #[test]
+    fn sync_tags_creates_unknown_tag_in_uncategorized() {
+        let conn = test_conn();
+
+        sync_tags(&conn, "m1", &["全新".into()], "music_tags", "music_id").unwrap();
+
+        assert_eq!(count_tags(&conn, "全新"), 1);
+        let category: String = conn.query_row(
+            "SELECT c.name FROM tags t JOIN tag_categories c ON c.id=t.category_id WHERE t.name='全新'",
+            [], |r| r.get(0),
+        ).unwrap();
+        assert_eq!(category, "未分类");
+    }
+
+    /// 库已经被旧版污染（同名两份都在）时，要挑真正的那个，而不是未分类里的副本。
+    #[test]
+    fn sync_tags_prefers_non_uncategorized_over_stale_duplicate() {
+        let conn = test_conn();
+        let real = add_tag(&conn, "人声", "情绪", None);
+        let stale = add_tag(&conn, "人声", "未分类", None);
+
+        sync_tags(&conn, "m1", &["人声".into()], "music_tags", "music_id").unwrap();
+
+        let tag_id: i64 = conn.query_row("SELECT tag_id FROM music_tags WHERE music_id='m1'", [], |r| r.get(0)).unwrap();
+        assert_eq!(tag_id, real, "应挑非未分类的那个，而不是 {stale}");
+        assert_eq!(count_tags(&conn, "人声"), 2, "解析不该顺手动数据结构");
+    }
+
+    /// 根层优先于子级：同名时挑根层那个。
+    #[test]
+    fn sync_tags_prefers_root_over_child() {
+        let conn = test_conn();
+        let parent = add_tag(&conn, "温暖", "情绪", None);
+        let child = add_tag(&conn, "明亮", "情绪", Some(parent));
+
+        sync_tags(&conn, "m1", &["明亮".into()], "music_tags", "music_id").unwrap();
+
+        let tag_id: i64 = conn.query_row("SELECT tag_id FROM music_tags WHERE music_id='m1'", [], |r| r.get(0)).unwrap();
+        assert_eq!(tag_id, child, "只有子级同名时就用它");
+    }
+
+    /// 大小写与空白不该造出重复项。
+    #[test]
+    fn sync_tags_ignores_case_and_padding() {
+        let conn = test_conn();
+        let real = add_tag(&conn, "Ambient", "情绪", None);
+
+        sync_tags(&conn, "m1", &["  ambient  ".into()], "music_tags", "music_id").unwrap();
+
+        assert_eq!(count_tags(&conn, "Ambient"), 1);
+        let tag_id: i64 = conn.query_row("SELECT tag_id FROM music_tags WHERE music_id='m1'", [], |r| r.get(0)).unwrap();
+        assert_eq!(tag_id, real);
+    }
+
+    /// 多个 Tag 一起同步，也各自解析。
+    #[test]
+    fn sync_tags_handles_mixed_existing_and_new() {
+        let conn = test_conn();
+        let existing = add_tag(&conn, "人声", "情绪", None);
+
+        sync_tags(&conn, "m1", &["人声".into(), "全新".into()], "music_tags", "music_id").unwrap();
+
+        assert_eq!(count_tags(&conn, "人声"), 1, "已有 Tag 不该被复制");
+        assert_eq!(count_tags(&conn, "全新"), 1, "新 Tag 应被创建");
+        let linked: Vec<i64> = conn.prepare("SELECT tag_id FROM music_tags WHERE music_id='m1'").unwrap()
+            .query_map([], |r| r.get(0)).unwrap().collect::<Result<_, _>>().unwrap();
+        assert_eq!(linked.len(), 2);
+        assert!(linked.contains(&existing));
+    }
+
+    #[test]
+    fn sync_tag_ids_preserves_exact_same_name_identity() {
+        let conn = test_conn();
+        let emotional = add_tag(&conn, "现场", "情绪", None);
+        let uncategorized = add_tag(&conn, "现场", "未分类", None);
+
+        sync_tag_ids(&conn, "m1", &[uncategorized], &[], "music_tags", "music_id").unwrap();
+
+        let linked: i64 = conn.query_row("SELECT tag_id FROM music_tags WHERE music_id='m1'", [], |row| row.get(0)).unwrap();
+        assert_eq!(linked, uncategorized);
+        assert_ne!(linked, emotional);
+    }
+
+    #[test]
+    fn sync_tag_ids_adds_new_free_text_tags() {
+        let conn = test_conn();
+        let existing = add_tag(&conn, "现场", "情绪", None);
+
+        sync_tag_ids(&conn, "m1", &[existing], &["新标签".into()], "music_tags", "music_id").unwrap();
+
+        let linked: Vec<i64> = conn.prepare("SELECT tag_id FROM music_tags WHERE music_id='m1'").unwrap()
+            .query_map([], |row| row.get(0)).unwrap().collect::<Result<_, _>>().unwrap();
+        assert_eq!(linked.len(), 2);
+        assert_eq!(count_tags(&conn, "新标签"), 1);
+    }
+
+    fn category_of(conn: &rusqlite::Connection, id: i64) -> String {
+        conn.query_row(
+            "SELECT c.name FROM tags t JOIN tag_categories c ON c.id=t.category_id WHERE t.id=?1",
+            params![id], |r| r.get(0),
+        ).unwrap()
+    }
+
+    fn parent_of(conn: &rusqlite::Connection, id: i64) -> Option<i64> {
+        conn.query_row("SELECT parent_id FROM tags WHERE id=?1", params![id], |r| r.get(0)).unwrap()
+    }
+
+    fn category_id_of(conn: &rusqlite::Connection, name: &str) -> i64 {
+        conn.query_row("SELECT id FROM tag_categories WHERE name=?1", params![name], |r| r.get(0)).unwrap()
+    }
+
+    /// 用户加错维度时最需要的功能：把 Tag 拖到另一个维度，它真的换维度。
+    #[test]
+    fn move_tag_changes_category() {
+        let mut conn = test_conn();
+        let tag = add_tag(&conn, "温暖", "情绪", None);
+
+        let uncategorized = category_id_of(&conn, "未分类");
+        move_tag_in(&mut conn, tag, None, Some(uncategorized)).unwrap();
+
+        assert_eq!(category_of(&conn, tag), "未分类");
+        assert_eq!(parent_of(&conn, tag), None, "落到根层");
+    }
+
+    /// 只传 parentId（老调用）时，维度不该被悄悄改掉。
+    #[test]
+    fn move_tag_keeps_category_when_only_parent_given() {
+        let mut conn = test_conn();
+        let parent = add_tag(&conn, "温暖", "情绪", None);
+        let child = add_tag(&conn, "沙发", "情绪", None);
+
+        move_tag_in(&mut conn, child, Some(parent), None).unwrap();
+
+        assert_eq!(parent_of(&conn, child), Some(parent));
+        assert_eq!(category_of(&conn, child), "情绪");
+    }
+
+    /// 挂到别的维度的 Tag 下面时，维度由父 Tag 决定。
+    #[test]
+    fn move_tag_follows_parent_category() {
+        let mut conn = test_conn();
+        let root = add_tag(&conn, "温暖", "未分类", None);
+        let other = add_tag(&conn, "节奏感", "情绪", None);
+
+        move_tag_in(&mut conn, root, Some(other), None).unwrap();
+
+        assert_eq!(parent_of(&conn, root), Some(other));
+        assert_eq!(category_of(&conn, root), "情绪", "应跟随父 Tag 的维度");
+    }
+
+    /// 子 Tag 必须跟着一起换维度，不能留下「父在 A、子在 B」的错位。
+    #[test]
+    fn move_tag_moves_descendants_along() {
+        let mut conn = test_conn();
+        let root = add_tag(&conn, "温暖", "情绪", None);
+        let child = add_tag(&conn, "沙发", "情绪", Some(root));
+        let grandchild = add_tag(&conn, "绒面", "情绪", Some(child));
+
+        let uncategorized = category_id_of(&conn, "未分类");
+        move_tag_in(&mut conn, root, None, Some(uncategorized)).unwrap();
+
+        assert_eq!(category_of(&conn, root), "未分类");
+        assert_eq!(category_of(&conn, child), "未分类", "子 Tag 要跟过来");
+        assert_eq!(category_of(&conn, grandchild), "未分类", "孙 Tag 也要跟过来");
+        assert_eq!(parent_of(&conn, child), Some(root), "层级结构不该被破坏");
+        assert_eq!(parent_of(&conn, grandchild), Some(child));
+    }
+
+    /// 不能把 Tag 拖进自己的子树里。
+    #[test]
+    fn move_tag_rejects_descendant_target() {
+        let mut conn = test_conn();
+        let root = add_tag(&conn, "温暖", "情绪", None);
+        let child = add_tag(&conn, "沙发", "情绪", Some(root));
+
+        let error = move_tag_in(&mut conn, root, Some(child), None).unwrap_err();
+
+        assert!(error.contains("后代"), "应提示不能移到后代：{error}");
+        assert_eq!(parent_of(&conn, root), None, "失败后结构不变");
+    }
+
+    /// 目标位置已有同名 Tag 时，给一句人话而不是抛唯一索引错误。
+    #[test]
+    fn move_tag_reports_name_clash() {
+        let mut conn = test_conn();
+        let tag = add_tag(&conn, "温暖", "情绪", None);
+        add_tag(&conn, "温暖", "未分类", None);
+
+        let uncategorized = category_id_of(&conn, "未分类");
+        let error = move_tag_in(&mut conn, tag, None, Some(uncategorized)).unwrap_err();
+
+        assert!(error.contains("同名"), "应提示同名：{error}");
+        assert_eq!(category_of(&conn, tag), "情绪", "失败后不该移动");
+    }
+
+    /// 拖到自身或同维度根层都不能算错。
+    #[test]
+    fn move_tag_rejects_self_and_allows_noop() {
+        let mut conn = test_conn();
+        let tag = add_tag(&conn, "温暖", "情绪", None);
+
+        assert!(move_tag_in(&mut conn, tag, Some(tag), None).unwrap_err().contains("自身"));
+        let emotional = category_id_of(&conn, "情绪");
+        move_tag_in(&mut conn, tag, None, Some(emotional)).unwrap();
+        assert_eq!(category_of(&conn, tag), "情绪");
+    }
 }

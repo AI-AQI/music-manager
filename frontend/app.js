@@ -8,31 +8,50 @@ const __TAURI__ = window.__TAURI__;
 const invoke = __TAURI__.core.invoke;
 const convertFileSrc = __TAURI__.core.convertFileSrc;
 
+const TAG_GROUP_COLLAPSED_STORAGE_KEY = "music-library-tag-groups-collapsed";
+const SIDEBAR_TAG_MANAGE_STORAGE_KEY = "music-library-sidebar-tag-manage";
+const PAGE_SIZES_STORAGE_KEY = "music-library-page-sizes";
+
 let state = {
     currentView: "all",
     search: "",
+    albumSearch: "",
     layout: "list",
     tagResultTab: null,
-    tagManagerOpen: false,
-    editingTagId: null,
-    tagAction: null,
-    activeTags: [],
+    /* 侧栏内联编辑：新增/重命名维度与 Tag 都在原位输入，不再弹浮层。
+       { type: "create-category" | "edit-category" | "create-tag" | "edit-tag",
+         categoryId?, categoryName?, parentId?, tagId?, tagName?, value? } */
+    tagDraft: null,
+    tagDraftSaving: false,
+    tagGroupCollapsed: new Set(getSavedTagGroupCollapsed()),
+    sidebarTagManage: getSavedSidebarTagManage(),
+    activeTagIds: [],
     selectionMode: false,
     selectedMusicIds: new Set(),
     selectedClipIds: new Set(),
+
+    pages: {},
+    pageSizes: getSavedPageSizes(),
+    importAlbumPage: 1,
+    importTrackPage: 1,
+    candidatePage: 1,
 
     catalogSelection: null,
 
     selectedMusic: null,
     clipsPanelMusic: null,
     playOnRowClick: true,
+    quickTagMusicId: null,
+    quickTagSuggestions: [],
 
     importFiles: [],
     importAlbumSource: "metadata",
     importSelectedAlbum: null,
 
     editTags: [],
+    editTagIds: [],
     clipTags: [],
+    clipTagIds: [],
 
     clipMusic: null,
     editingClip: null,
@@ -47,7 +66,6 @@ let state = {
     draggingHandle: null,
     draggingTagId: null,
     tagPointerDrag: null,
-    suppressTagClick: false,
 
     player: {
         queue: [],
@@ -72,6 +90,99 @@ let importAlbumRefreshTimer = null;
 let importAlbumNameScrollTimer = null;
 let importAlbumNameScrollElement = null;
 let locationSyncPromise = null;
+let tagRecordsCache = [];
+let searchRenderTimer = null;
+let albumFilterTimer = null;
+const libraryCache = { music: null, clips: null };
+const coverArtCache = new Map();
+const PAGE_SIZE = 50;
+const COMPACT_PAGE_SIZE = 30;
+const PAGE_SIZE_OPTIONS = [10, 20, 30, 50, 100];
+
+function getSavedPageSizes() {
+    try {
+        const saved = JSON.parse(localStorage.getItem(PAGE_SIZES_STORAGE_KEY) || "{}");
+        if (!saved || typeof saved !== "object" || Array.isArray(saved)) return {};
+        return Object.fromEntries(Object.entries(saved).filter(([, value]) => [10, 20, 30, 50, 100].includes(Number(value))));
+    } catch (_) {
+        return {};
+    }
+}
+
+function savePageSizes() {
+    try {
+        localStorage.setItem(PAGE_SIZES_STORAGE_KEY, JSON.stringify(state.pageSizes));
+    } catch (_) {
+        // 存储不可用时，仅在本次运行中保留设置。
+    }
+}
+
+function resetPagination() {
+    state.pages = {};
+    state.candidatePage = 1;
+}
+
+function paginate(items, key, pageSize = PAGE_SIZE) {
+    pageSize = Number(state.pageSizes[key]) || pageSize;
+    const totalPages = Math.max(1, Math.ceil(items.length / pageSize));
+    const requested = Number(state.pages[key]) || 1;
+    const page = Math.min(totalPages, Math.max(1, requested));
+    state.pages[key] = page;
+    return {
+        items: items.slice((page - 1) * pageSize, page * pageSize),
+        page,
+        pageSize,
+        total: items.length,
+        totalPages
+    };
+}
+
+function paginationHTML(result, key, noun = "项") {
+    if (result.total <= PAGE_SIZE_OPTIONS[0]) return "";
+    const compact = key === "candidates" || key === "import:albums" || key.startsWith("music-clips:") || key.endsWith(":groups");
+    const sizeOptions = PAGE_SIZE_OPTIONS.map(size =>
+        `<option value="${size}" ${size === result.pageSize ? "selected" : ""}>${compact ? `${size} / 页` : `每页 ${size}`}</option>`
+    ).join("");
+    return `<nav class="pagination${compact ? " pagination-compact" : ""}" aria-label="分页">
+        <button type="button" data-page-key="${escapeHTML(key)}" data-page="${result.page - 1}" title="上一页" aria-label="上一页" ${result.page <= 1 ? "disabled" : ""}>${compact ? "‹" : "上一页"}</button>
+        <span>${compact ? `${result.page} / ${result.totalPages}` : `第 ${result.page} / ${result.totalPages} 页 · 共 ${result.total} ${noun}`}</span>
+        <label class="pagination-size"><span>每页数量</span><select data-page-size-key="${escapeHTML(key)}" aria-label="每页显示数量">${sizeOptions}</select></label>
+        <button type="button" data-page-key="${escapeHTML(key)}" data-page="${result.page + 1}" title="下一页" aria-label="下一页" ${result.page >= result.totalPages ? "disabled" : ""}>${compact ? "›" : "下一页"}</button>
+    </nav>`;
+}
+
+function restoreCatalogScroll({ list = 0, detail = 0 } = {}) {
+    requestAnimationFrame(() => {
+        const catalogList = document.querySelector(".catalog-list");
+        const catalogDetail = document.querySelector(".catalog-detail");
+        if (catalogList) catalogList.scrollTop = list;
+        if (catalogDetail) catalogDetail.scrollTop = detail;
+    });
+}
+
+function scrollMainContentToTop() {
+    requestAnimationFrame(() => {
+        const scroller = document.querySelector(".main-scroll-area");
+        const content = $("contentArea");
+        scroller?.scrollTo({ top: Math.max(0, content.offsetTop), behavior: "auto" });
+    });
+}
+
+async function hydrateVisibleArtwork(music) {
+    const ids = music.filter(item => !item.coverArt && !coverArtCache.has(item.id)).map(item => item.id);
+    if (ids.length) {
+        const covers = await invoke("get_music_cover_arts", { ids });
+        covers.forEach(item => coverArtCache.set(item.id, item.coverArt || ""));
+    }
+    music.forEach(item => {
+        const coverArt = item.coverArt || coverArtCache.get(item.id);
+        if (!coverArt) return;
+        document.querySelectorAll(`[data-music-id="${CSS.escape(item.id)}"] .music-icon, [data-music-id="${CSS.escape(item.id)}"] .card-icon`).forEach(container => {
+            container.classList.toggle("has-artwork", container.classList.contains("card-icon"));
+            container.innerHTML = `<img src="${escapeHTML(coverArt)}" alt="${escapeHTML(item.album || item.name)} 封面">`;
+        });
+    });
+}
 
 function stopImportAlbumNameScroll() {
     if (importAlbumNameScrollTimer) clearInterval(importAlbumNameScrollTimer);
@@ -144,6 +255,41 @@ function getSavedSidebarCollapsed() {
         return localStorage.getItem(SIDEBAR_COLLAPSED_STORAGE_KEY) === "true";
     } catch (_) {
         return false;
+    }
+}
+
+/* 折叠键统一为带前缀字符串："c:<维度id>" / "t:<Tag id>"；兼容旧版纯数字（视为维度 id）。 */
+function getSavedTagGroupCollapsed() {
+    try {
+        const saved = JSON.parse(localStorage.getItem(TAG_GROUP_COLLAPSED_STORAGE_KEY) || "[]");
+        if (!Array.isArray(saved)) return [];
+        return saved.map(value => typeof value === "number" ? `c:${value}` : String(value));
+    } catch (_) {
+        return [];
+    }
+}
+
+function saveTagGroupCollapsed() {
+    try {
+        localStorage.setItem(TAG_GROUP_COLLAPSED_STORAGE_KEY, JSON.stringify([...state.tagGroupCollapsed]));
+    } catch (_) {
+        // 仅本次运行保持当前状态。
+    }
+}
+
+function getSavedSidebarTagManage() {
+    try {
+        return localStorage.getItem(SIDEBAR_TAG_MANAGE_STORAGE_KEY) === "true";
+    } catch (_) {
+        return false;
+    }
+}
+
+function saveSidebarTagManage() {
+    try {
+        localStorage.setItem(SIDEBAR_TAG_MANAGE_STORAGE_KEY, String(state.sidebarTagManage));
+    } catch (_) {
+        // 仅本次运行保持当前状态。
     }
 }
 
@@ -231,38 +377,66 @@ function ensureTauri() {
    数据访问层（Tauri command 封装）
 ========================================================= */
 
-const dbGetAll = async storeName =>
-    storeName === "music"
-        ? invoke("list_music")
-        : invoke("list_clips");
+const dbGetAll = async storeName => {
+    if (libraryCache[storeName]) return libraryCache[storeName];
+    const rows = await invoke(storeName === "music" ? "list_music" : "list_clips");
+    libraryCache[storeName] = rows;
+    return rows;
+};
+
+function invalidateLibraryCache(storeName = null) {
+    if (!storeName || storeName === "music") libraryCache.music = null;
+    if (!storeName || storeName === "clips") libraryCache.clips = null;
+}
+
+const getLibraryCounts = async () => invoke("get_library_counts");
 
 const dbGet = async (storeName, id) =>
     storeName === "music"
         ? invoke("get_music", { id })
         : invoke("get_clip", { id });
 
-const dbAdd = async (storeName, value) =>
-    storeName === "music"
-        ? invoke("create_music", { music: value })
-        : invoke("create_clip", { clip: value });
+function withTagWritePayload(value) {
+    const tags = [...(value.tags || [])];
+    const alignedIds = [...(value.tagIds || [])];
+    return {
+        ...value,
+        tags,
+        tagIds: alignedIds.filter(Number.isInteger),
+        newTags: tags.filter((_, index) => !Number.isInteger(alignedIds[index]))
+    };
+}
 
-const dbPut = async (storeName, value) =>
-    storeName === "music"
-        ? invoke("update_music", { music: value })
-        : invoke("update_clip", { clip: value });
+const dbAdd = async (storeName, value) => {
+    await (storeName === "music"
+        ? invoke("create_music", { music: withTagWritePayload(value) })
+        : invoke("create_clip", { clip: withTagWritePayload(value) }));
+    invalidateLibraryCache(storeName);
+    if (storeName === "music") coverArtCache.delete(value.id);
+};
 
-const dbDelete = async (storeName, id) =>
-    storeName === "music"
+const dbPut = async (storeName, value) => {
+    await (storeName === "music"
+        ? invoke("update_music", { music: withTagWritePayload(value) })
+        : invoke("update_clip", { clip: withTagWritePayload(value) }));
+    invalidateLibraryCache(storeName);
+    if (storeName === "music") coverArtCache.delete(value.id);
+};
+
+const dbDelete = async (storeName, id) => {
+    await (storeName === "music"
         ? invoke("delete_music", { id })
-        : invoke("delete_clip", { id });
+        : invoke("delete_clip", { id }));
+    invalidateLibraryCache(storeName);
+    if (storeName === "music") {
+        coverArtCache.delete(id);
+        invalidateLibraryCache("clips");
+    }
+};
 
 async function initDB() {
 
     await invoke("init_db");
-
-    // 先用 macOS 文件书签修正 Finder 中的移动/改名，再读取音乐库。
-    // 其中以文件夹识别的专辑会在这里同步为最新父文件夹名称。
-    await invoke("sync_library_locations");
 }
 
 async function refreshLocationsAfterFinderChanges() {
@@ -271,6 +445,7 @@ async function refreshLocationsAfterFinderChanges() {
     locationSyncPromise = (async () => {
         const result = await invoke("sync_library_locations");
         if (!result.updatedPaths && !result.updatedAlbums) return;
+        invalidateLibraryCache("music");
 
         const selectedMusicId = state.selectedMusic?.id;
         await updateCounts();
@@ -350,6 +525,61 @@ function musicArtwork(item) {
         : "♫";
 }
 
+function renderInlineMusicTags(item) {
+    const tags = (item.tags || [])
+        .map((tag, index) => {
+            const record = tagRecordsCache.find(value => value.id === item.tagIds?.[index]);
+            return `<span class="tag" title="${escapeHTML(record?.path || tag)}">#${escapeHTML(tag)}</span>`;
+        })
+        .join("");
+    const editing = state.quickTagMusicId === item.id;
+    const used = new Set((item.tagIds || []).filter(Number.isInteger));
+    const grouped = new Map();
+    state.quickTagSuggestions
+        .filter(tag => !used.has(tag.id))
+        .forEach(tag => {
+            const category = tag.category || "未分类";
+            if (!grouped.has(category)) grouped.set(category, []);
+            grouped.get(category).push(tag);
+        });
+    const options = [...grouped.entries()].map(([category, categoryTags]) =>
+        `<optgroup label="${escapeHTML(category)}">${categoryTags.map(tag => `<option value="${tag.id}">#${escapeHTML(tag.path)}</option>`).join("")}</optgroup>`
+    ).join("");
+
+    return `${tags}<button class="quick-tag-button" data-action="quick-tag" data-id="${item.id}" title="为这首音乐添加 Tag">＋ Tag</button>${editing ? `<span class="quick-tag-editor"><select data-quick-tag-select data-id="${item.id}" aria-label="选择已有 Tag"><option value="">选择已有 Tag</option>${options}</select><input data-quick-tag-input="${item.id}" type="text" placeholder="新 Tag，按 Enter" aria-label="输入新 Tag"><button data-action="quick-tag-save" data-id="${item.id}" title="保存新 Tag">添加</button></span>` : ""}`;
+}
+
+async function saveQuickTag(musicId, rawValue, tagId = null) {
+    const selected = Number.isInteger(Number(tagId)) && tagId !== null
+        ? tagRecordsCache.find(item => item.id === Number(tagId))
+        : null;
+    const tag = selected?.name || normalizeTag(rawValue);
+    if (!tag) {
+        showToast("请输入 Tag 名称");
+        return;
+    }
+
+    const music = await dbGet("music", musicId);
+    if (!music) return;
+    if ((selected && (music.tagIds || []).includes(selected.id)) || (!selected && (music.tags || []).includes(tag))) {
+        state.quickTagMusicId = null;
+        await render();
+        showToast("该 Tag 已添加");
+        return;
+    }
+
+    music.tags = [...(music.tags || []), tag];
+    music.tagIds = [...(music.tagIds || []), selected?.id ?? null];
+    music.updatedAt = Date.now();
+    await dbPut("music", music);
+    state.quickTagMusicId = null;
+    await updateCounts();
+    await renderSidebarTags();
+    await renderFilterPanel();
+    await render();
+    showToast(`已添加 #${tag}`);
+}
+
 function getErrorMessage(error) {
     if (error instanceof Error && error.message) {
         return error.message;
@@ -426,30 +656,77 @@ function normalizeTag(value) {
     return String(value || "").trim().replace(/\s+/g, " ");
 }
 
-function closeTagAction() {
-    state.tagAction = null;
-    $("tagActionModal").classList.add("hidden");
+
+/* =========================================================
+   侧栏内联编辑
+   新增/重命名维度与 Tag 都在侧栏原位输入：Enter 提交、Esc 取消、
+   失焦时若已输入内容则提交。渲染由 renderSidebarTags 负责，
+   这里只维护 state.tagDraft 这一份待编辑状态。
+========================================================= */
+
+/* 每一轮草稿带一个自增 id：重渲染会换掉输入框元素，提交后也要开新一轮，
+   靠 id 才能分清「用户真的离开了这个输入框」和「这个输入框被重渲染换掉了」——
+   后者在浏览器里也会补一个 focusout，不区分就会重复提交一次。 */
+let tagDraftSeq = 0;
+
+function startTagDraft(draft) {
+    /* 默认空值 + 光标置尾；重命名时先全选，敲字即覆盖。 */
+    state.tagDraft = { id: ++tagDraftSeq, value: "", selectAll: draft.type.startsWith("edit-"), ...draft };
+    renderSidebarTags();
 }
 
-async function openTagAction(action) {
-    state.tagAction = action;
-    const isCategory = action.type === "create-category" || action.type === "edit-category";
-    const isEditing = action.type === "edit-tag";
-    const isEditingCategory = action.type === "edit-category";
-    $("tagActionTitle").textContent = isEditingCategory ? "编辑分类" : isCategory ? "新增分类" : isEditing ? `编辑 Tag · ${action.tag.name}` : "新增 Tag";
-    $("tagActionNameText").textContent = isCategory ? "分类名称" : "Tag 名称";
-    $("tagActionName").value = isEditingCategory ? action.category : action.tag?.name || "";
-    $("tagActionCategoryLabel").classList.toggle("hidden", !isEditing);
-    if (isEditing) {
-        const categories = await invoke("list_tag_categories");
-        $("tagActionCategory").innerHTML = `<option value="">未分类</option>` + categories.map(category =>
-            `<option value="${escapeHTML(category)}">${escapeHTML(category)}</option>`
-        ).join("");
-        $("tagActionCategory").value = action.tag.category;
+function cancelTagDraft() {
+    if (!state.tagDraft) return;
+    state.tagDraft = null;
+    renderSidebarTags();
+}
+
+async function commitTagDraft(input) {
+    const draft = state.tagDraft;
+    if (!draft || state.tagDraftSaving) return;
+
+    const name = normalizeTag(input ? input.value : draft.value);
+    const isCreate = draft.type === "create-category" || draft.type === "create-tag";
+
+    /* 空值等于放弃；重命名时输入原值也算放弃，避免无意义的写库。 */
+    if (!name || (draft.type === "edit-category" && name === draft.categoryName)
+        || (draft.type === "edit-tag" && name === draft.tagName)) {
+        state.tagDraft = null;
+        await renderSidebarTags();
+        return;
     }
-    $("tagActionHint").textContent = isEditingCategory ? "分类内的 Tag 会一并移至新分类。" : isCategory ? "分类创建后，可以把 Tag 拖入这一列。" : isEditing ? `当前分类：${action.tag.category || "未分类"}（可通过上方选择框修改）` : `将保存到「${action.category || "未分类"}」分类`;
-    $("tagActionModal").classList.remove("hidden");
-    requestAnimationFrame(() => $("tagActionName").focus());
+
+    state.tagDraftSaving = true;
+    /* 先清空草稿再请求，避免失焦与回车重复提交。 */
+    state.tagDraft = null;
+    try {
+        if (draft.type === "create-category") {
+            await invoke("create_tag_category", { name });
+            showToast("维度已创建");
+        } else if (draft.type === "edit-category") {
+            await invoke("update_tag_category", { oldName: draft.categoryName, name });
+            showToast("维度已更新");
+        } else if (draft.type === "create-tag") {
+            await invoke("create_tag", { name, categoryId: draft.categoryId, category: null, parentId: draft.parentId ?? null });
+            showToast("Tag 已创建");
+        } else if (draft.type === "edit-tag") {
+            await invoke("update_tag", { id: draft.tagId, name, category: null });
+            showToast("Tag 已更新");
+        }
+        invalidateLibraryCache();
+        /* 连续录入：新增后把同一个输入位重新打开，方便接着敲下一个。
+           若期间用户已经点了别处的编辑，就不要再抢回来。 */
+        if (isCreate && !state.tagDraft) state.tagDraft = { ...draft, id: ++tagDraftSeq, value: "", selectAll: false };
+    } catch (error) {
+        showToast(`保存失败：${error}`);
+        /* 失败时把输入框连同刚敲的名字放回去并全选，改一个字就能重试。 */
+        if (!state.tagDraft) state.tagDraft = { ...draft, id: ++tagDraftSeq, value: name, selectAll: true };
+    } finally {
+        state.tagDraftSaving = false;
+        await renderSidebarTags();
+        await renderFilterPanel();
+        await render();
+    }
 }
 
 
@@ -520,55 +797,245 @@ async function showMessage(message, title = "提示", kind = "info") {
    获取所有 Tag
 ========================================================= */
 
-async function getAllTags() {
-    const tags = await invoke("list_tags");
-    return tags.map(tag => tag.name);
-}
-
 async function getAllTagRecords() {
-    return invoke("list_tags");
+    tagRecordsCache = await invoke("list_tags");
+    return tagRecordsCache;
 }
 
 
 /* =========================================================
    侧边 Tag
+   按筛选维度分组的 Tag 树：维度行与有子级的 Tag 行均可折叠，
+   折叠状态按 "c:<维度id>" / "t:<Tag id>" 持久化。
+   开合箭头是一枚 SVG 细线箭头，指向由 CSS 依据 aria-expanded 旋转，
+   这里只输出图形本身，不随状态替换字形。
 ========================================================= */
+
+/* 1.5px 圆头描边箭头：字符字形要么太小看不清、要么太大太笨重，CSS border 画的
+   箭头又做不出圆头，而且小于 1px 的描边会被浏览器取整。 */
+const CHEVRON_SVG = '<svg class="chevron" viewBox="0 0 12 12" aria-hidden="true" focusable="false"><path d="M1.5 4L6 8L10.5 4" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>';
 
 async function renderSidebarTags() {
 
     const container = $("sidebarTags");
 
     const tags = await getAllTagRecords();
+    const categories = await invoke("list_tag_category_records");
 
-    if (!tags.length) {
+    const groups = new Map();
+    categories.forEach(category => groups.set(category.id, category));
+    tags.forEach(tag => {
+        if (!groups.has(tag.categoryId)) {
+            groups.set(tag.categoryId, { id: tag.categoryId, name: tag.category || "未分类" });
+        }
+    });
 
-        container.innerHTML =
-            `<div class="empty-small">暂无 Tag</div>`;
+    const byParent = new Map();
+    tags.forEach(tag => {
+        const key = tag.parentId ?? "root";
+        if (!byParent.has(key)) byParent.set(key, []);
+        byParent.get(key).push(tag);
+    });
+    byParent.forEach(list => list.sort((a, b) =>
+        (b.musicCount ?? 0) - (a.musicCount ?? 0) ||
+        a.name.localeCompare(b.name, "zh-Hans-CN")
+    ));
 
-        return;
-    }
+    /* 自底向上累加：每个 Tag 的计数包含所有后代子 Tag。 */
+    const inclusiveCount = new Map();
+    const computeCount = tag => {
+        let total = tag.musicCount ?? 0;
+        (byParent.get(tag.id) || []).forEach(child => {
+            total += computeCount(child);
+        });
+        inclusiveCount.set(tag.id, total);
+        return total;
+    };
+    (byParent.get("root") || []).forEach(computeCount);
 
-    container.innerHTML = tags
-        .sort((a, b) =>
-            (b.musicCount ?? 0) - (a.musicCount ?? 0) ||
-            a.name.localeCompare(b.name, "zh-Hans-CN")
-        )
-        .map(tag => {
+    const renderCaret = (key, hasChildren) => {
+        if (!hasChildren) return `<span class="sidebar-tag-caret-spacer" aria-hidden="true"></span>`;
+        const collapsed = state.tagGroupCollapsed.has(key);
+        return `<button class="sidebar-tag-caret" data-collapse-toggle="${key}" title="${collapsed ? "展开" : "折叠"}" aria-expanded="${!collapsed}">${CHEVRON_SVG}</button>`;
+    };
 
+    const draft = state.tagDraft;
+
+    /* 内联输入框：新增空着（用 placeholder 说明用途），重命名带上原名并全选。 */
+    const renderDraftInput = placeholder => `<input
+        class="sidebar-tag-input"
+        data-tag-draft-input
+        data-tag-draft-id="${draft?.id ?? 0}"
+        type="text"
+        autocomplete="off"
+        spellcheck="false"
+        aria-label="${placeholder}"
+        placeholder="${placeholder}"
+        value="${escapeHTML(draft?.value || "")}"
+    >`;
+
+    /* 新增 Tag 的占位行：与普通 Tag 行同样的缩进和 checkbox 位置。 */
+    const renderTagDraftRow = depth => `
+        <div class="sidebar-tag-row is-draft" style="--tag-depth:${depth}">
+            <span class="sidebar-tag-caret-spacer" aria-hidden="true"></span>
+            <span class="sidebar-tag">
+                <span class="sidebar-tag-checkbox is-draft" aria-hidden="true"></span>
+                ${renderDraftInput("新 Tag 名称")}
+            </span>
+        </div>
+    `;
+
+    const renderTagRow = (tag, depth) => {
+        const children = byParent.get(tag.id) || [];
+        const key = `t:${tag.id}`;
+        const collapsed = state.tagGroupCollapsed.has(key);
+        const selected = state.activeTagIds.includes(tag.id);
+        const editing = draft?.type === "edit-tag" && draft.tagId === tag.id;
+        /* 新增子 Tag 时输入框放在该 Tag 的第一个子级位置。 */
+        const childDraft = draft?.type === "create-tag" && draft.parentId === tag.id;
+        return `
+        <div
+            class="sidebar-tag-row"
+            style="--tag-depth:${depth}"
+            data-tag-id="${tag.id}"
+            data-tag-name="${escapeHTML(tag.name)}"
+        >
+            ${renderCaret(key, children.length > 0)}
+            ${editing ? `
+            <div class="sidebar-tag is-editing">
+                <span class="sidebar-tag-checkbox${selected ? " is-selected" : ""}" aria-hidden="true">✓</span>
+                ${renderDraftInput("Tag 名称")}
+                <span class="sidebar-tag-count">${inclusiveCount.get(tag.id) ?? 0}</span>
+            </div>
+            ` : `
+            <button
+                class="sidebar-tag${selected ? " is-selected" : ""}"
+                data-tag-id="${tag.id}"
+                title="# ${escapeHTML(tag.path)}"
+                aria-pressed="${selected}"
+            >
+                <span class="sidebar-tag-checkbox" aria-hidden="true">✓</span>
+                <span class="sidebar-tag-name">${escapeHTML(tag.name)}</span>
+                <span class="sidebar-tag-count">${inclusiveCount.get(tag.id) ?? 0}</span>
+            </button>
+            `}
+            <span class="sidebar-tag-ops">
+                <button data-sidebar-tag-edit="${tag.id}" title="编辑 Tag">✎</button>
+                <button data-sidebar-tag-add="${tag.id}" data-category-id="${tag.categoryId}" title="新增子 Tag">＋</button>
+                <button data-sidebar-tag-delete="${tag.id}" title="删除 Tag">×</button>
+            </span>
+        </div>
+        ${children.length || childDraft ? `<div class="sidebar-tag-children${collapsed ? " is-collapsed" : ""}" data-tag-children="${tag.id}">${childDraft ? renderTagDraftRow(depth + 1) : ""}${children.map(child => renderTagRow(child, depth + 1)).join("")}</div>` : ""}
+    `;
+    };
+
+    const renderDimensionBody = categoryId => {
+        const roots = (byParent.get("root") || []).filter(tag => tag.categoryId === categoryId);
+        /* 新增根 Tag 时输入框放在该维度第一个 Tag 的位置。 */
+        const rootDraft = draft?.type === "create-tag" && draft.categoryId === categoryId && !draft.parentId
+            ? renderTagDraftRow(0)
+            : "";
+        if (rootDraft) return rootDraft + roots.map(tag => renderTagRow(tag, 0)).join("");
+        return roots.length
+            ? roots.map(tag => renderTagRow(tag, 0)).join("")
+            : `<div class="empty-small">暂无 Tag</div>`;
+    };
+
+    container.innerHTML = `<div class="sidebar-tag-tree${state.sidebarTagManage ? " is-managing" : ""}">` +
+        [...groups.values()].map(category => {
+            const key = `c:${category.id}`;
+            const collapsed = state.tagGroupCollapsed.has(key);
+            const selectedTags = tags.filter(tag => tag.categoryId === category.id && state.activeTagIds.includes(tag.id));
+            const editing = draft?.type === "edit-category" && draft.categoryName === category.name;
             return `
-                <button
-                    class="sidebar-tag"
-                    data-tag="${escapeHTML(tag.name)}"
-                    title="# ${escapeHTML(tag.name)}"
-                >
-                    <span class="sidebar-tag-icon" aria-hidden="true">#</span>
-                    <span class="sidebar-tag-name">${escapeHTML(tag.name)}</span>
-                    <span class="nav-count sidebar-tag-count"><span class="nav-count-value">${tag.musicCount ?? 0}</span></span>
-                </button>
+                <div class="sidebar-tag-dimension${collapsed ? " is-collapsed" : ""}" data-dimension-id="${category.id}">
+                    <div class="sidebar-tag-dimension-row" data-dimension-row="${category.id}">
+                        <span class="sidebar-tag-dimension-icon" aria-hidden="true">#</span>
+                        ${editing
+                            ? renderDraftInput("维度名称")
+                            : `<span class="sidebar-tag-dimension-name">${escapeHTML(category.name)}</span>
+                        <span class="sidebar-tag-dimension-selected">${escapeHTML(selectedTags.map(tag => tag.name).join(", "))}</span>`}
+                        ${selectedTags.length ? `<span class="sidebar-tag-dimension-pill">${selectedTags.length}</span>` : ""}
+                        <span class="sidebar-tag-ops">
+                            <button data-dimension-edit="${escapeHTML(category.name)}" title="编辑维度">✎</button>
+                            <button data-dimension-delete="${escapeHTML(category.name)}" title="删除维度">×</button>
+                            <button data-dimension-add data-category-id="${category.id}" data-category-name="${escapeHTML(category.name)}" title="新增根 Tag">＋</button>
+                        </span>
+                        <button class="sidebar-tag-dimension-toggle" data-collapse-toggle="${key}" title="${collapsed ? "展开" : "折叠"}" aria-expanded="${!collapsed}">${CHEVRON_SVG}</button>
+                    </div>
+                    <div class="sidebar-tag-dimension-body">
+                        ${renderDimensionBody(category.id)}
+                    </div>
+                </div>
             `;
+        }).join("") +
+        (draft?.type === "create-category"
+            ? `<div class="sidebar-tag-dimension-row is-draft">
+                    <span class="sidebar-tag-dimension-icon" aria-hidden="true">#</span>
+                    ${renderDraftInput("新维度名称")}
+               </div>`
+            : state.sidebarTagManage ? `<button class="sidebar-tag-add-dimension" data-dimension-create>＋ 新增维度</button>` : "") +
+        (groups.size ? "" : `<div class="empty-small">还没有筛选维度，先新增一个维度再创建 Tag</div>`) +
+        `</div>`;
 
-        })
-        .join("");
+    $("sidebarTagClearBtn").classList.toggle("hidden", !state.activeTagIds.length);
+
+    /* 重渲染后把光标放回草稿输入框：重命名全选一次，新增时光标置尾。 */
+    const draftInput = container.querySelector("[data-tag-draft-input]");
+    if (draftInput && state.tagDraft) {
+        draftInput.focus();
+        if (state.tagDraft.selectAll) {
+            state.tagDraft.selectAll = false;
+            draftInput.select();
+        } else {
+            draftInput.setSelectionRange(draftInput.value.length, draftInput.value.length);
+        }
+    }
+}
+
+/* =========================================================
+   打 Tag 时的「已有 Tag」分组选择器
+   按筛选维度分组展示；chip 的 data-* 属性由调用方通过 attr 指定。
+========================================================= */
+
+async function loadTagPickerData() {
+    const [records, categories] = await Promise.all([
+        getAllTagRecords(),
+        invoke("list_tag_category_records")
+    ]);
+    return { records, categories };
+}
+
+function renderTagPickerGroups({ exclude = [], excludeIds = [], query = "", attr, data }) {
+    const excluded = new Set(exclude);
+    const excludedIds = new Set(excludeIds.filter(Number.isInteger));
+    const needle = query.trim().toLowerCase();
+    const categoryNames = new Map(data.categories.map(category => [category.id, category.name]));
+    const grouped = new Map();
+    data.records
+        .filter(tag =>
+            !excludedIds.has(tag.id) && !excluded.has(tag.name) &&
+            (!needle || tag.name.toLowerCase().includes(needle))
+        )
+        .forEach(tag => {
+            const category = categoryNames.get(tag.categoryId) || tag.category || "未分类";
+            if (!grouped.has(category)) grouped.set(category, []);
+            grouped.get(category).push(tag);
+        });
+    return [...grouped.entries()].map(([category, tags]) => `
+        <div class="tag-pick-group">
+            <div class="tag-pick-group-title">${escapeHTML(category)}</div>
+            <div class="tag-pick-group-tags">${tags.map(tag => `
+                <button
+                    class="suggestion-tag"
+                    data-${attr}="${tag.id}"
+                    title="${escapeHTML(tag.path)}"
+                >
+                    #${escapeHTML(tag.name)}
+                </button>
+            `).join("")}</div>
+        </div>
+    `).join("");
 }
 
 async function renderFilterPanel() {
@@ -576,70 +1043,68 @@ async function renderFilterPanel() {
         const drag = state.tagPointerDrag;
         drag.tagElement?.classList.remove("is-dragging");
         drag.ghost?.remove();
+        document.querySelectorAll("#sidebarTags .is-drop-target")
+            .forEach(item => item.classList.remove("is-drop-target"));
         state.draggingTagId = null;
         state.tagPointerDrag = null;
         showToast("拖拽已取消");
     }
-    const active = $("activeFilterTags");
-    const suggested = $("recommendedTags");
-    active.innerHTML = state.activeTags.map(tag =>
-        `<button class="active-filter-tag" data-filter-tag="${escapeHTML(tag)}">#${escapeHTML(tag)} ×</button>`
+    updateFilterToggleIndicator();
+    $("activeFilterTags").innerHTML = state.activeTagIds.map(id => {
+        const tag = tagRecordsCache.find(item => item.id === id);
+        return tag ? `<button class="active-filter-tag" data-filter-tag-id="${id}">#${escapeHTML(tag.path)} ×</button>` : "";
+    }
     ).join("");
-    const records = await getAllTagRecords();
-    const categories = await invoke("list_tag_categories");
-    const groups = new Map();
-    categories.forEach(category => groups.set(category, []));
-    groups.set("", []);
-    records.forEach(tag => groups.get(tag.category || "")?.push(tag));
-    suggested.innerHTML = (state.tagManagerOpen ? `<div class="tag-management-tools"><button class="add-category-btn" data-add-category>＋ 添加分类</button><span class="tag-management-hint">拖动 Tag 到分类区域即可更改分类</span></div>` : "") + [...groups.entries()].map(([group, tags]) => `
-        <div class="recommended-tag-group ${state.tagManagerOpen ? "is-managing" : ""}" data-tag-category="${escapeHTML(group)}">
-            <span class="recommended-tag-title"><span>${escapeHTML(group || "未分类")}</span>${state.tagManagerOpen && group ? `<button class="category-inline-edit" data-category-edit="${escapeHTML(group)}" title="编辑分类">✎</button><button class="category-inline-delete" data-category-delete="${escapeHTML(group)}" data-category-tag-count="${tags.length}" title="删除分类">×</button>` : ""}</span>
-            <div class="recommended-tag-list">${tags.map(tag =>
-                `<span class="tag-manage-item"><button class="recommended-tag ${state.activeTags.includes(tag.name) ? "active" : ""}" data-recommended-tag="${escapeHTML(tag.name)}" data-tag-id="${tag.id}" data-tag-name="${escapeHTML(tag.name)}">#${escapeHTML(tag.name)}</button>${state.tagManagerOpen ? `<button class="tag-inline-edit" data-tag-edit="${tag.id}" title="编辑 Tag">✎</button><button class="tag-inline-delete" data-tag-delete="${tag.id}" data-tag-name="${escapeHTML(tag.name)}" title="删除 Tag">×</button>` : ""}</span>`
-            ).join("")}${state.tagManagerOpen ? `<button class="category-add-btn" data-category-add="${escapeHTML(group)}" title="新增 Tag 到此分类">＋</button>` : ""}</div>
-            ${state.tagManagerOpen && group && !tags.length ? `<span class="empty-small">拖入 Tag 或点击 ＋ 新建</span>` : ""}
-        </div>
-    `).join("");
-    $("tagManager").classList.add("hidden");
+    /* 面板只负责「看当前选了什么 + 一键清掉」。Tag 树是侧栏的活，
+       这里不再重复渲染一份（收起侧栏时面板仍可用）。 */
+    $("filterEmptyHint").classList.toggle("hidden", state.activeTagIds.length > 0);
 }
 
-async function renderTagManager(records) {
-    const manager = $("tagManager");
-    manager.classList.toggle("hidden", !state.tagManagerOpen);
-    const categories = await invoke("list_tag_categories");
-    const options = selected => `<option value="" ${!selected ? "selected" : ""}>未分类</option>` + categories.map(category => `<option value="${escapeHTML(category)}" ${category === selected ? "selected" : ""}>${escapeHTML(category)}</option>`).join("") + `<option value="__custom__">＋ 新建分类…</option>`;
-    const editing = records.find(tag => tag.id === state.editingTagId);
-    $("newTagName").value = editing?.name || "";
-    $("newTagCategory").innerHTML = options(editing?.category || "");
-    $("newTagCustomCategory").classList.add("hidden");
-    $("createTagBtn").textContent = editing ? "保存修改" : "新建 Tag";
-    $("resetTagEditorBtn").classList.toggle("hidden", !editing);
-    $("deleteEditingTagBtn").classList.toggle("hidden", !editing);
-    const grouped = new Map();
-    records.forEach(tag => {
-        if (!grouped.has(tag.category)) grouped.set(tag.category, []);
-        grouped.get(tag.category).push(tag);
-    });
-    $("tagManagerList").innerHTML = [...grouped.entries()].map(([category, tags]) => `
-        <div class="tag-manager-group"><span>${escapeHTML(category || "未分类")}</span><div>${tags.map(tag =>
-            `<button class="tag-manager-chip ${tag.id === state.editingTagId ? "active" : ""}" data-manage-tag-id="${tag.id}">#${escapeHTML(tag.name)}</button>`
-        ).join("")}</div></div>`).join("");
+function updateFilterToggleIndicator() {
+    const button = $("filterToggleBtn");
+    const indicator = $("filterActiveIndicator");
+    const hasActiveTags = state.activeTagIds.length > 0;
+
+    indicator.classList.toggle("hidden", !hasActiveTags);
+    button.classList.toggle("has-active-filters", hasActiveTags);
+    button.title = hasActiveTags
+        ? `筛选中：已选择 ${state.activeTagIds.length} 个 Tag`
+        : "筛选 Tag";
+    button.setAttribute(
+        "aria-label",
+        hasActiveTags
+            ? `筛选，已选择 ${state.activeTagIds.length} 个 Tag`
+            : "筛选 Tag"
+    );
 }
 
-function setActiveTag(tag) {
-    tag = normalizeTag(tag);
-    if (!tag) return;
-    state.activeTags = state.activeTags.includes(tag)
-        ? state.activeTags.filter(item => item !== tag)
-        : [...state.activeTags, tag];
+function setActiveTag(tagId) {
+    tagId = Number(tagId);
+    if (!Number.isInteger(tagId)) return;
+    state.activeTagIds = state.activeTagIds.includes(tagId)
+        ? state.activeTagIds.filter(item => item !== tagId)
+        : [...state.activeTagIds, tagId];
+    resetPagination();
+    renderSidebarTags();
     renderFilterPanel();
     render();
 }
 
 function matchesActiveTags(music, clips) {
-    return state.activeTags.every(tag =>
-        (music.tags || []).includes(tag) || clips.some(clip => (clip.tags || []).includes(tag))
-    );
+    if (!state.activeTagIds.length) return true;
+    const selected = state.activeTagIds.map(id => tagRecordsCache.find(tag => tag.id === id)).filter(Boolean);
+    const children = new Map();
+    tagRecordsCache.forEach(tag => { const key = tag.parentId ?? "root"; if (!children.has(key)) children.set(key, []); children.get(key).push(tag); });
+    const descendants = root => {
+        const result = new Set([root.id]);
+        const visit = id => (children.get(id) || []).forEach(child => { result.add(child.id); visit(child.id); });
+        visit(root.id);
+        return result;
+    };
+    const byCategory = new Map();
+    selected.forEach(tag => { if (!byCategory.has(tag.categoryId)) byCategory.set(tag.categoryId, []); byCategory.get(tag.categoryId).push(tag); });
+    const assigned = new Set([...(music.tagIds || []), ...clips.flatMap(clip => clip.tagIds || [])]);
+    return [...byCategory.values()].every(tags => tags.some(tag => [...descendants(tag)].some(id => assigned.has(id))));
 }
 
 function renderSelectionToolbar() {
@@ -665,12 +1130,9 @@ function renderSelectionToolbar() {
 ========================================================= */
 
 async function updateCounts() {
-
-    const music = await dbGetAll("music");
-    const clips = await dbGetAll("clips");
-
-    $("allCount").querySelector(".nav-count-value").textContent = music.length;
-    $("clipCount").querySelector(".nav-count-value").textContent = clips.length;
+    const counts = await getLibraryCounts();
+    $("allCount").querySelector(".nav-count-value").textContent = counts.music;
+    $("clipCount").querySelector(".nav-count-value").textContent = counts.clips;
 }
 
 
@@ -679,12 +1141,7 @@ async function updateCounts() {
 ========================================================= */
 
 async function getMusicClips(musicId) {
-
-    const clips = await dbGetAll("clips");
-
-    return clips.filter(
-        clip => clip.musicId === musicId
-    );
+    return invoke("list_clips_for_music", { musicId });
 }
 
 async function openMusicClipsPanel(musicId) {
@@ -695,9 +1152,11 @@ async function openMusicClipsPanel(musicId) {
     $("musicClipsPanel").classList.remove("hidden");
     $("musicClipsSource").textContent = music.name;
     const clips = (await getMusicClips(music.id)).sort((a, b) => a.start - b.start);
+    const pageKey = `music-clips:${music.id}`;
+    const page = paginate(clips, pageKey, COMPACT_PAGE_SIZE);
     $("musicClipsBody").innerHTML = `
         <div class="clip-section-heading"><strong>${escapeHTML(music.name)}</strong><button class="primary-btn" data-clips-panel-action="create">＋ 新建片段</button></div>
-        <div class="clip-list">${clips.length ? clips.map(clip => `
+        <div class="clip-list">${clips.length ? page.items.map(clip => `
             <div class="clip-item" data-panel-clip-id="${clip.id}">
                 <div class="clip-item-header"><div class="clip-item-name">${escapeHTML(clip.name || "未命名片段")}</div><div class="clip-time">${formatTime(clip.start)} - ${formatTime(clip.end)}</div></div>
                 <div class="clip-tags">${(clip.tags || []).map(tag => `<span class="tag">#${escapeHTML(tag)}</span>`).join("")}</div>
@@ -707,7 +1166,8 @@ async function openMusicClipsPanel(musicId) {
                     <button class="icon-action ${isClipCandidate(clip.id) ? "is-candidate" : ""}" data-panel-clip-action="candidate" data-panel-clip-id="${clip.id}" title="候选">${isClipCandidate(clip.id) ? "★" : "☆"}</button>
                     <button class="icon-action" data-panel-clip-action="delete" data-panel-clip-id="${clip.id}" title="删除">🗑</button>
                 </div>
-            </div>`).join("") : `<div class="detail-value">暂无片段，创建一个开始标记。</div>`}</div>`;
+            </div>`).join("") : `<div class="detail-value">暂无片段，创建一个开始标记。</div>`}</div>
+        ${paginationHTML(page, pageKey, "个片段")}`;
 }
 
 
@@ -726,7 +1186,11 @@ function matchesSearch(music, clips, query) {
     const musicText = [
 
         music.name,
+        music.fileName,
         music.album,
+        music.artist,
+        music.genre,
+        music.year,
         music.path,
         ...(music.tags || [])
 
@@ -764,10 +1228,14 @@ function matchesSearch(music, clips, query) {
    获取当前音乐
 ========================================================= */
 
-async function getCurrentMusicList() {
+async function getCurrentMusicList(allMusic, clips) {
 
-    let music = await dbGetAll("music");
-    const clips = await dbGetAll("clips");
+    let music = [...allMusic];
+    const clipsByMusic = new Map();
+    clips.forEach(clip => {
+        if (!clipsByMusic.has(clip.musicId)) clipsByMusic.set(clip.musicId, []);
+        clipsByMusic.get(clip.musicId).push(clip);
+    });
 
 
     if (state.currentView === "recent") {
@@ -808,23 +1276,19 @@ async function getCurrentMusicList() {
 
     if (state.currentView.startsWith("tag:")) {
 
-        const tag =
-            state.currentView.substring(4);
+        const tagId = Number(state.currentView.substring(4));
 
         music = music.filter(m => {
 
             const musicHas =
-                (m.tags || []).includes(tag);
+                (m.tagIds || []).includes(tagId);
 
-            const musicClips =
-                clips.filter(
-                    c => c.musicId === m.id
-                );
+            const musicClips = clipsByMusic.get(m.id) || [];
 
             const clipHas =
                 musicClips.some(
                     c =>
-                        (c.tags || []).includes(tag)
+                        (c.tagIds || []).includes(tagId)
                 );
 
             return musicHas || clipHas;
@@ -836,10 +1300,7 @@ async function getCurrentMusicList() {
 
     for (const m of music) {
 
-        const mClips =
-            clips.filter(
-                c => c.musicId === m.id
-            );
+        const mClips = clipsByMusic.get(m.id) || [];
 
         if (
             matchesSearch(
@@ -862,8 +1323,15 @@ async function getCurrentMusicList() {
 
 function updatePageHeader() {
 
+    $("viewButtons").classList.toggle(
+        "hidden",
+        state.currentView === "clips"
+    );
+    updateFilterToggleIndicator();
+
     let title = "全部音乐";
     let description = "你的本地音乐素材";
+    let searchPlaceholder = "搜索音乐名、专辑、作者、类型、年份或 Tag";
 
 
     if (state.currentView === "clips") {
@@ -871,6 +1339,7 @@ function updatePageHeader() {
         title = "音乐片段";
         description =
             "所有已经标记过时间轴的音乐片段";
+        searchPlaceholder = "搜索片段名、原音乐、专辑、作者或 Tag";
     }
 
 
@@ -879,6 +1348,7 @@ function updatePageHeader() {
         title = "最近添加";
         description =
             "最近导入的音乐";
+        searchPlaceholder = "搜索最近添加的音乐、作者、专辑或 Tag";
     }
 
 
@@ -887,6 +1357,7 @@ function updatePageHeader() {
         title = "专辑";
         description =
             "按照专辑查看音乐";
+        searchPlaceholder = "搜索音乐名、作者、类型或 Tag";
     }
 
 
@@ -895,23 +1366,24 @@ function updatePageHeader() {
         title = "Tags";
         description =
             "按照 Tag 管理音乐素材";
+        searchPlaceholder = "搜索音乐、专辑、作者或 Tag";
     }
 
 
     if (state.currentView.startsWith("tag:")) {
+        const tag = tagRecordsCache.find(item => item.id === Number(state.currentView.substring(4)));
 
-        const tag =
-            state.currentView.substring(4);
-
-        title = "#" + tag;
+        title = "#" + (tag?.path || "Tag");
 
         description =
             "包含这个 Tag 的音乐和片段";
+        searchPlaceholder = "搜索当前 Tag 下的音乐或片段";
     }
 
 
     $("pageTitle").textContent = title;
     $("pageDescription").textContent = description;
+    $("searchInput").placeholder = searchPlaceholder;
 }
 
 
@@ -963,12 +1435,12 @@ async function render() {
     /* 其他视图(全部 / 片段 / 最近 / tag 过滤) */
 
     const list =
-        await getCurrentMusicList();
+        await getCurrentMusicList(music, clips);
 
     $("resultInfo").textContent = `${list.length} 个音乐`;
 
     if (state.currentView.startsWith("tag:")) {
-        renderTagResults(list, clips, state.currentView.substring(4));
+        renderTagResults(list, clips, Number(state.currentView.substring(4)));
         return;
     }
 
@@ -1002,51 +1474,65 @@ async function render() {
     }
 
 
-    visibleQueueMusic = list;
+    const pageKey = `music:${state.currentView}`;
+    const page = paginate(list, pageKey);
+    visibleQueueMusic = page.items;
     visibleClipIds = [];
 
     if (state.layout === "grid") {
 
         renderGrid(
-            list,
+            page.items,
             clips
         );
 
     } else {
 
         renderList(
-            list,
+            page.items,
             clips
         );
     }
 
+    $("contentArea").insertAdjacentHTML("beforeend", paginationHTML(page, pageKey, "首音乐"));
+
     renderSelectionToolbar();
 
     syncPlayerQueue();
+    await hydrateVisibleArtwork(page.items);
 }
 
-function renderTagResults(music, clips, tag) {
+function renderTagResults(music, clips, tagId) {
+    const tag = tagRecordsCache.find(item => item.id === tagId);
+    const tagLabel = tag?.path || "Tag";
     const musicById = new Map(music.map(item => [item.id, item]));
-    const matchingMusic = music.filter(item => (item.tags || []).includes(tag));
+    const matchingMusic = music.filter(item => (item.tagIds || []).includes(tagId));
     const matchingClips = clips
-        .filter(clip => (clip.tags || []).includes(tag) && musicById.has(clip.musicId))
+        .filter(clip => (clip.tagIds || []).includes(tagId) && musicById.has(clip.musicId))
         .map(clip => ({ clip, music: musicById.get(clip.musicId) }));
 
     $("resultInfo").textContent = `${matchingMusic.length} 首音乐 · ${matchingClips.length} 个片段`;
-    visibleQueueMusic = matchingMusic;
-    renderSelectionToolbar();
-    syncPlayerQueue();
     if (!state.tagResultTab || (state.tagResultTab === "clips" && !matchingClips.length)) {
         state.tagResultTab = matchingClips.length ? "clips" : "music";
     }
 
-    const musicRows = matchingMusic.map(item => `
+    const activeItems = state.tagResultTab === "clips" ? matchingClips : matchingMusic;
+    const pageKey = `tag:${tagId}:${state.tagResultTab}`;
+    const page = paginate(activeItems, pageKey);
+    visibleQueueMusic = state.tagResultTab === "clips"
+        ? [...new Map(page.items.map(({ music: parent }) => [parent.id, parent])).values()]
+        : page.items;
+    visibleClipIds = state.tagResultTab === "clips" ? page.items.map(({ clip }) => clip.id) : [];
+    renderSelectionToolbar();
+    syncPlayerQueue();
+
+    const musicRows = (state.tagResultTab === "music" ? page.items : []).map(item => `
         <div class="music-row" data-music-id="${item.id}">
             <div class="music-icon">${musicArtwork(item)}</div>
             <div class="music-main"><div class="music-name">${escapeHTML(item.name)}</div><div class="music-meta"><span>${formatTime(item.duration)}</span>${item.album ? `<span>专辑：${escapeHTML(item.album)}</span>` : ""}</div><div class="music-tags">${(item.tags || []).map(value => `<span class="tag">#${escapeHTML(value)}</span>`).join("")}</div></div>
             <div class="music-actions"><button class="icon-action" data-action="play" data-id="${item.id}" title="试听">▶</button><button class="icon-action info-strong" data-action="info" data-id="${item.id}" title="详情">ⓘ</button></div>
         </div>`).join("");
-    const clipRows = matchingClips.map(({ clip, music: parent }) => {
+    const clipRows = (state.tagResultTab === "clips" ? page.items : []).map(({ clip, music: parent }) => {
         const isCandidate = isClipCandidate(clip.id);
         return `
         <div class="clip-library-row" data-clip-id="${clip.id}">
@@ -1062,8 +1548,10 @@ function renderTagResults(music, clips, tag) {
                 <button class="tag-result-tab ${state.tagResultTab === "music" ? "active" : ""}" data-tag-result-tab="music">音乐 <span>${matchingMusic.length}</span></button>
                 <button class="tag-result-tab ${state.tagResultTab === "clips" ? "active" : ""}" data-tag-result-tab="clips">音乐片段 <span>${matchingClips.length}</span></button>
             </div>
-            ${state.tagResultTab === "music" ? (musicRows ? `<div class="music-list">${musicRows}</div>` : `<div class="detail-value">没有直接标记 #${escapeHTML(tag)} 的音乐</div>`) : (clipRows ? `<div class="clip-library">${clipRows}</div>` : `<div class="detail-value">没有直接标记 #${escapeHTML(tag)} 的片段</div>`)}
+            ${state.tagResultTab === "music" ? (musicRows ? `<div class="music-list">${musicRows}</div>` : `<div class="detail-value">没有直接标记 #${escapeHTML(tagLabel)} 的音乐</div>`) : (clipRows ? `<div class="clip-library">${clipRows}</div>` : `<div class="detail-value">没有直接标记 #${escapeHTML(tagLabel)} 的片段</div>`)}
+            ${paginationHTML(page, pageKey, state.tagResultTab === "clips" ? "个片段" : "首音乐")}
         </div>`;
+    hydrateVisibleArtwork(visibleQueueMusic).catch(console.error);
 }
 
 
@@ -1074,8 +1562,14 @@ function renderTagResults(music, clips, tag) {
 
 function renderCatalogView(music, clips, type) {
 
+    const clipsByMusic = new Map();
+    clips.forEach(clip => {
+        if (!clipsByMusic.has(clip.musicId)) clipsByMusic.set(clip.musicId, []);
+        clipsByMusic.get(clip.musicId).push(clip);
+    });
+
     music = music.filter(item => {
-        const itemClips = clips.filter(clip => clip.musicId === item.id);
+        const itemClips = clipsByMusic.get(item.id) || [];
         return matchesSearch(item, itemClips, state.search) && matchesActiveTags(item, itemClips);
     });
 
@@ -1101,19 +1595,19 @@ function renderCatalogView(music, clips, type) {
 
         const map = new Map();
 
-        const pushTag = (tag, m) => {
+        const pushTag = (tagId, m) => {
 
-            if (!map.has(tag)) {
-                map.set(tag, new Set());
+            if (!map.has(tagId)) {
+                map.set(tagId, new Set());
             }
 
-            map.get(tag).add(m.id);
+            map.get(tagId).add(m.id);
         };
 
         music.forEach(m => {
 
-            (m.tags || []).forEach(
-                tag => pushTag(tag, m)
+            (m.tagIds || []).forEach(
+                tagId => pushTag(tagId, m)
             );
         });
 
@@ -1125,15 +1619,16 @@ function renderCatalogView(music, clips, type) {
                 return;
             }
 
-            (c.tags || []).forEach(
-                tag => pushTag(tag, m)
+            (c.tagIds || []).forEach(
+                tagId => pushTag(tagId, m)
             );
         });
 
         entries = [...map.entries()].map(
-            ([tag, idSet]) => ({
+            ([tagId, idSet]) => ({
 
-                key: tag,
+                key: String(tagId),
+                label: tagRecordsCache.find(tag => tag.id === tagId)?.path || `Tag ${tagId}`,
                 items: [...idSet]
                     .map(id => musicById.get(id))
                     .filter(Boolean)
@@ -1167,8 +1662,8 @@ function renderCatalogView(music, clips, type) {
 
     entries.sort(
         (a, b) =>
-            a.key.localeCompare(
-                b.key,
+            (a.label || a.key).localeCompare(
+                b.label || b.key,
                 "zh-CN"
             )
     );
@@ -1205,6 +1700,34 @@ function renderCatalogView(music, clips, type) {
         return;
     }
 
+    const albumFilterHTML = type === "album" ? `
+        <div class="catalog-filter">
+            <span class="catalog-filter-icon" aria-hidden="true"></span>
+            <input type="search" data-album-filter value="${escapeHTML(state.albumSearch)}" placeholder="筛选专辑名" aria-label="筛选专辑名">
+            ${state.albumSearch ? `<button type="button" data-clear-album-filter title="清空专辑筛选" aria-label="清空专辑筛选">×</button>` : ""}
+        </div>` : "";
+
+    if (type === "album" && state.albumSearch) {
+        const needle = state.albumSearch.normalize("NFKC").toLocaleLowerCase("zh-CN").replace(/\s+/g, "");
+        entries = entries.filter(entry => entry.key.normalize("NFKC").toLocaleLowerCase("zh-CN").replace(/\s+/g, "").includes(needle));
+    }
+
+    if (!entries.length) {
+        $("contentArea").innerHTML = `
+            <div class="catalog-view">
+                <div class="catalog-list">${albumFilterHTML}<div class="catalog-filter-empty">没有匹配的专辑</div></div>
+                <div class="catalog-detail"><div class="empty-state compact"><div class="empty-icon">⌕</div><div class="empty-title">没有匹配的专辑</div><div class="empty-description">换一个专辑名称试试</div></div></div>
+            </div>`;
+        visibleQueueMusic = [];
+        visibleClipIds = [];
+        renderSelectionToolbar();
+        syncPlayerQueue();
+        return;
+    }
+
+
+    const catalogPageKey = `catalog:${type}:groups`;
+    const catalogPage = paginate(entries, catalogPageKey, COMPACT_PAGE_SIZE);
 
     /* 选中项 */
 
@@ -1212,10 +1735,9 @@ function renderCatalogView(music, clips, type) {
 
     if (
         !selected ||
-        !entries.some(e => e.key === selected)
+        !catalogPage.items.some(e => e.key === selected)
     ) {
-
-        selected = entries[0].key;
+        selected = catalogPage.items[0].key;
     }
 
     state.catalogSelection = selected;
@@ -1226,7 +1748,7 @@ function renderCatalogView(music, clips, type) {
 
     /* 左侧目录 */
 
-    const listHTML = entries
+    const listHTML = catalogPage.items
         .map(e => `
 
             <button
@@ -1247,7 +1769,7 @@ function renderCatalogView(music, clips, type) {
                 </span>
 
                 <span class="catalog-item-name">
-                    ${escapeHTML(e.key)}
+                    ${escapeHTML(e.label || e.key)}
                 </span>
 
                 <span class="catalog-item-count">
@@ -1259,15 +1781,15 @@ function renderCatalogView(music, clips, type) {
         .join("");
 
 
-    /* 右侧音乐列表 */
+    /* 右侧音乐列表 / 大图 */
 
-    const rowsHTML = current.items
+    const musicPageKey = `catalog:${type}:${current.key}`;
+    const musicPage = paginate(current.items, musicPageKey);
+
+    const rowsHTML = musicPage.items
         .map(item => {
 
-            const itemClips =
-                clips.filter(
-                    c => c.musicId === item.id
-                );
+            const itemClips = clipsByMusic.get(item.id) || [];
 
             const tags =
                 item.tags || [];
@@ -1310,17 +1832,7 @@ function renderCatalogView(music, clips, type) {
 
                         </div>
 
-                        <div class="music-tags">
-
-                            ${tags
-                                .map(
-                                    tag =>
-                                        `<span class="tag">#${escapeHTML(tag)}</span>`
-                                )
-                                .join("")
-                            }
-
-                        </div>
+                        <div class="music-tags">${renderInlineMusicTags(item)}</div>
 
                     </div>
 
@@ -1333,6 +1845,16 @@ function renderCatalogView(music, clips, type) {
                             title="${state.player.music?.id === item.id && state.player.playing ? "暂停试听" : "试听"}"
                         >
                             ${state.player.music?.id === item.id && state.player.playing ? "Ⅱ" : "▶"}
+                        </button>
+
+                        <button
+                            class="icon-action"
+                            data-action="show-clips"
+                            data-id="${item.id}"
+                            title="打开音乐片段"
+                            aria-label="打开音乐片段"
+                        >
+                            ◈
                         </button>
 
                         <button
@@ -1382,12 +1904,19 @@ function renderCatalogView(music, clips, type) {
         })
         .join("");
 
+    const detailContent =
+        state.layout === "grid"
+            ? `<div class="music-grid catalog-music-grid">${renderMusicCards(musicPage.items, clips)}</div>`
+            : `<div class="music-list">${rowsHTML}</div>`;
+
 
     $("contentArea").innerHTML = `
         <div class="catalog-view">
 
             <div class="catalog-list">
+                ${albumFilterHTML}
                 ${listHTML}
+                ${paginationHTML(catalogPage, catalogPageKey, type === "album" ? "张专辑" : "个 Tag")}
             </div>
 
             <div class="catalog-detail">
@@ -1402,19 +1931,20 @@ function renderCatalogView(music, clips, type) {
                     ${type === "album" && current.key !== "未设置专辑" ? `<button class="text-btn danger-btn" data-delete-album="${escapeHTML(current.key)}">删除专辑</button>` : ""}
                 </div>
 
-                <div class="music-list">
-                    ${rowsHTML}
-                </div>
+                ${detailContent}
+                ${paginationHTML(musicPage, musicPageKey, "首音乐")}
 
             </div>
 
         </div>
     `;
 
-    visibleQueueMusic = current.items;
+    visibleQueueMusic = musicPage.items;
+    visibleClipIds = [];
     renderSelectionToolbar();
 
     syncPlayerQueue();
+    hydrateVisibleArtwork(musicPage.items).catch(console.error);
 }
 
 
@@ -1442,7 +1972,12 @@ function renderClipLibrary(music, clips) {
             const matchesText = !query || [
                 clip.name,
                 parent.name,
+                parent.fileName,
                 parent.album,
+                parent.artist,
+                parent.genre,
+                parent.year,
+                ...(parent.tags || []),
                 ...(clip.tags || [])
             ]
                 .filter(Boolean)
@@ -1477,10 +2012,12 @@ function renderClipLibrary(music, clips) {
     }
 
     $("resultInfo").textContent = `${visibleClips.length} 个片段`;
+    const pageKey = "clips:library";
+    const page = paginate(visibleClips, pageKey);
 
     $("contentArea").innerHTML = `
         <div class="clip-library">
-            ${visibleClips.map(({ clip, music: parent }) => `
+            ${page.items.map(({ clip, music: parent }) => `
                 <div class="clip-library-row ${state.selectedClipIds.has(clip.id) ? "is-selected" : ""}" data-clip-id="${clip.id}">
                     ${state.selectionMode ? `<label class="music-select"><input type="checkbox" data-select-clip="${clip.id}" ${state.selectedClipIds.has(clip.id) ? "checked" : ""}><span></span></label>` : ""}
                     <div class="clip-library-icon">◈</div>
@@ -1508,12 +2045,14 @@ function renderClipLibrary(music, clips) {
                 </div>
             `).join("")}
         </div>
+        ${paginationHTML(page, pageKey, "个片段")}
     `;
 
-    visibleQueueMusic = [...new Map(visibleClips.map(({ music: parent }) => [parent.id, parent])).values()];
-    visibleClipIds = visibleClips.map(({ clip }) => clip.id);
+    visibleQueueMusic = [...new Map(page.items.map(({ music: parent }) => [parent.id, parent])).values()];
+    visibleClipIds = page.items.map(({ clip }) => clip.id);
     renderSelectionToolbar();
     syncPlayerQueue();
+    hydrateVisibleArtwork(visibleQueueMusic).catch(console.error);
 }
 
 
@@ -1577,17 +2116,7 @@ function renderList(music, clips) {
 
                         </div>
 
-                        <div class="music-tags">
-
-                            ${tags
-                                .map(
-                                    tag =>
-                                        `<span class="tag">#${escapeHTML(tag)}</span>`
-                                )
-                                .join("")
-                            }
-
-                        </div>
+                        <div class="music-tags">${renderInlineMusicTags(item)}</div>
 
                     </div>
 
@@ -1601,6 +2130,16 @@ function renderList(music, clips) {
                             title="${state.player.music?.id === item.id && state.player.playing ? "暂停试听" : "试听"}"
                         >
                             ${state.player.music?.id === item.id && state.player.playing ? "Ⅱ" : "▶"}
+                        </button>
+
+                        <button
+                            class="icon-action"
+                            data-action="show-clips"
+                            data-id="${item.id}"
+                            title="打开音乐片段"
+                            aria-label="打开音乐片段"
+                        >
+                            ◈
                         </button>
 
                         <button
@@ -1663,9 +2202,9 @@ function renderList(music, clips) {
    Grid
 ========================================================= */
 
-function renderGrid(music, clips) {
+function renderMusicCards(music, clips) {
 
-    const html = music
+    return music
         .map(item => {
 
             const itemClips =
@@ -1682,8 +2221,8 @@ function renderGrid(music, clips) {
 
                     ${state.selectionMode ? `<label class="music-select card-select"><input type="checkbox" data-select-music="${item.id}" ${state.selectedMusicIds.has(item.id) ? "checked" : ""}><span></span></label>` : ""}
 
-                    <div class="card-icon">
-                        ♫
+                    <div class="card-icon ${item.coverArt ? "has-artwork" : ""}">
+                        ${musicArtwork(item)}
                     </div>
 
                     <div class="card-name">
@@ -1731,11 +2270,15 @@ function renderGrid(music, clips) {
 
         })
         .join("");
+}
+
+
+function renderGrid(music, clips) {
 
 
     $("contentArea").innerHTML = `
         <div class="music-grid">
-            ${html}
+            ${renderMusicCards(music, clips)}
         </div>
     `;
 }
@@ -1762,6 +2305,7 @@ async function openDetail(id) {
 
     state.editTags =
         [...(music.tags || [])];
+    state.editTagIds = [...(music.tagIds || [])];
 
     const clips =
         await getMusicClips(id);
@@ -2389,11 +2933,13 @@ async function openDetail(id) {
 
                 state.editTags
                     .splice(index, 1);
+                state.editTagIds.splice(index, 1);
 
                 renderDetailEditTags();
 
                 saveDetailEdit({
-                    tags: [...state.editTags]
+                    tags: [...state.editTags],
+                    tagIds: [...state.editTagIds]
                 });
             }
         );
@@ -2412,14 +2958,16 @@ async function openDetail(id) {
                     return;
                 }
 
-                const tag =
-                    btn.dataset.detailSuggestTag;
+                const tagId = Number(btn.dataset.detailSuggestTag);
+                const record = tagRecordsCache.find(tag => tag.id === tagId);
+                if (!record) return;
 
                 if (
-                    !state.editTags.includes(tag)
+                    !state.editTagIds.includes(tagId)
                 ) {
 
-                    state.editTags.push(tag);
+                    state.editTags.push(record.name);
+                    state.editTagIds.push(record.id);
                 }
 
                 renderDetailEditTags();
@@ -2429,7 +2977,8 @@ async function openDetail(id) {
                 renderDetailTagSuggestions();
 
                 saveDetailEdit({
-                    tags: [...state.editTags]
+                    tags: [...state.editTags],
+                    tagIds: [...state.editTagIds]
                 });
             }
         );
@@ -2474,47 +3023,20 @@ async function renderDetailTagSuggestions(query = "") {
     const container =
         $("detailTagSuggestions");
 
-    const allTags = await getAllTags();
+    const groups = renderTagPickerGroups({
+        excludeIds: state.editTagIds,
+        query,
+        attr: "detail-suggest-tag",
+        data: await loadTagPickerData()
+    });
 
-    const used =
-        new Set(state.editTags);
-
-    let suggestions =
-        allTags.filter(
-            tag =>
-                !used.has(tag) &&
-                (!query ||
-                    tag.toLowerCase()
-                        .includes(
-                            query.toLowerCase()
-                        ))
-        );
-
-    if (!suggestions.length) {
-
-        container.innerHTML = "";
-
-        return;
-    }
-
-    container.innerHTML =
-        `<div class="suggestion-title">已有 Tag</div>` +
-        suggestions
-            .map(tag => `
-
-                <button
-                    class="suggestion-tag"
-                    data-detail-suggest-tag="${escapeHTML(tag)}"
-                >
-                    #${escapeHTML(tag)}
-                </button>
-
-            `)
-            .join("");
+    container.innerHTML = groups
+        ? `<div class="suggestion-title">已有 Tag</div>` + groups
+        : "";
 }
 
 
-function addDetailEditTag() {
+async function addDetailEditTag() {
 
     const input =
         $("detailEditTagInput");
@@ -2525,16 +3047,24 @@ function addDetailEditTag() {
         return;
     }
 
-    if (
-        !state.editTags.includes(value)
-    ) {
-
-        state.editTags.push(value);
+    if (state.editTags.includes(value)) {
+        input.value = "";
+        showToast("该 Tag 已添加");
+        return;
     }
+
+    state.editTags.push(value);
+    state.editTagIds.push(null);
 
     input.value = "";
 
     renderDetailEditTags();
+
+    // 保存音乐时后端会同步创建此前不存在的 Tag，并关联到当前音乐。
+    await saveDetailEdit({
+        tags: [...state.editTags],
+        tagIds: [...state.editTagIds]
+    });
 }
 
 
@@ -2593,6 +3123,7 @@ async function saveDetailEdit(changes) {
 
         music.tags =
             changes.tags;
+        music.tagIds = changes.tagIds || [];
     }
 
     music.updatedAt =
@@ -3496,6 +4027,7 @@ async function renderCandidatePanel() {
 
     const list =
         state.player.candidates;
+    const page = paginate(list, "candidates", COMPACT_PAGE_SIZE);
 
     count.textContent =
         list.length
@@ -3516,7 +4048,7 @@ async function renderCandidatePanel() {
         return;
     }
 
-    const entries = (await Promise.all(list.map(async c => {
+    const entries = (await Promise.all(page.items.map(async c => {
         if (c.kind === "clip") {
             const clip = await dbGet("clips", c.id);
             if (!clip) return null;
@@ -3591,7 +4123,7 @@ async function renderCandidatePanel() {
             </div>
             `;
         })
-        .join("");
+        .join("") + paginationHTML(page, "candidates", "项候选");
 }
 
 
@@ -3886,6 +4418,7 @@ function openImportModal() {
     state.importFiles = [];
     state.importAlbumSource = "metadata";
     state.importSelectedAlbum = null;
+    Object.keys(state.pages).filter(key => key.startsWith("import:")).forEach(key => delete state.pages[key]);
     document.querySelector('input[name="albumSource"][value="metadata"]').checked = true;
     $("confirmImportBtn").textContent = "导入";
 
@@ -3973,7 +4506,8 @@ function makeImportItems(infos) {
         bitrate: info.bitrate || 0,
         duration: info.duration || 0,
         coverArt: info.coverArt || "",
-        tags: []
+        tags: [],
+        tagIds: []
     }));
 }
 
@@ -4110,7 +4644,7 @@ async function renderSelectedFiles(focusTagIndex) {
     }
 
 
-    const allTags = await getAllTags();
+    const tagPickerData = await loadTagPickerData();
 
 
     const groups = new Map();
@@ -4120,9 +4654,16 @@ async function renderSelectedFiles(focusTagIndex) {
         groups.get(album).push({ item, index });
     });
     if (!groups.has(state.importSelectedAlbum)) state.importSelectedAlbum = groups.keys().next().value;
+    const albumPageKey = "import:albums";
+    const albumPage = paginate([...groups.entries()], albumPageKey, COMPACT_PAGE_SIZE);
+    if (!albumPage.items.some(([album]) => album === state.importSelectedAlbum)) {
+        state.importSelectedAlbum = albumPage.items[0]?.[0] || null;
+    }
     const visibleItems = groups.get(state.importSelectedAlbum) || [];
+    const trackPageKey = `import:tracks:${state.importSelectedAlbum}`;
+    const trackPage = paginate(visibleItems, trackPageKey, COMPACT_PAGE_SIZE);
     const renderTrack = ({ item, index }, order) => {
-        const suggestions = allTags.filter(tag => !(item.tags || []).includes(tag));
+        const suggestions = renderTagPickerGroups({ excludeIds: item.tagIds || [], attr: "file-suggest-tag", data: tagPickerData });
         return `<article class="import-track" data-file-index="${index}">
             <div class="import-track-summary"><span class="import-track-number">${String(order + 1).padStart(2, "0")}</span><div class="import-track-main"><strong>${escapeHTML(item.name)}</strong><span>${escapeHTML(item.artist || "未知作者")} · ${item.duration ? formatTime(item.duration) : "时长读取中"}</span></div><span class="import-track-format">${item.sampleRate ? `${(item.sampleRate / 1000).toFixed(1)} kHz` : "MP3"}${item.bitrate ? ` · ${item.bitrate} kbps` : ""}</span><button class="icon-action import-track-remove" data-remove-import-file="${index}" title="不导入这首音乐" aria-label="不导入这首音乐">×</button></div>
             <details class="import-edit-details"><summary>编辑曲目资料</summary><div class="selected-file-fields import-edit-fields">
@@ -4157,7 +4698,7 @@ async function renderSelectedFiles(focusTagIndex) {
                         <div class="import-meta-value">${formatFileSize(item.fileSize)}</div>
                     </div>
                 </div>
-                <div class="file-tag-area"><div class="tag-editor" data-file-tags>${(item.tags || []).map((tag, tagIndex) => `<span class="editing-tag">#${escapeHTML(tag)}<button data-file-remove-tag="${tagIndex}">×</button></span>`).join("")}</div><div class="tag-input-row"><input type="text" data-file-tag-input placeholder="输入 Tag"><button class="secondary-btn" data-file-add-tag>添加</button></div>${suggestions.length ? `<div class="tag-suggestions"><div class="suggestion-title">已有 Tag</div>${suggestions.map(tag => `<button class="suggestion-tag" data-file-suggest-tag="${escapeHTML(tag)}">#${escapeHTML(tag)}</button>`).join("")}</div>` : ""}</div>
+                <div class="file-tag-area"><div class="tag-editor" data-file-tags>${(item.tags || []).map((tag, tagIndex) => `<span class="editing-tag">#${escapeHTML(tag)}<button data-file-remove-tag="${tagIndex}">×</button></span>`).join("")}</div><div class="tag-input-row"><input type="text" data-file-tag-input placeholder="输入 Tag"><button class="secondary-btn" data-file-add-tag>添加</button></div>${suggestions ? `<div class="tag-suggestions"><div class="suggestion-title">已有 Tag</div>${suggestions}</div>` : ""}</div>
             </div></details></article>`;
     };
 
@@ -4169,7 +4710,7 @@ async function renderSelectedFiles(focusTagIndex) {
     );
 
     stopImportAlbumNameScroll();
-    container.innerHTML = `<div class="import-review"><aside class="import-album-list"><div class="import-review-label">本次识别到 ${groups.size} 张专辑 · ${state.importFiles.length} 首音乐</div>${[...groups.entries()].map(([album, items]) => `<button class="import-album-item ${album === state.importSelectedAlbum ? "active" : ""}" data-import-album="${escapeHTML(album)}" title="${escapeHTML(album)}"><span>${escapeHTML(album)}</span><b>${items.length}</b></button>`).join("")}</aside><section class="import-album-detail"><header><div><span>正在审阅</span><h3>${escapeHTML(state.importSelectedAlbum)}</h3></div><strong>${visibleItems.length} 首</strong></header><div class="import-track-list">${visibleItems.map(renderTrack).join("")}</div></section></div>`;
+    container.innerHTML = `<div class="import-review"><aside class="import-album-list"><div class="import-review-label">本次识别到 ${groups.size} 张专辑 · ${state.importFiles.length} 首音乐</div>${albumPage.items.map(([album, items]) => `<button class="import-album-item ${album === state.importSelectedAlbum ? "active" : ""}" data-import-album="${escapeHTML(album)}" title="${escapeHTML(album)}"><span>${escapeHTML(album)}</span><b>${items.length}</b></button>`).join("")}${paginationHTML(albumPage, albumPageKey, "张专辑")}</aside><section class="import-album-detail"><header><div><span>正在审阅</span><h3>${escapeHTML(state.importSelectedAlbum)}</h3></div><strong>${visibleItems.length} 首</strong></header><div class="import-track-list">${trackPage.items.map((entry, index) => renderTrack(entry, (trackPage.page - 1) * trackPage.pageSize + index)).join("")}</div>${paginationHTML(trackPage, trackPageKey, "首音乐")}</section></div>`;
     openDetails.forEach(index => {
         const details = container.querySelector(`[data-file-index="${index}"] details.import-edit-details`);
         if (details) details.open = true;
@@ -4324,6 +4865,8 @@ async function importSelectedFiles() {
 
                 tags:
                     [...(item.tags || [])],
+                tagIds:
+                    [...(item.tagIds || [])],
 
                 duration,
 
@@ -4409,6 +4952,7 @@ function openEditModal(music) {
 
     state.editTags =
         [...(music.tags || [])];
+    state.editTagIds = [...(music.tagIds || [])];
 
 
     renderEditTags();
@@ -4462,6 +5006,7 @@ function addEditTag() {
     ) {
 
         state.editTags.push(value);
+        state.editTagIds.push(null);
     }
 
 
@@ -4496,6 +5041,7 @@ async function saveEdit() {
 
     music.tags =
         [...state.editTags];
+    music.tagIds = [...state.editTagIds];
 
     music.updatedAt =
         Date.now();
@@ -4555,25 +5101,11 @@ async function renderClipTagSuggestions() {
     const container =
         $("clipTagSuggestions");
 
-    const tags = await getAllTags();
-    const suggestions = tags.filter(tag => !state.clipTags.includes(tag));
-
-
-    container.innerHTML =
-        suggestions
-            .map(
-                tag => `
-
-                    <button
-                        class="suggestion-tag"
-                        data-suggestion-tag="${escapeHTML(tag)}"
-                    >
-                        #${escapeHTML(tag)}
-                    </button>
-
-                `
-            )
-            .join("");
+    container.innerHTML = renderTagPickerGroups({
+        excludeIds: state.clipTagIds,
+        attr: "suggestion-tag",
+        data: await loadTagPickerData()
+    });
 }
 
 
@@ -4598,6 +5130,7 @@ function addClipTag() {
     ) {
 
         state.clipTags.push(value);
+        state.clipTagIds.push(null);
     }
 
 
@@ -4662,6 +5195,7 @@ async function openClipEditor(music, clip = null) {
 
     state.clipTags =
         [...(clip?.tags || [])];
+    state.clipTagIds = [...(clip?.tagIds || [])];
 
 
     $("clipMusicId").value =
@@ -4786,7 +5320,8 @@ function getClipEditorSnapshot() {
         start: Number(state.clipStart.toFixed(3)),
         end: Number(state.clipEnd.toFixed(3)),
         name: $("clipName").value.trim(),
-        tags: [...state.clipTags]
+        tags: [...state.clipTags],
+        tagIds: [...state.clipTagIds]
     });
 }
 
@@ -5146,6 +5681,7 @@ async function closeClipEditor(force = false) {
     state.clipFullPreviewing = false;
     state.clipNameAutoGenerated = false;
     state.clipTags = [];
+    state.clipTagIds = [];
     state.clipDuration = 0;
     state.clipInitialState = null;
     clipEditorPanel.classList.add("hidden");
@@ -5199,6 +5735,8 @@ async function saveClip() {
 
         tags:
             [...state.clipTags],
+        tagIds:
+            [...state.clipTagIds],
 
         createdAt:
             state.editingClip?.createdAt ||
@@ -5346,13 +5884,14 @@ async function deleteMusic(music, id) {
    Tag 视图跳转
 ========================================================= */
 
-function goToTagView(tag) {
+function goToTagView(tagId) {
 
     closeMusicContextPanels();
     state.tagResultTab = null;
 
     state.currentView =
-        "tag:" + tag;
+        "tag:" + Number(tagId);
+    resetPagination();
 
     document
         .querySelectorAll(
@@ -5390,54 +5929,44 @@ function setupEvents() {
         if (!document.hidden) void refreshLocationsAfterFinderChanges().catch(console.error);
     });
 
+    document.addEventListener("change", async event => {
+        const select = event.target.closest("[data-page-size-key]");
+        if (!select) return;
+        const key = select.dataset.pageSizeKey;
+        const size = Number(select.value);
+        if (!PAGE_SIZE_OPTIONS.includes(size)) return;
+        const listScroll = document.querySelector(".catalog-list")?.scrollTop || 0;
+        state.pageSizes[key] = size;
+        state.pages[key] = 1;
+        savePageSizes();
+
+        if (key.startsWith("import:")) {
+            await renderSelectedFiles();
+        } else if (key === "candidates") {
+            await renderCandidatePanel();
+        } else if (key.startsWith("music-clips:") && state.clipsPanelMusic) {
+            await openMusicClipsPanel(state.clipsPanelMusic.id);
+        } else {
+            await render();
+            if (key.startsWith("catalog:")) {
+                restoreCatalogScroll({
+                    list: key.endsWith(":groups") ? 0 : listScroll,
+                    detail: 0
+                });
+            } else {
+                scrollMainContentToTop();
+            }
+        }
+    });
+
     $("sidebarCollapseBtn").addEventListener("click", () => {
         setSidebarCollapsed(
             !document.body.classList.contains("sidebar-collapsed")
         );
     });
 
-    const saveTagAction = async () => {
-        const action = state.tagAction;
-        const name = normalizeTag($("tagActionName").value);
-        if (!action) return;
-        if (!name) {
-            showToast(action.type === "create-category" ? "请填写分类名称" : "请填写 Tag 名称");
-            $("tagActionName").focus();
-            return;
-        }
-        try {
-            if (action.type === "create-category") {
-                await invoke("create_tag_category", { name });
-                showToast("分类已创建");
-            } else if (action.type === "edit-category") {
-                await invoke("update_tag_category", { oldName: action.category, name });
-                showToast("分类已更新");
-            } else if (action.type === "create-tag") {
-                await invoke("create_tag", { name, category: action.category });
-                showToast("Tag 已创建");
-            } else if (action.type === "edit-tag") {
-                await invoke("update_tag", { id: action.tag.id, name, category: $("tagActionCategory").value });
-                state.activeTags = state.activeTags.map(value => value === action.tag.name ? name : value);
-                showToast("Tag 已更新");
-            }
-            closeTagAction();
-            await renderSidebarTags();
-            await renderFilterPanel();
-            await render();
-        } catch (error) {
-            showToast(`保存失败：${error}`);
-        }
-    };
-
-    $("closeTagAction").addEventListener("click", closeTagAction);
-    $("cancelTagAction").addEventListener("click", closeTagAction);
-    $("saveTagAction").addEventListener("click", saveTagAction);
-    $("tagActionName").addEventListener("keydown", event => {
-        if (event.key === "Enter") {
-            event.preventDefault();
-            saveTagAction();
-        }
-    });
+    /* 维度与 Tag 的新增/重命名都改在侧栏原位输入（见 startTagDraft / commitTagDraft），
+       这里不再有 Tag 操作浮层需要初始化。 */
 
 
     /* 导入 */
@@ -5552,6 +6081,14 @@ function setupEvents() {
             const albumButton = event.target.closest("[data-import-album]");
             if (albumButton) {
                 state.importSelectedAlbum = albumButton.dataset.importAlbum;
+                state.pages[`import:tracks:${state.importSelectedAlbum}`] = 1;
+                renderSelectedFiles();
+                return;
+            }
+
+            const pageButton = event.target.closest("[data-page-key]");
+            if (pageButton) {
+                state.pages[pageButton.dataset.pageKey] = Number(pageButton.dataset.page);
                 renderSelectedFiles();
                 return;
             }
@@ -5599,6 +6136,7 @@ function setupEvents() {
                     ) {
 
                         item.tags.push(value);
+                        item.tagIds = [...(item.tagIds || []), null];
                     }
 
                     input.value = "";
@@ -5630,14 +6168,16 @@ function setupEvents() {
                 const item =
                     state.importFiles[index];
 
-                const tag =
-                    suggBtn.dataset.fileSuggestTag;
+                const tagId = Number(suggBtn.dataset.fileSuggestTag);
+                const record = tagRecordsCache.find(tag => tag.id === tagId);
+                if (!record) return;
 
                 if (
-                    !item.tags.includes(tag)
+                    !(item.tagIds || []).includes(tagId)
                 ) {
 
-                    item.tags.push(tag);
+                    item.tags.push(record.name);
+                    item.tagIds = [...(item.tagIds || []), record.id];
                 }
 
                 renderSelectedFiles(index);
@@ -5672,6 +6212,7 @@ function setupEvents() {
                     );
 
                 item.tags.splice(ti, 1);
+                item.tagIds?.splice(ti, 1);
 
                 renderSelectedFiles(index);
             }
@@ -5728,8 +6269,9 @@ function setupEvents() {
                 state.search =
                     event.target.value
                         .trim();
-
-                render();
+                resetPagination();
+                clearTimeout(searchRenderTimer);
+                searchRenderTimer = setTimeout(() => render(), 160);
             }
         );
 
@@ -5743,7 +6285,7 @@ function setupEvents() {
                     "";
 
                 state.search = "";
-
+                resetPagination();
                 render();
             }
         );
@@ -5755,249 +6297,19 @@ function setupEvents() {
         renderFilterPanel();
     });
 
-    $("recommendedTags").addEventListener("click", event => {
-        if (state.suppressTagClick) {
-            state.suppressTagClick = false;
-            event.preventDefault();
-            return;
-        }
-        const button = event.target.closest("[data-recommended-tag]");
-        if (button) setActiveTag(button.dataset.recommendedTag);
-    });
-
-    $("recommendedTags").addEventListener("click", async event => {
-        const addCategory = event.target.closest("[data-add-category]");
-        if (addCategory) {
-            await openTagAction({ type: "create-category" });
-            return;
-        }
-        const addTag = event.target.closest("[data-category-add]");
-        if (addTag) {
-            await openTagAction({ type: "create-tag", category: addTag.dataset.categoryAdd });
-            return;
-        }
-        const editCategory = event.target.closest("[data-category-edit]");
-        if (editCategory) {
-            await openTagAction({ type: "edit-category", category: editCategory.dataset.categoryEdit });
-            return;
-        }
-        const deleteCategory = event.target.closest("[data-category-delete]");
-        if (deleteCategory) {
-            const name = deleteCategory.dataset.categoryDelete;
-            const count = Number(deleteCategory.dataset.categoryTagCount);
-            const detail = count ? `其中 ${count} 个 Tag 将移至“未分类”。` : "此分类没有 Tag。";
-            const ok = await confirm(`删除分类「${name}」吗？${detail}`, "删除分类");
-            if (!ok) return;
-            try {
-                await invoke("delete_tag_category", { name });
-                await renderSidebarTags(); await renderFilterPanel(); await render();
-                showToast("分类已删除");
-            } catch (error) {
-                showToast(`删除失败：${error}`);
-            }
-            return;
-        }
-        const edit = event.target.closest("[data-tag-edit]");
-        if (edit) {
-            const records = await getAllTagRecords();
-            const tag = records.find(item => item.id === Number(edit.dataset.tagEdit));
-            if (!tag) return;
-            await openTagAction({ type: "edit-tag", tag, category: tag.category });
-            return;
-        }
-        const remove = event.target.closest("[data-tag-delete]");
-        if (remove) {
-            const ok = await confirm(`删除 Tag「${remove.dataset.tagName}」吗？它会从所有音乐和片段中移除。`, "删除 Tag");
-            if (!ok) return;
-            await invoke("delete_tag", { id: Number(remove.dataset.tagDelete) });
-            state.activeTags = state.activeTags.filter(value => value !== remove.dataset.tagName);
-            await renderSidebarTags(); await renderFilterPanel(); await render();
-            showToast("Tag 已删除");
-        }
-    });
-
-    const findTagGroupAtPoint = (drag, x, y) => {
-        if (!drag.groupRects) {
-            drag.groupRects = [...document.querySelectorAll(".recommended-tag-group[data-tag-category]")]
-                .map(el => ({ el, category: el.dataset.tagCategory, rect: el.getBoundingClientRect() }));
-        }
-        for (const entry of drag.groupRects) {
-            const { rect } = entry;
-            if (x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom) return entry;
-        }
-        return null;
-    };
-
-    const isPointInsideTagPanel = (x, y) => {
-        const rect = $("recommendedTags").getBoundingClientRect();
-        return x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom;
-    };
-
-    const clearTagPointerDrag = () => {
-        const drag = state.tagPointerDrag;
-        drag?.tagElement?.classList.remove("is-dragging");
-        drag?.ghost?.remove();
-        document.querySelectorAll(".recommended-tag-group.is-drop-target")
-            .forEach(item => item.classList.remove("is-drop-target"));
-        state.draggingTagId = null;
-        state.tagPointerDrag = null;
-    };
-
-    $("recommendedTags").addEventListener("pointerdown", event => {
-        const tag = event.target.closest("[data-tag-id]");
-        if (!tag || !state.tagManagerOpen || event.button !== 0) return;
-        state.tagPointerDrag = {
-            pointerId: event.pointerId,
-            tagId: Number(tag.dataset.tagId),
-            tagName: tag.dataset.tagName,
-            tagElement: tag,
-            startX: event.clientX,
-            startY: event.clientY,
-            moved: false,
-            targetCategory: null,
-            ghost: null
-        };
-        tag.setPointerCapture?.(event.pointerId);
-    });
-
-    $("recommendedTags").addEventListener("pointermove", event => {
-        const drag = state.tagPointerDrag;
-        if (!drag || drag.pointerId !== event.pointerId) return;
-        const distance = Math.hypot(event.clientX - drag.startX, event.clientY - drag.startY);
-        if (!drag.moved && distance < 5) return;
-        if (!drag.moved) {
-            drag.moved = true;
-            state.draggingTagId = drag.tagId;
-            drag.tagElement.classList.add("is-dragging");
-            drag.ghost = document.createElement("div");
-            drag.ghost.className = "tag-drag-ghost";
-            drag.ghost.textContent = `#${drag.tagName}`;
-            document.body.appendChild(drag.ghost);
-        }
-        event.preventDefault();
-        drag.ghost.style.left = `${event.clientX}px`;
-        drag.ghost.style.top = `${event.clientY}px`;
-        const match = findTagGroupAtPoint(drag, event.clientX, event.clientY);
-        if (match) {
-            drag.targetCategory = match.category;
-            drag.targetEl = match.el;
-        } else if (!isPointInsideTagPanel(event.clientX, event.clientY)) {
-            drag.targetCategory = null;
-            drag.targetEl = null;
-        }
-        document.querySelectorAll(".recommended-tag-group.is-drop-target")
-            .forEach(item => item.classList.toggle("is-drop-target", item === drag.targetEl));
-    });
-
-    const finishTagPointerDrag = async event => {
-        const drag = state.tagPointerDrag;
-        if (!drag || drag.pointerId !== event.pointerId) return;
-        const targetCategory = drag.targetCategory;
-        const moved = drag.moved;
-        if (moved) state.suppressTagClick = true;
-        clearTagPointerDrag();
-        if (!moved) return;
-        const records = await getAllTagRecords();
-        const tag = records.find(item => item.id === drag.tagId);
-        if (!tag) return;
-        if (targetCategory === null) {
-            showToast("未放入任何分类");
-            return;
-        }
-        const targetLabel = targetCategory || "未分类";
-        if (tag.category === targetCategory) {
-            showToast(`「${tag.name}」已在「${targetLabel}」`);
-            return;
-        }
-        try {
-            await invoke("update_tag", { id: tag.id, name: tag.name, category: targetCategory });
-            await renderFilterPanel();
-            showToast(`已移动到「${targetLabel}」`);
-        } catch (error) {
-            showToast(`移动失败：${error}`);
-        }
-    };
-
-    $("recommendedTags").addEventListener("pointerup", finishTagPointerDrag);
-    $("recommendedTags").addEventListener("pointercancel", event => {
-        if (state.tagPointerDrag?.pointerId === event.pointerId) clearTagPointerDrag();
-    });
-
     $("activeFilterTags").addEventListener("click", event => {
-        const button = event.target.closest("[data-filter-tag]");
-        if (button) setActiveTag(button.dataset.filterTag);
+        const button = event.target.closest("[data-filter-tag-id]");
+        if (button) setActiveTag(button.dataset.filterTagId);
     });
 
     $("clearFiltersBtn").addEventListener("click", () => {
-        state.activeTags = [];
+        state.activeTagIds = [];
         state.search = "";
+        resetPagination();
         $("searchInput").value = "";
+        renderSidebarTags();
         renderFilterPanel();
         render();
-    });
-
-    $("manageTagsBtn").addEventListener("click", () => {
-        state.tagManagerOpen = !state.tagManagerOpen;
-        $("manageTagsBtn").textContent = state.tagManagerOpen ? "收起管理" : "管理 Tag";
-        renderFilterPanel();
-    });
-
-    $("createTagBtn").addEventListener("click", async () => {
-        const name = normalizeTag($("newTagName").value);
-        const selectedCategory = $("newTagCategory").value;
-        const category = selectedCategory === "__custom__"
-            ? normalizeTag($("newTagCustomCategory").value)
-            : selectedCategory;
-        if (!name) return;
-        if (!category) { showToast("请填写新分类名称"); return; }
-        try {
-            const records = await getAllTagRecords();
-            const editing = records.find(tag => tag.id === state.editingTagId);
-            if (editing) {
-                await invoke("update_tag", { id: editing.id, name, category });
-                state.activeTags = state.activeTags.map(tag => tag === editing.name ? name : tag);
-            } else {
-                await invoke("create_tag", { name, category });
-            }
-            state.editingTagId = null;
-            await renderSidebarTags();
-            await renderFilterPanel();
-            await render();
-            showToast(editing ? "Tag 已更新" : "Tag 已创建");
-        } catch (error) {
-            showToast(`创建失败：${error}`);
-        }
-    });
-
-    $("newTagCategory").addEventListener("change", event => {
-        $("newTagCustomCategory").classList.toggle("hidden", event.target.value !== "__custom__");
-    });
-
-    $("tagManagerList").addEventListener("click", async event => {
-        const chip = event.target.closest("[data-manage-tag-id]");
-        if (!chip) return;
-        state.editingTagId = Number(chip.dataset.manageTagId);
-        await renderFilterPanel();
-    });
-
-    $("resetTagEditorBtn").addEventListener("click", async () => {
-        state.editingTagId = null;
-        await renderFilterPanel();
-    });
-
-    $("deleteEditingTagBtn").addEventListener("click", async () => {
-        const records = await getAllTagRecords();
-        const editing = records.find(tag => tag.id === state.editingTagId);
-        if (!editing) return;
-        const ok = await confirm(`删除 Tag「${editing.name}」吗？它会从所有音乐和片段中移除。`, "删除 Tag");
-        if (!ok) return;
-        await invoke("delete_tag", { id: editing.id });
-        state.activeTags = state.activeTags.filter(tag => tag !== editing.name);
-        state.editingTagId = null;
-        await renderSidebarTags();
-        await renderFilterPanel();
-        await render();
-        showToast("Tag 已删除");
     });
 
     $("selectionToggleBtn").addEventListener("click", () => {
@@ -6033,6 +6345,7 @@ function setupEvents() {
         const ok = await confirm(`确定删除选中的 ${ids.length} 个${noun}${extra}吗？此操作无法撤销。`, `批量删除${noun}`);
         if (!ok) return;
         await invoke(deletingClips ? "delete_clip_batch" : "delete_music_batch", { ids });
+        invalidateLibraryCache(deletingClips ? "clips" : null);
         state.selectedMusicIds.clear();
         state.selectedClipIds.clear();
         state.selectionMode = false;
@@ -6049,7 +6362,17 @@ function setupEvents() {
             const music = await dbGet("music", id);
             if (!music) continue;
             const tags = music.tags || [];
-            music.tags = add ? (tags.includes(tag) ? tags : [...tags, tag]) : tags.filter(item => item !== tag);
+            const tagIds = music.tagIds || [];
+            if (add) {
+                if (!tags.includes(tag)) {
+                    music.tags = [...tags, tag];
+                    music.tagIds = [...tagIds, null];
+                }
+            } else {
+                const keep = tags.map((value, index) => ({ value, id: tagIds[index] ?? null })).filter(item => item.value !== tag);
+                music.tags = keep.map(item => item.value);
+                music.tagIds = keep.map(item => item.id);
+            }
             music.updatedAt = Date.now();
             await dbPut("music", music);
         }
@@ -6139,6 +6462,7 @@ function setupEvents() {
 
                     state.catalogSelection =
                         null;
+                    resetPagination();
 
                     closeMusicContextPanels();
 
@@ -6149,27 +6473,309 @@ function setupEvents() {
         });
 
 
-    /* sidebar tag */
+    /* sidebar tag 树：折叠、跳转、管理操作、拖拽调层级 */
 
-    $("sidebarTags")
-        .addEventListener(
-            "click",
-            event => {
+    const sidebarTags = $("sidebarTags");
+    let suppressSidebarTagClick = false;
 
-                const button =
-                    event.target.closest(
-                        ".sidebar-tag"
-                    );
+    const sidebarTagManageBtn = $("sidebarTagManageBtn");
+    const updateSidebarTagManageButton = () => {
+        sidebarTagManageBtn.textContent = state.sidebarTagManage ? "完成" : "管理";
+    };
+    updateSidebarTagManageButton();
 
-                if (!button) {
-                    return;
-                }
+    sidebarTagManageBtn.addEventListener("click", async () => {
+        state.sidebarTagManage = !state.sidebarTagManage;
+        /* 退出管理态时收掉没提交的输入框：那时已经没有 ✎/＋ 入口了。 */
+        if (!state.sidebarTagManage) state.tagDraft = null;
+        saveSidebarTagManage();
+        updateSidebarTagManageButton();
+        await renderSidebarTags();
+    });
 
-                goToTagView(
-                    button.dataset.tag
-                );
+    $("sidebarTagClearBtn").addEventListener("click", async () => {
+        state.activeTagIds = [];
+        resetPagination();
+        await renderSidebarTags();
+        renderFilterPanel();
+        render();
+    });
+
+    sidebarTags.addEventListener("click", async event => {
+
+        if (suppressSidebarTagClick) {
+            suppressSidebarTagClick = false;
+            event.preventDefault();
+            return;
+        }
+
+        const toggleCollapse = key => {
+            const collapsed = !state.tagGroupCollapsed.has(key);
+            if (collapsed) state.tagGroupCollapsed.add(key);
+            else state.tagGroupCollapsed.delete(key);
+            saveTagGroupCollapsed();
+            const caret = sidebarTags.querySelector(`[data-collapse-toggle="${key}"]`);
+            if (caret) {
+                /* 箭头方向由 CSS 根据 aria-expanded 旋转，这里只维护状态与提示。 */
+                caret.title = collapsed ? "展开" : "折叠";
+                caret.setAttribute("aria-expanded", String(!collapsed));
             }
-        );
+            if (key.startsWith("c:")) {
+                const dimension = sidebarTags.querySelector(`[data-dimension-id="${key.slice(2)}"]`);
+                dimension?.classList.toggle("is-collapsed", collapsed);
+            } else {
+                const children = sidebarTags.querySelector(`[data-tag-children="${key.slice(2)}"]`);
+                children?.classList.toggle("is-collapsed", collapsed);
+            }
+        };
+
+        const toggle = event.target.closest("[data-collapse-toggle]");
+        if (toggle) {
+            toggleCollapse(toggle.dataset.collapseToggle);
+            return;
+        }
+
+        const createCategory = event.target.closest("[data-dimension-create]");
+        if (createCategory) {
+            startTagDraft({ type: "create-category" });
+            return;
+        }
+
+        const editCategory = event.target.closest("[data-dimension-edit]");
+        if (editCategory) {
+            const categoryName = editCategory.dataset.dimensionEdit;
+            startTagDraft({ type: "edit-category", categoryName, value: categoryName });
+            return;
+        }
+
+        const deleteCategory = event.target.closest("[data-dimension-delete]");
+        if (deleteCategory) {
+            const name = deleteCategory.dataset.dimensionDelete;
+            const ok = await confirm(`删除筛选维度「${name}」吗？非空维度不能删除。`, "删除筛选维度");
+            if (!ok) return;
+            try {
+                await invoke("delete_tag_category", { name });
+                await renderSidebarTags();
+                await renderFilterPanel();
+                await render();
+                showToast("维度已删除");
+            } catch (error) {
+                showToast(`删除失败：${getErrorMessage(error)}`);
+            }
+            return;
+        }
+
+        const addRootTag = event.target.closest("[data-dimension-add]");
+        if (addRootTag) {
+            const categoryId = Number(addRootTag.dataset.categoryId);
+            /* 收起态的维度要先展开，否则输入框会落在折叠区域里。 */
+            state.tagGroupCollapsed.delete(`c:${categoryId}`);
+            saveTagGroupCollapsed();
+            startTagDraft({ type: "create-tag", categoryId, parentId: null });
+            return;
+        }
+
+        const editTag = event.target.closest("[data-sidebar-tag-edit]");
+        if (editTag) {
+            const tag = tagRecordsCache.find(item => item.id === Number(editTag.dataset.sidebarTagEdit));
+            if (tag) startTagDraft({ type: "edit-tag", tagId: tag.id, tagName: tag.name, value: tag.name });
+            return;
+        }
+
+        const addChildTag = event.target.closest("[data-sidebar-tag-add]");
+        if (addChildTag) {
+            const parentId = Number(addChildTag.dataset.sidebarTagAdd);
+            const parent = tagRecordsCache.find(item => item.id === parentId);
+            if (parent) {
+                /* 收起态的父 Tag 要先展开，子级输入框才可见可聚焦。 */
+                state.tagGroupCollapsed.delete(`t:${parentId}`);
+                saveTagGroupCollapsed();
+                startTagDraft({ type: "create-tag", categoryId: parent.categoryId, parentId });
+            }
+            return;
+        }
+
+        const deleteTag = event.target.closest("[data-sidebar-tag-delete]");
+        if (deleteTag) {
+            const tag = tagRecordsCache.find(item => item.id === Number(deleteTag.dataset.sidebarTagDelete));
+            if (!tag) return;
+            const ok = await confirm(`删除 Tag「${tag.path}」吗？它会从所有音乐和片段中移除。`, "删除 Tag");
+            if (!ok) return;
+            try {
+                await invoke("delete_tag", { id: tag.id });
+                invalidateLibraryCache();
+                state.activeTagIds = state.activeTagIds.filter(value => value !== tag.id);
+                await renderSidebarTags();
+                await renderFilterPanel();
+                await render();
+                showToast("Tag 已删除");
+            } catch (error) {
+                showToast(`删除失败：${getErrorMessage(error)}`);
+            }
+            return;
+        }
+
+        const dimensionRow = event.target.closest("[data-dimension-row]");
+        if (dimensionRow) {
+            toggleCollapse(`c:${dimensionRow.dataset.dimensionRow}`);
+            return;
+        }
+
+        const button = event.target.closest(".sidebar-tag");
+        if (button) setActiveTag(button.dataset.tagId);
+    });
+
+    /* 内联编辑：Enter 提交、Esc 取消、失去焦点时若已改动则提交。 */
+    sidebarTags.addEventListener("input", event => {
+        const draft = state.tagDraft;
+        if (!draft || !event.target.matches("[data-tag-draft-input]")) return;
+        /* 只认当前这一轮草稿的输入框，被换掉的旧输入框不该再写入状态。 */
+        if (event.target.dataset.tagDraftId !== String(draft.id)) return;
+        draft.value = event.target.value;
+    });
+
+    sidebarTags.addEventListener("keydown", event => {
+        const draft = state.tagDraft;
+        if (!draft || !event.target.matches("[data-tag-draft-input]")) return;
+        if (event.target.dataset.tagDraftId !== String(draft.id)) return;
+        if (event.key === "Enter") {
+            event.preventDefault();
+            commitTagDraft(event.target);
+        } else if (event.key === "Escape") {
+            /* 拦在这里，免得全局 Esc 顺手把搜索词和已选 Tag 一起清掉。 */
+            event.preventDefault();
+            event.stopPropagation();
+            cancelTagDraft();
+        }
+    });
+
+    sidebarTags.addEventListener("focusout", event => {
+        const input = event.target;
+        const draft = state.tagDraft;
+        if (!draft || !input.matches?.("[data-tag-draft-input]")) return;
+        /* 只认当前这一轮草稿的输入框。重渲染换掉旧输入框时浏览器也会补一个
+           focusout，那一份带着上一轮的 id，放过去就会把同一个名字提交两次。 */
+        if (input.dataset.tagDraftId !== String(draft.id)) return;
+        commitTagDraft(input);
+    });
+
+    const clearTagPointerDrag = () => {
+        const drag = state.tagPointerDrag;
+        drag?.tagElement?.classList.remove("is-dragging");
+        drag?.ghost?.remove();
+        sidebarTags.querySelectorAll(".is-drop-target")
+            .forEach(item => item.classList.remove("is-drop-target"));
+        state.draggingTagId = null;
+        state.tagPointerDrag = null;
+    };
+
+    sidebarTags.addEventListener("pointerdown", event => {
+        if (!state.sidebarTagManage) return;
+        const row = event.target.closest("[data-tag-id]");
+        /* 内联输入框里不触发拖拽，否则在输入框里选字会被当成拖动 Tag。 */
+        if (!row || event.button !== 0 || event.target.closest(".sidebar-tag-ops") || event.target.closest("input")) return;
+        state.tagPointerDrag = {
+            pointerId: event.pointerId,
+            tagId: Number(row.dataset.tagId),
+            tagName: row.dataset.tagName,
+            tagElement: row,
+            startX: event.clientX,
+            startY: event.clientY,
+            moved: false,
+            targetParentId: undefined,
+            targetCategoryId: undefined,
+            targetEl: null,
+            highlightEl: null,
+            ghost: null
+        };
+        row.setPointerCapture?.(event.pointerId);
+    });
+
+    sidebarTags.addEventListener("pointermove", event => {
+        const drag = state.tagPointerDrag;
+        if (!drag || drag.pointerId !== event.pointerId) return;
+        const distance = Math.hypot(event.clientX - drag.startX, event.clientY - drag.startY);
+        if (!drag.moved && distance < 5) return;
+        if (!drag.moved) {
+            drag.moved = true;
+            state.draggingTagId = drag.tagId;
+            drag.tagElement.classList.add("is-dragging");
+            drag.ghost = document.createElement("div");
+            drag.ghost.className = "tag-drag-ghost";
+            drag.ghost.textContent = `#${drag.tagName}`;
+            document.body.appendChild(drag.ghost);
+        }
+        event.preventDefault();
+        drag.ghost.style.left = `${event.clientX}px`;
+        drag.ghost.style.top = `${event.clientY}px`;
+        const pointEl = document.elementFromPoint(event.clientX, event.clientY);
+        const targetRow = pointEl?.closest("[data-tag-id]");
+        const targetDimension = pointEl?.closest("[data-dimension-row]");
+        if (targetRow && sidebarTags.contains(targetRow) && Number(targetRow.dataset.tagId) !== drag.tagId) {
+            /* 拖到某个 Tag 上 = 成为它的子级，维度跟着那个 Tag 走。 */
+            drag.crossDimension = false;
+            drag.targetParentId = Number(targetRow.dataset.tagId);
+            drag.targetCategoryId = undefined;
+            drag.targetEl = targetRow;
+        } else if (targetDimension && sidebarTags.contains(targetDimension)) {
+            /* 拖到维度行 = 落到该维度根层；换成别的维度就是改维度。 */
+            const targetCategoryId = Number(targetDimension.dataset.dimensionRow);
+            const dragTag = tagRecordsCache.find(item => item.id === drag.tagId);
+            drag.crossDimension = Boolean(dragTag) && targetCategoryId !== dragTag.categoryId;
+            drag.targetParentId = null;
+            drag.targetCategoryId = targetCategoryId;
+            drag.targetEl = targetDimension;
+        } else {
+            drag.crossDimension = false;
+            drag.targetParentId = undefined;
+            drag.targetCategoryId = undefined;
+            drag.targetEl = null;
+        }
+        /* 只查 .is-drop-target 是查不到「还没高亮过」的元素的，落点提示会永远不出现；
+           记住上一次高亮的元素，逐个换。 */
+        if (drag.highlightEl && drag.highlightEl !== drag.targetEl) drag.highlightEl.classList.remove("is-drop-target");
+        if (drag.targetEl) drag.targetEl.classList.add("is-drop-target");
+        drag.highlightEl = drag.targetEl;
+    });
+
+    const finishTagPointerDrag = async event => {
+        const drag = state.tagPointerDrag;
+        if (!drag || drag.pointerId !== event.pointerId) return;
+        const moved = drag.moved;
+        const targetParentId = drag.targetParentId;
+        const targetCategoryId = drag.targetCategoryId;
+        const hasTarget = Boolean(drag.targetEl);
+        const crossDimension = Boolean(drag.crossDimension);
+        if (moved) suppressSidebarTagClick = true;
+        clearTagPointerDrag();
+        if (!moved) return;
+        if (!hasTarget) {
+            showToast("未放入目标 Tag 或维度");
+            return;
+        }
+        try {
+            await invoke("move_tag", { id: drag.tagId, parentId: targetParentId ?? null, categoryId: targetCategoryId ?? null });
+            /* 目标维度或目标父 Tag 若是折叠的，移过去就看不见了，等于白拖，先展开。 */
+            if (targetCategoryId != null) state.tagGroupCollapsed.delete(`c:${targetCategoryId}`);
+            if (targetParentId != null) state.tagGroupCollapsed.delete(`t:${targetParentId}`);
+            saveTagGroupCollapsed();
+            await renderSidebarTags();
+            await renderFilterPanel();
+            if (crossDimension) {
+                const category = (await invoke("list_tag_category_records")).find(item => item.id === targetCategoryId);
+                showToast(`已移动到「${category?.name ?? "目标"}」维度`);
+            } else {
+                showToast(targetParentId != null ? "已移动到目标 Tag 下" : "已移动到维度根层");
+            }
+        } catch (error) {
+            showToast(`移动失败：${getErrorMessage(error)}`);
+        }
+    };
+
+    sidebarTags.addEventListener("pointerup", finishTagPointerDrag);
+    sidebarTags.addEventListener("pointercancel", event => {
+        if (state.tagPointerDrag?.pointerId === event.pointerId) clearTagPointerDrag();
+    });
 
 
     /* 主列表 */
@@ -6179,10 +6785,41 @@ function setupEvents() {
             "click",
             async event => {
 
+                const clearAlbumFilter = event.target.closest("[data-clear-album-filter]");
+                if (clearAlbumFilter) {
+                    state.albumSearch = "";
+                    state.catalogSelection = null;
+                    state.pages["catalog:album:groups"] = 1;
+                    await render();
+                    document.querySelector("[data-album-filter]")?.focus();
+                    return;
+                }
+
+                if (event.target.closest("[data-quick-tag-input], [data-quick-tag-select]")) {
+                    event.stopPropagation();
+                    return;
+                }
+
                 const tagTab = event.target.closest("[data-tag-result-tab]");
                 if (tagTab) {
                     state.tagResultTab = tagTab.dataset.tagResultTab;
                     render();
+                    return;
+                }
+
+                const pageButton = event.target.closest("[data-page-key]");
+                if (pageButton) {
+                    const listScroll = document.querySelector(".catalog-list")?.scrollTop || 0;
+                    state.pages[pageButton.dataset.pageKey] = Number(pageButton.dataset.page);
+                    await render();
+                    if (pageButton.dataset.pageKey.startsWith("catalog:")) {
+                        restoreCatalogScroll({
+                            list: pageButton.dataset.pageKey.endsWith(":groups") ? 0 : listScroll,
+                            detail: 0
+                        });
+                    } else {
+                        scrollMainContentToTop();
+                    }
                     return;
                 }
 
@@ -6296,6 +6933,27 @@ function setupEvents() {
 
                     const id =
                         action.dataset.id;
+
+                    if (act === "quick-tag") {
+                        state.quickTagMusicId = id;
+                        state.quickTagSuggestions = await getAllTagRecords();
+                        await render();
+                        requestAnimationFrame(() =>
+                            document.querySelector(`[data-quick-tag-input="${id}"]`)?.focus()
+                        );
+                        return;
+                    }
+
+                    if (act === "quick-tag-save") {
+                        const input = action.closest(".quick-tag-editor")?.querySelector("[data-quick-tag-input]");
+                        await saveQuickTag(id, input?.value);
+                        return;
+                    }
+
+                    if (act === "show-clips") {
+                        await openMusicClipsPanel(id);
+                        return;
+                    }
 
 
                     if (
@@ -6445,10 +7103,14 @@ function setupEvents() {
 
                 if (catalogItem) {
 
+                    const listScroll = document.querySelector(".catalog-list")?.scrollTop || 0;
+
                     state.catalogSelection =
                         catalogItem.dataset.catalogKey;
+                    state.pages[`catalog:${state.currentView === "albums" ? "album" : "tag"}:${state.catalogSelection}`] = 1;
 
-                    render();
+                    await render();
+                    restoreCatalogScroll({ list: listScroll, detail: 0 });
 
                     return;
                 }
@@ -6462,6 +7124,7 @@ function setupEvents() {
                     const ok = await confirm(`确定删除专辑「${album}」及其 ${ids.length} 首音乐和全部片段吗？此操作无法撤销。`, "删除专辑");
                     if (!ok) return;
                     await invoke("delete_music_batch", { ids });
+                    invalidateLibraryCache();
                     state.catalogSelection = null;
                     await updateCounts();
                     await render();
@@ -6489,10 +7152,62 @@ function setupEvents() {
                     }
 
                     if (state.playOnRowClick) playMusic(rowId);
-                    openMusicClipsPanel(rowId);
+                    /* 点音乐行不再自动弹出片段栏：片段改从行尾的 ◈ 按钮或详情页进入。 */
                 }
             }
         );
+
+    $("contentArea").addEventListener("input", event => {
+        const input = event.target.closest("[data-album-filter]");
+        if (!input) return;
+        state.albumSearch = input.value;
+        state.catalogSelection = null;
+        state.pages["catalog:album:groups"] = 1;
+        clearTimeout(albumFilterTimer);
+        albumFilterTimer = setTimeout(async () => {
+            await render();
+            const nextInput = document.querySelector("[data-album-filter]");
+            if (nextInput) {
+                nextInput.focus();
+                nextInput.setSelectionRange(nextInput.value.length, nextInput.value.length);
+            }
+        }, 140);
+    });
+
+    $("contentArea").addEventListener("keydown", async event => {
+        const albumInput = event.target.closest("[data-album-filter]");
+        if (albumInput && event.key === "Escape") {
+            event.preventDefault();
+            clearTimeout(albumFilterTimer);
+            state.albumSearch = "";
+            state.catalogSelection = null;
+            state.pages["catalog:album:groups"] = 1;
+            await render();
+            document.querySelector("[data-album-filter]")?.focus();
+            return;
+        }
+        const input = event.target.closest("[data-quick-tag-input]");
+        if (!input) return;
+
+        if (event.key === "Escape") {
+            event.preventDefault();
+            state.quickTagMusicId = null;
+            await render();
+            return;
+        }
+
+        if (event.key === "Enter") {
+            event.preventDefault();
+            await saveQuickTag(input.dataset.quickTagInput, input.value);
+        }
+    });
+
+    $("contentArea").addEventListener("change", async event => {
+        const select = event.target.closest("[data-quick-tag-select]");
+        if (!select?.value) return;
+        event.stopPropagation();
+        await saveQuickTag(select.dataset.id, "", Number(select.value));
+    });
 
 
     /* 关闭详情 */
@@ -6517,6 +7232,12 @@ function setupEvents() {
     });
 
     $("musicClipsBody").addEventListener("click", async event => {
+        const pageButton = event.target.closest("[data-page-key]");
+        if (pageButton && state.clipsPanelMusic) {
+            state.pages[pageButton.dataset.pageKey] = Number(pageButton.dataset.page);
+            await openMusicClipsPanel(state.clipsPanelMusic.id);
+            return;
+        }
         const create = event.target.closest("[data-clips-panel-action]");
         if (create && state.clipsPanelMusic) {
             await openClipEditor(state.clipsPanelMusic);
@@ -6604,6 +7325,7 @@ function setupEvents() {
                         index,
                         1
                     );
+                state.editTagIds.splice(index, 1);
 
 
                 renderEditTags();
@@ -6672,6 +7394,7 @@ function setupEvents() {
                         index,
                         1
                     );
+                state.clipTagIds.splice(index, 1);
 
 
                 renderClipTags();
@@ -6694,18 +7417,17 @@ function setupEvents() {
                 }
 
 
-                const tag =
-                    button.dataset
-                        .suggestionTag;
+                const tagId = Number(button.dataset.suggestionTag);
+                const record = tagRecordsCache.find(tag => tag.id === tagId);
+                if (!record) return;
 
 
                 if (
-                    !state.clipTags
-                        .includes(tag)
+                    !state.clipTagIds.includes(tagId)
                 ) {
 
-                    state.clipTags
-                        .push(tag);
+                    state.clipTags.push(record.name);
+                    state.clipTagIds.push(record.id);
 
                     renderClipTags();
                 }
@@ -6815,10 +7537,13 @@ function setupEvents() {
                     return;
                 }
 
-                if (state.search || state.activeTags.length) {
+                if (state.search || state.activeTagIds.length) {
                     state.search = "";
-                    state.activeTags = [];
+                    state.activeTagIds = [];
+                    clearTimeout(searchRenderTimer);
+                    resetPagination();
                     $("searchInput").value = "";
+                    renderSidebarTags();
                     renderFilterPanel();
                     render();
                     return;
@@ -6965,6 +7690,13 @@ function setupEvents() {
             "click",
             async event => {
 
+                const pageButton = event.target.closest("[data-page-key]");
+                if (pageButton) {
+                    state.pages[pageButton.dataset.pageKey] = Number(pageButton.dataset.page);
+                    await renderCandidatePanel();
+                    return;
+                }
+
                 const btn =
                     event.target.closest(
                         "[data-action]"
@@ -7049,6 +7781,9 @@ async function init() {
         await renderSidebarTags();
 
         await render();
+
+        // 位置同步可能需要逐一解析数千个 macOS 文件书签，不阻塞首屏。
+        setTimeout(() => refreshLocationsAfterFinderChanges().catch(console.error), 0);
 
         console.log(
             "音乐库初始化完成"
