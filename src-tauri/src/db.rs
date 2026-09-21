@@ -1,27 +1,73 @@
 use rusqlite::{params, Connection, OptionalExtension};
+use serde::{Deserialize, Serialize};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tauri::Manager;
 
 pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 const SCHEMA_VERSION: i64 = 2;
+
+#[derive(Serialize, Deserialize, Default)]
+struct AppSettings {
+    db_path: Option<String>,
+}
+
+fn settings_path(dir: &Path) -> PathBuf {
+    dir.join("settings.json")
+}
+
+fn load_settings(settings_file: &Path) -> AppSettings {
+    fs::read_to_string(settings_file)
+        .ok()
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_default()
+}
+
+fn resolve_db_path(custom: Option<&str>, default_dir: &Path) -> Result<PathBuf, String> {
+    match custom {
+        Some(custom) if !custom.trim().is_empty() => {
+            let path = PathBuf::from(custom);
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent)
+                    .map_err(|e| format!("无法创建数据库目录: {e}"))?;
+            }
+            Ok(path)
+        }
+        _ => {
+            fs::create_dir_all(default_dir)
+                .map_err(|e| format!("无法创建数据目录: {e}"))?;
+            Ok(default_dir.join("library.db"))
+        }
+    }
+}
 
 pub fn db_path(app: &tauri::App) -> Result<PathBuf, String> {
     let dir = app
         .path()
         .app_data_dir()
         .map_err(|e| format!("无法获取数据目录: {e}"))?;
-
-    fs::create_dir_all(&dir)
-        .map_err(|e| format!("无法创建数据目录: {e}"))?;
-
-    Ok(dir.join("library.db"))
+    let settings = load_settings(&settings_path(&dir));
+    resolve_db_path(settings.db_path.as_deref(), &dir)
 }
 
-pub fn init(app: &tauri::App) -> Result<Connection, String> {
-    let path = db_path(app)?;
+pub fn save_db_path(app: &tauri::AppHandle, path: &Path) -> Result<(), String> {
+    let dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("无法获取数据目录: {e}"))?;
+    save_db_path_to(&settings_path(&dir), path)
+}
 
-    let mut conn = Connection::open(&path)
+fn save_db_path_to(settings_file: &Path, path: &Path) -> Result<(), String> {
+    let settings = AppSettings { db_path: Some(path.to_string_lossy().into_owned()) };
+    let raw = serde_json::to_string_pretty(&settings)
+        .map_err(|e| format!("序列化设置失败: {e}"))?;
+    fs::write(settings_file, raw)
+        .map_err(|e| format!("保存数据库位置失败: {e}"))
+}
+
+pub fn open_conn(path: &Path) -> Result<Connection, String> {
+    let conn = Connection::open(path)
         .map_err(|e| format!("无法打开数据库: {e}"))?;
 
     conn.pragma_update(None, "journal_mode", "WAL")
@@ -30,11 +76,17 @@ pub fn init(app: &tauri::App) -> Result<Connection, String> {
     conn.pragma_update(None, "foreign_keys", "ON")
         .map_err(|e| format!("设置外键失败: {e}"))?;
 
+    Ok(conn)
+}
+
+pub fn init(path: &Path) -> Result<Connection, String> {
+    let mut conn = open_conn(path)?;
+
     if has_column(&conn, "tags", "category")
         || has_column(&conn, "music", "tags")
         || has_column(&conn, "clips", "tags")
     {
-        backup_legacy_database(&conn, &path)?;
+        backup_legacy_database(&conn, path)?;
     }
 
     migrate(&mut conn)?;
@@ -47,6 +99,18 @@ fn backup_legacy_database(conn: &Connection, path: &std::path::Path) -> Result<(
     if backup.exists() { return Ok(()); }
     conn.execute("VACUUM main INTO ?1", params![backup.to_string_lossy().as_ref()])
         .map_err(|e| format!("备份旧数据库失败: {e}"))?;
+    Ok(())
+}
+
+pub fn migrate_database_file(conn: &Connection, target: &Path) -> Result<(), String> {
+    conn.execute("VACUUM main INTO ?1", params![target.to_string_lossy().as_ref()])
+        .map_err(|e| format!("迁移数据库失败: {e}"))?;
+    let check = Connection::open(target)
+        .map_err(|e| format!("校验新数据库失败: {e}"))?;
+    if let Err(e) = check.query_row("SELECT COUNT(*) FROM music", [], |row| row.get::<_, i64>(0)) {
+        let _ = fs::remove_file(target);
+        return Err(format!("校验新数据库失败: {e}"));
+    }
     Ok(())
 }
 
@@ -349,6 +413,69 @@ fn migrate_json_tags(conn: &Connection, table: &str, id_column: &str, join_table
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn temp_test_dir(name: &str) -> PathBuf {
+        let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let dir = std::env::temp_dir().join(format!("music-manager-{name}-{}-{nonce}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn settings_roundtrip_and_fallback_to_default() {
+        let dir = temp_test_dir("settings");
+        let settings_file = settings_path(&dir);
+
+        let resolved = resolve_db_path(load_settings(&settings_file).db_path.as_deref(), &dir).unwrap();
+        assert_eq!(resolved, dir.join("library.db"), "缺 settings.json 时用默认路径");
+
+        let custom = dir.join("custom").join("sub").join("library.db");
+        save_db_path_to(&settings_file, &custom).unwrap();
+        let resolved = resolve_db_path(load_settings(&settings_file).db_path.as_deref(), &dir).unwrap();
+        assert_eq!(resolved, custom, "应读回自定义路径");
+        assert!(custom.parent().unwrap().is_dir(), "自定义路径的父目录应已创建");
+
+        std::fs::write(&settings_file, "{ 不是合法 json").unwrap();
+        let resolved = resolve_db_path(load_settings(&settings_file).db_path.as_deref(), &dir).unwrap();
+        assert_eq!(resolved, dir.join("library.db"), "settings.json 损坏时回退默认路径");
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn migrate_database_copies_wal_data() {
+        let dir = temp_test_dir("migrate");
+        let source = dir.join("library.db");
+        let conn = Connection::open(&source).unwrap();
+        conn.pragma_update(None, "journal_mode", "WAL").unwrap();
+        conn.execute_batch("CREATE TABLE music(id TEXT PRIMARY KEY); INSERT INTO music VALUES ('m1');").unwrap();
+
+        let target = dir.join("moved").join("library.db");
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        migrate_database_file(&conn, &target).unwrap();
+
+        let migrated = Connection::open(&target).unwrap();
+        let count: i64 = migrated.query_row("SELECT COUNT(*) FROM music", [], |row| row.get(0)).unwrap();
+        assert_eq!(count, 1, "WAL 中未 checkpoint 的数据也要迁过去");
+        drop(migrated);
+        drop(conn);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn migrate_database_rejects_existing_target() {
+        let dir = temp_test_dir("migrate-reject");
+        let source = dir.join("library.db");
+        let conn = Connection::open(&source).unwrap();
+        conn.execute_batch("CREATE TABLE music(id TEXT PRIMARY KEY);").unwrap();
+
+        let target = dir.join("target.db");
+        std::fs::write(&target, b"occupied").unwrap();
+        let error = migrate_database_file(&conn, &target).unwrap_err();
+        assert!(error.contains("迁移数据库失败"), "{error}");
+        drop(conn);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn legacy_backup_contains_committed_data() {

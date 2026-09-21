@@ -1,0 +1,580 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>声场唱机 · Three.js 样机</title>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+body {
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 30px;
+    font-family: -apple-system, "PingFang SC", sans-serif;
+    background: #efe9dd;
+    transition: background .6s;
+    overflow: hidden;
+}
+
+body[data-theme="porcelain"] { background: #e9f1f3; }
+
+.caption {
+    font-size: 12px;
+    letter-spacing: .3em;
+    color: #8a8578;
+}
+
+#stage { width: min(1080px, 96vw); height: min(640px, 60vh); }
+#stage canvas { display: block; border-radius: 18px; }
+
+.controls { display: flex; gap: 12px; }
+
+.controls button {
+    height: 40px;
+    padding: 0 22px;
+    border: 1px solid #bdb5a6;
+    border-radius: 10px;
+    background: #faf7ef;
+    color: #4a4438;
+    font-size: 13px;
+    cursor: pointer;
+    transition: all .15s;
+}
+
+.controls button:hover { border-color: #8a7f6a; background: #fffdf6; }
+</style>
+</head>
+<body data-theme="walnut">
+
+<div class="caption">声场唱机 · Three.js 样机</div>
+<div id="stage"></div>
+
+<div class="controls">
+    <button id="playBtn">▶ 播放</button>
+    <button id="introBtn">↻ 重播开场</button>
+    <button id="themeBtn">◐ 切换主题</button>
+</div>
+
+<script src="frontend/vendor/three.min.js"></script>
+<script>
+(function () {
+    "use strict";
+
+    /* ================= 基础场景 ================= */
+
+    const stage = document.getElementById("stage");
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    renderer.shadowMap.enabled = true;
+    renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    renderer.outputEncoding = THREE.sRGBEncoding;
+    renderer.toneMapping = THREE.ACESFilmicToneMapping;
+    renderer.toneMappingExposure = 1.06;
+    stage.appendChild(renderer.domElement);
+
+    const scene = new THREE.Scene();
+
+    const camera = new THREE.PerspectiveCamera(34, 2, 0.1, 100);
+    const camTarget = new THREE.Vector3(0, 0.55, 0.2);
+    const CAM = { radius: 9.2, theta: 0.72, phi: 1.12 }; // 球坐标：斜侧俯视
+
+    function placeCamera() {
+        camera.position.set(
+            camTarget.x + CAM.radius * Math.sin(CAM.phi) * Math.sin(CAM.theta),
+            camTarget.y + CAM.radius * Math.cos(CAM.phi),
+            camTarget.z + CAM.radius * Math.sin(CAM.phi) * Math.cos(CAM.theta)
+        );
+        camera.lookAt(camTarget);
+    }
+
+    // 灯光：暖主光（投影）+ 冷补光 + 唱片上方点光
+    const hemi = new THREE.HemisphereLight(0xfff5e6, 0x8a7f6a, 0.5);
+    scene.add(hemi);
+
+    const key = new THREE.DirectionalLight(0xffedd0, 1.15);
+    key.position.set(4.5, 6.5, 3.5);
+    key.castShadow = true;
+    key.shadow.mapSize.set(2048, 2048);
+    key.shadow.camera.left = key.shadow.camera.bottom = -6;
+    key.shadow.camera.right = key.shadow.camera.top = 6;
+    key.shadow.radius = 6;
+    scene.add(key);
+
+    const fill = new THREE.PointLight(0x9db8c8, 0.4, 30);
+    fill.position.set(-4.5, 3, -2.5);
+    scene.add(fill);
+
+    const sheen = new THREE.PointLight(0xffffff, 0.5, 12);
+    sheen.position.set(-0.6, 3.4, 0.4);
+    scene.add(sheen);
+
+    // 地面
+    const ground = new THREE.Mesh(
+        new THREE.PlaneGeometry(60, 60),
+        new THREE.MeshStandardMaterial({ color: 0xece5d6, roughness: 1 })
+    );
+    ground.rotation.x = -Math.PI / 2;
+    ground.receiveShadow = true;
+    scene.add(ground);
+
+    /* ================= 程序化贴图 ================= */
+
+    // 假波形（接入 app 时换真实峰值）
+    const PEAKS = new Float32Array(720);
+    for (let i = 0; i < 720; i++) {
+        const t = i / 720;
+        PEAKS[i] = Math.min(1, Math.abs(
+            Math.sin(t * 43) * .5 + Math.sin(t * 17 + 2) * .3 + Math.sin(t * 91 + 5) * .2
+        ));
+    }
+
+    function makeWoodTexture() {
+        const c = document.createElement("canvas");
+        c.width = c.height = 512;
+        const x = c.getContext("2d");
+        const g = x.createLinearGradient(0, 0, 512, 512);
+        g.addColorStop(0, "#5d3f27");
+        g.addColorStop(.5, "#4a2f1a");
+        g.addColorStop(1, "#38220f");
+        x.fillStyle = g;
+        x.fillRect(0, 0, 512, 512);
+        for (let i = 0; i < 90; i++) {
+            const y0 = Math.random() * 512;
+            x.strokeStyle = `rgba(${Math.random() > .5 ? "20,12,6" : "120,84,50"},${.05 + Math.random() * .09})`;
+            x.lineWidth = .6 + Math.random() * 2.2;
+            x.beginPath();
+            x.moveTo(0, y0);
+            for (let px = 0; px <= 512; px += 32) {
+                x.lineTo(px, y0 + Math.sin(px * .02 + i) * 6);
+            }
+            x.stroke();
+        }
+        const tex = new THREE.CanvasTexture(c);
+        tex.encoding = THREE.sRGBEncoding;
+        return tex;
+    }
+
+    const LABEL = { walnut: ["#c23a24", "#8e2417"], porcelain: ["#5eaec3", "#3d7f93"] };
+
+    function makeRecordTexture(theme) {
+        const S = 1024, C = S / 2;
+        const c = document.createElement("canvas");
+        c.width = c.height = S;
+        const x = c.getContext("2d");
+        const R_OUT = C - 4, R_IN = 182, R_LABEL = 170;
+
+        const base = x.createRadialGradient(C, C, R_LABEL, C, C, R_OUT);
+        base.addColorStop(0, "#141317");
+        base.addColorStop(.78, "#0b0a0d");
+        base.addColorStop(1, "#070608");
+        x.fillStyle = base;
+        x.beginPath(); x.arc(C, C, R_OUT, 0, Math.PI * 2); x.fill();
+
+        for (let r = R_IN; r < R_OUT - 6; r += 3) {
+            for (let s = 0; s < 360; s += 3) {
+                const a0 = s / 360 * Math.PI * 2;
+                const peak = PEAKS[Math.floor(s / 360 * 720)];
+                x.strokeStyle = `rgba(255,255,255,${.03 + peak * .08})`;
+                x.lineWidth = 1.1;
+                x.beginPath();
+                x.arc(C, C, r, a0, a0 + 0.052);
+                x.stroke();
+            }
+        }
+
+        x.strokeStyle = "rgba(255,255,255,.15)";
+        x.lineWidth = 2;
+        x.beginPath(); x.arc(C, C, R_OUT - 4, 0, Math.PI * 2); x.stroke();
+
+        const [la, lb] = LABEL[theme];
+        const lg = x.createRadialGradient(C - 34, C - 34, 10, C, C, R_LABEL);
+        lg.addColorStop(0, la); lg.addColorStop(1, lb);
+        x.fillStyle = lg;
+        x.beginPath(); x.arc(C, C, R_LABEL, 0, Math.PI * 2); x.fill();
+
+        x.strokeStyle = "rgba(232,179,76,.7)";
+        x.lineWidth = 3;
+        x.beginPath(); x.arc(C, C, R_LABEL - 9, 0, Math.PI * 2); x.stroke();
+
+        x.fillStyle = "rgba(255,244,224,.94)";
+        x.font = "600 46px 'Songti SC', serif";
+        x.textAlign = "center"; x.textBaseline = "middle";
+        x.fillText("声场档案", C, C - 32);
+        x.font = "20px ui-monospace, monospace";
+        x.fillStyle = "rgba(255,244,224,.62)";
+        x.fillText("CUT & CUE · 33⅓ RPM", C, C + 22);
+        x.font = "16px ui-monospace, monospace";
+        x.fillText("SIDE A · STEREO", C, C + 60);
+
+        const tex = new THREE.CanvasTexture(c);
+        tex.encoding = THREE.sRGBEncoding;
+        tex.anisotropy = renderer.capabilities.getMaxAnisotropy();
+        return tex;
+    }
+
+    function makePlateTexture(theme) {
+        const c = document.createElement("canvas");
+        c.width = 512; c.height = 160;
+        const x = c.getContext("2d");
+        x.fillStyle = theme === "walnut" ? "#1c1710" : "#33525e";
+        x.fillRect(0, 0, 512, 160);
+        x.strokeStyle = "rgba(214,178,106,.85)";
+        x.lineWidth = 4;
+        x.strokeRect(10, 10, 492, 140);
+        x.fillStyle = "#e3c07c";
+        x.font = "600 56px 'Songti SC', serif";
+        x.textAlign = "center";
+        x.fillText("声 场 档 案", 256, 74);
+        x.font = "22px ui-monospace, monospace";
+        x.fillStyle = "rgba(227,192,124,.75)";
+        x.fillText("CUT & CUE · SOUND ARCHIVE", 256, 122);
+        const tex = new THREE.CanvasTexture(c);
+        tex.encoding = THREE.sRGBEncoding;
+        return tex;
+    }
+
+    function makeCounterTexture(theme) {
+        const c = document.createElement("canvas");
+        c.width = 512; c.height = 128;
+        const x = c.getContext("2d");
+        x.fillStyle = "#12100b";
+        x.fillRect(0, 0, 512, 128);
+        x.fillStyle = theme === "walnut" ? "#e8b34c" : "#63b7cc";
+        x.font = "54px ui-monospace, monospace";
+        x.textAlign = "center"; x.textBaseline = "middle";
+        x.shadowColor = x.fillStyle; x.shadowBlur = 16;
+        x.fillText("TRACKS 128", 256, 66);
+        const tex = new THREE.CanvasTexture(c);
+        tex.encoding = THREE.sRGBEncoding;
+        return tex;
+    }
+
+    /* ================= 机身 ================= */
+
+    const deck = new THREE.Group();
+    scene.add(deck);
+
+    const plinthMat = new THREE.MeshStandardMaterial({
+        map: makeWoodTexture(), roughness: .55, metalness: .06
+    });
+    const plinth = new THREE.Mesh(new THREE.BoxGeometry(5.6, 0.5, 4.2), plinthMat);
+    plinth.position.y = 0.25;
+    plinth.castShadow = plinth.receiveShadow = true;
+    deck.add(plinth);
+
+    // 前面板铭牌与计数窗（贴在机身前立面，和参考图一致）
+    let plateMesh, counterMesh;
+
+    function rebuildFront(theme) {
+        if (plateMesh) { deck.remove(plateMesh); plateMesh.material.map.dispose(); plateMesh.material.dispose(); plateMesh.geometry.dispose(); }
+        if (counterMesh) { deck.remove(counterMesh); counterMesh.material.map.dispose(); counterMesh.material.dispose(); counterMesh.geometry.dispose(); }
+
+        plateMesh = new THREE.Mesh(
+            new THREE.PlaneGeometry(1.7, 0.53),
+            new THREE.MeshStandardMaterial({ map: makePlateTexture(theme), roughness: .6 })
+        );
+        plateMesh.position.set(-1.55, 0.25, 2.101);
+        deck.add(plateMesh);
+
+        counterMesh = new THREE.Mesh(
+            new THREE.PlaneGeometry(1.15, 0.29),
+            new THREE.MeshStandardMaterial({
+                map: makeCounterTexture(theme),
+                emissive: 0xffffff,
+                emissiveMap: makeCounterTexture(theme),
+                emissiveIntensity: .8,
+                roughness: .4
+            })
+        );
+        counterMesh.position.set(1.35, 0.25, 2.101);
+        deck.add(counterMesh);
+    }
+
+    rebuildFront("walnut");
+
+    /* ================= 转盘与唱片 ================= */
+
+    const PLATTER = { x: -0.4, z: 0.2 };
+    const platterTop = 0.5 + 0.1;
+
+    const platter = new THREE.Mesh(
+        new THREE.CylinderGeometry(1.95, 1.95, 0.1, 72),
+        new THREE.MeshStandardMaterial({ color: 0xc8c2b2, metalness: .85, roughness: .34 })
+    );
+    platter.position.set(PLATTER.x, 0.5 + 0.05, PLATTER.z);
+    platter.castShadow = platter.receiveShadow = true;
+    deck.add(platter);
+
+    const recordGroup = new THREE.Group();
+    recordGroup.position.set(PLATTER.x, platterTop + 0.02, PLATTER.z);
+    deck.add(recordGroup);
+
+    let recordTopMat = new THREE.MeshStandardMaterial({
+        map: makeRecordTexture("walnut"), roughness: .32, metalness: .18
+    });
+    const recordSideMat = new THREE.MeshStandardMaterial({ color: 0x0a0a0c, roughness: .4 });
+
+    const record = new THREE.Mesh(
+        new THREE.CylinderGeometry(1.78, 1.78, 0.035, 96),
+        [recordSideMat, recordTopMat, recordSideMat]
+    );
+    record.castShadow = record.receiveShadow = true;
+    recordGroup.add(record);
+
+    const spindle = new THREE.Mesh(
+        new THREE.CylinderGeometry(0.032, 0.032, 0.14, 24),
+        new THREE.MeshStandardMaterial({ color: 0xd8d2c2, metalness: .9, roughness: .3 })
+    );
+    spindle.position.y = 0.08;
+    recordGroup.add(spindle);
+
+    /* ================= 唱臂 ================= */
+
+    const PIVOT = { x: 2.55, z: -1.35 };
+    const ARM_PARK = -1.59;   // 停靠角度（绕 Y）
+    const ARM_PLAY = -2.17;   // 落针角度
+
+    const armBase = new THREE.Group();
+    armBase.position.set(PIVOT.x, 0.5, PIVOT.z);
+    deck.add(armBase);
+
+    const metalMat = new THREE.MeshStandardMaterial({ color: 0xd9cfae, metalness: .9, roughness: .28 });
+    const darkMat = new THREE.MeshStandardMaterial({ color: 0x2c2820, roughness: .5, metalness: .3 });
+
+    const baseDisc = new THREE.Mesh(new THREE.CylinderGeometry(0.19, 0.21, 0.07, 40), metalMat);
+    baseDisc.position.y = 0.035;
+    baseDisc.castShadow = true;
+    armBase.add(baseDisc);
+
+    const column = new THREE.Mesh(new THREE.CylinderGeometry(0.075, 0.09, 0.44, 32), metalMat);
+    column.position.y = 0.28;
+    column.castShadow = true;
+    armBase.add(column);
+
+    const armLift = new THREE.Group();   // 抬臂
+    armLift.position.y = 0.5;
+    armBase.add(armLift);
+
+    const armSwing = new THREE.Group();  // 平移（绕枢轴）
+    armSwing.rotation.y = ARM_PARK;
+    armLift.add(armSwing);
+
+    const wand = new THREE.Mesh(new THREE.CylinderGeometry(0.034, 0.034, 2.8, 24), metalMat);
+    wand.rotation.z = -Math.PI / 2;
+    wand.position.x = 0.95;
+    wand.castShadow = true;
+    armSwing.add(wand);
+
+    const counterweight = new THREE.Mesh(new THREE.CylinderGeometry(0.115, 0.115, 0.3, 32), darkMat);
+    counterweight.rotation.z = Math.PI / 2;
+    counterweight.position.x = -0.55;
+    counterweight.castShadow = true;
+    armSwing.add(counterweight);
+
+    const headshell = new THREE.Mesh(new THREE.BoxGeometry(0.36, 0.055, 0.13), darkMat);
+    headshell.position.set(2.42, -0.01, 0);
+    headshell.rotation.y = -0.12;
+    headshell.castShadow = true;
+    armSwing.add(headshell);
+
+    const needle = new THREE.Mesh(new THREE.CylinderGeometry(0.008, 0.008, 0.09, 8),
+        new THREE.MeshStandardMaterial({ color: 0xd8d2c2 }));
+    needle.position.set(2.55, -0.06, 0);
+    armSwing.add(needle);
+
+    // 唱头微下垂，针尖贴近盘面
+    armSwing.rotation.z = -0.055;
+
+    // 停靠柱
+    const rest = new THREE.Mesh(new THREE.CylinderGeometry(0.04, 0.05, 0.34, 16), metalMat);
+    rest.position.set(2.5, 0.5 + 0.17, 1.28);
+    rest.castShadow = true;
+    deck.add(rest);
+    const restClip = new THREE.Mesh(new THREE.BoxGeometry(0.1, 0.05, 0.16), darkMat);
+    restClip.position.set(2.5, 0.5 + 0.36, 1.28);
+    deck.add(restClip);
+
+    /* ================= 旋钮 ================= */
+
+    [[0.35, 1.5], [1.05, 1.5], [1.75, 1.5]].forEach(([kx, kz]) => {
+        const knob = new THREE.Mesh(new THREE.CylinderGeometry(0.14, 0.15, 0.1, 32), darkMat);
+        knob.position.set(kx, 0.55, kz);
+        knob.castShadow = true;
+        deck.add(knob);
+        const tick = new THREE.Mesh(new THREE.BoxGeometry(0.02, 0.012, 0.1),
+            new THREE.MeshStandardMaterial({ color: 0xf2ead8 }));
+        tick.position.set(kx, 0.607, kz - 0.08);
+        deck.add(tick);
+    });
+
+    // 电源灯
+    const ledMat = new THREE.MeshStandardMaterial({ color: 0x5a5142, emissive: 0x000000 });
+    const led = new THREE.Mesh(new THREE.SphereGeometry(0.045, 16, 12), ledMat);
+    led.position.set(2.35, 0.53, 1.5);
+    deck.add(led);
+
+    /* ================= 动画状态 ================= */
+
+    const cur = { recordY: 1.15, speed: 0, armLift: 0, armAngle: ARM_PARK, spin: 0 };
+    const tgt = { recordY: 0, speed: 0, armLift: 0, armAngle: ARM_PARK };
+    const FULL_SPEED = 2.3;
+
+    let playing = false;
+    let busy = false;
+
+    function armDrop() {
+        busy = true;
+        tgt.armLift = 0.14;
+        setTimeout(() => { tgt.armAngle = ARM_PLAY; }, 430);
+        setTimeout(() => {
+            tgt.armLift = 0;
+            tgt.speed = FULL_SPEED;
+            ledMat.emissive.setHex(0xe8b34c);
+            ledMat.emissiveIntensity = 1.2;
+            busy = false;
+        }, 1750);
+    }
+
+    function armPark() {
+        busy = true;
+        ledMat.emissive.setHex(0x000000);
+        tgt.speed = 0;
+        tgt.armLift = 0.14;
+        setTimeout(() => { tgt.armAngle = ARM_PARK; }, 430);
+        setTimeout(() => { tgt.armLift = 0; busy = false; }, 1750);
+    }
+
+    function playIntro() {
+        cur.recordY = 1.15; cur.speed = 0;
+        tgt.speed = 0; tgt.armAngle = ARM_PARK; tgt.armLift = 0;
+        playing = false;
+        playBtn.textContent = "▶ 播放";
+        setTimeout(() => { tgt.recordY = 0; }, 200);          // 落盘
+        setTimeout(() => { tgt.speed = FULL_SPEED * .55; }, 1300); // 起转
+        setTimeout(() => {                                   // 上针
+            armDrop();
+            playing = true;
+            playBtn.textContent = "⏸ 暂停";
+        }, 2400);
+    }
+
+    /* ================= 交互 ================= */
+
+    const playBtn = document.getElementById("playBtn");
+    playBtn.addEventListener("click", () => {
+        if (busy) return;
+        playing = !playing;
+        playBtn.textContent = playing ? "⏸ 暂停" : "▶ 播放";
+        if (playing) armDrop(); else armPark();
+    });
+
+    document.getElementById("introBtn").addEventListener("click", playIntro);
+
+    document.getElementById("themeBtn").addEventListener("click", () => {
+        const body = document.body;
+        body.dataset.theme = body.dataset.theme === "walnut" ? "porcelain" : "walnut";
+        const theme = body.dataset.theme;
+        if (theme === "porcelain") {
+            plinthMat.map = null;
+            plinthMat.color.setHex(0xf2eee4);
+            plinthMat.roughness = .4;
+            ground.material.color.setHex(0xe3edef);
+        } else {
+            plinthMat.map = makeWoodTexture();
+            plinthMat.color.setHex(0xffffff);
+            plinthMat.roughness = .55;
+            ground.material.color.setHex(0xece5d6);
+        }
+        plinthMat.needsUpdate = true;
+        recordTopMat.map = makeRecordTexture(theme);
+        recordTopMat.needsUpdate = true;
+        rebuildFront(theme);
+    });
+
+    // 鼠标交互：按住拖拽 360° 环绕，滚轮缩放
+    const camOffset = { theta: 0, phi: 0, radius: 0 };
+    const camOffsetTgt = { theta: 0, phi: 0, radius: 0 };
+    let dragging = false;
+    let lastX = 0;
+    let lastY = 0;
+
+    stage.style.cursor = "grab";
+
+    stage.addEventListener("pointerdown", e => {
+        dragging = true;
+        lastX = e.clientX;
+        lastY = e.clientY;
+        stage.setPointerCapture(e.pointerId);
+        stage.style.cursor = "grabbing";
+    });
+
+    stage.addEventListener("pointermove", e => {
+        if (!dragging) return;
+        camOffsetTgt.theta += (e.clientX - lastX) * 0.006;   // 水平：360° 不限
+        camOffsetTgt.phi = Math.min(0.35, Math.max(-0.55,    // 垂直：不钻到桌面下
+            camOffsetTgt.phi + (e.clientY - lastY) * 0.004));
+        lastX = e.clientX;
+        lastY = e.clientY;
+    });
+
+    ["pointerup", "pointercancel"].forEach(type =>
+        stage.addEventListener(type, () => {
+            dragging = false;
+            stage.style.cursor = "grab";
+        })
+    );
+
+    stage.addEventListener("wheel", e => {
+        e.preventDefault();
+        camOffsetTgt.radius = Math.min(3, Math.max(-2.5,
+            camOffsetTgt.radius + e.deltaY * 0.004));
+    }, { passive: false });
+
+    /* ================= 主循环 ================= */
+
+    function resize() {
+        const w = stage.clientWidth, h = stage.clientHeight;
+        renderer.setSize(w, h);
+        camera.aspect = w / h;
+        camera.updateProjectionMatrix();
+    }
+    window.addEventListener("resize", resize);
+    resize();
+
+    function frame() {
+        cur.recordY += (tgt.recordY - cur.recordY) * 0.055;
+        cur.speed += (tgt.speed - cur.speed) * 0.02;
+        cur.armLift += (tgt.armLift - cur.armLift) * 0.16;
+        cur.armAngle += (tgt.armAngle - cur.armAngle) * 0.045;
+        cur.spin += cur.speed / 60;
+
+        camOffset.theta += (camOffsetTgt.theta - camOffset.theta) * 0.09;
+        camOffset.phi += (camOffsetTgt.phi - camOffset.phi) * 0.09;
+        camOffset.radius += (camOffsetTgt.radius - camOffset.radius) * 0.09;
+
+        recordGroup.position.y = platterTop + 0.02 + cur.recordY;
+        recordGroup.rotation.y = cur.spin;
+
+        armLift.position.y = 0.5 + cur.armLift;
+        armSwing.rotation.y = cur.armAngle;
+
+        CAM.theta = 0.72 + camOffset.theta;
+        CAM.phi = 1.12 + camOffset.phi;
+        CAM.radius = 9.2 + camOffset.radius;
+        placeCamera();
+
+        renderer.render(scene, camera);
+        requestAnimationFrame(frame);
+    }
+
+    placeCamera();
+    requestAnimationFrame(frame);
+    setTimeout(playIntro, 400);
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><style>body{margin:0;background:#7ab}</style></head>
+<body>
+<script src="../vendor/three.min.js"></script>
+<script>
+const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+renderer.setPixelRatio(1);
+renderer.setSize(900, 400, false);
+renderer.outputEncoding = THREE.sRGBEncoding;
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.setClearColor(0xf0efe9, 0);
+document.body.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+scene.add(new THREE.HemisphereLight(0xfff2df, 0x4a3a26, 0.6));
+const key = new THREE.DirectionalLight(0xffffff, 1.2);
+key.position.set(-3, 4, 5);
+scene.add(key);
+
+const camera = new THREE.PerspectiveCamera(28, 2.25, 0.1, 100);
+camera.position.set(0, 1, 8);
+camera.lookAt(0, 0, 0);
+
+[-3.9, -1.3, 1.3, 3.9].forEach(x => {
+    const box = new THREE.Mesh(new THREE.BoxGeometry(1.8, 1.8, 1.8), new THREE.MeshStandardMaterial({ color: 0xc02030 }));
+    box.position.set(x, 0, -1);
+    scene.add(box);
+});
+
+// 裸奔对照组（最左无玻璃）
+
+// 左二：裸 transmission=1
+const g1 = new THREE.Mesh(
+    new THREE.BoxGeometry(2, 2, 0.06),
+    new THREE.MeshPhysicalMaterial({ transmission: 1, roughness: 0, thickness: 0.05 })
+);
+g1.position.set(-1.3, 0, 0.4);
+scene.add(g1);
+
+// 右二：当前配方 .96 + clearcoat
+const g2 = new THREE.Mesh(
+    new THREE.BoxGeometry(2, 2, 0.06),
+    new THREE.MeshPhysicalMaterial({
+        color: 0xffffff, metalness: 0, roughness: 0.05,
+        transmission: 0.96, thickness: 0.08, ior: 1.49,
+        clearcoat: 0.45, clearcoatRoughness: 0.25
+    })
+);
+g2.position.set(1.3, 0, 0.4);
+scene.add(g2);
+
+// 最右：假玻璃对照
+const g3 = new THREE.Mesh(
+    new THREE.BoxGeometry(2, 2, 0.06),
+    new THREE.MeshPhysicalMaterial({
+        color: 0xffffff, metalness: 0, roughness: 0.06,
+        transparent: true, opacity: 0.1, clearcoat: 1, depthWrite: false
+    })
+);
+g3.position.set(3.9, 0, 0.4);
+scene.add(g3);
+
+let n = 0;
+function loop() {
+    renderer.render(scene, camera);
+    if (++n < 12) requestAnimationFrame(loop);
+}
+loop();
+</script>
+</body>
+</html>

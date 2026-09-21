@@ -6,6 +6,7 @@ use tauri::Manager;
 
 pub struct AppState {
     pub db: Mutex<rusqlite::Connection>,
+    pub db_path: Mutex<std::path::PathBuf>,
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -14,9 +15,11 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
-            let conn = db::init(app)?;
+            let path = db::db_path(app)?;
+            let conn = db::init(&path)?;
             app.manage(AppState {
                 db: Mutex::new(conn),
+                db_path: Mutex::new(path),
             });
 
             Ok(())
@@ -57,6 +60,7 @@ pub fn run() {
             commands::clear_candidates,
             commands::file_exists,
             commands::get_database_path,
+            commands::set_database_location,
             commands::get_audio_base_url,
             commands::sync_library_locations,
         ])

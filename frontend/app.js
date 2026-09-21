@@ -13,7 +13,7 @@ const SIDEBAR_TAG_MANAGE_STORAGE_KEY = "music-library-sidebar-tag-manage";
 const PAGE_SIZES_STORAGE_KEY = "music-library-page-sizes";
 
 let state = {
-    currentView: "all",
+    currentView: "home",
     search: "",
     albumSearch: "",
     layout: "list",
@@ -75,7 +75,6 @@ let state = {
         segment: null,
         playing: false,
         loading: false,
-        seeking: false,
         audio: null,
         currentUrl: "",
         candidates: []
@@ -320,6 +319,8 @@ function applyTheme(themeName, { persist = true } = {}) {
             // 主题仍可在当前次运行中正常切换。
         }
     }
+
+    window.Turntable?.setTheme(theme);
 }
 
 function setupThemeSwitcher() {
@@ -478,6 +479,45 @@ async function revealDatabaseFile() {
         await showMessage(
             `无法在 Finder 中显示数据库文件：${getErrorMessage(error)}`,
             "无法定位数据库",
+            "error"
+        );
+    }
+}
+
+async function changeDatabaseLocation() {
+    try {
+        const selected = await __TAURI__.dialog.open({
+            directory: true,
+            multiple: false,
+            title: "选择新的数据库位置"
+        });
+        if (!selected) return;
+        const dir = String(selected);
+
+        let overwrite = false;
+        if (await invoke("file_exists", { path: `${dir}/library.db` })) {
+            overwrite = await confirm(
+                "目标位置已有数据库文件，覆盖后其中的数据会被当前曲库替换。是否覆盖？",
+                "覆盖数据库文件"
+            );
+            if (!overwrite) return;
+        }
+
+        if (!await confirm(
+            `将把数据库迁移到：\n${dir}\n\n迁移完成后立即生效，无需重启。`,
+            "更改数据库位置"
+        )) return;
+
+        showToast("正在迁移数据库…", 60000);
+        await invoke("set_database_location", { dir, overwrite });
+        await setupDatabasePath();
+        showToast("数据库已迁移到新位置");
+    } catch (error) {
+        console.error(error);
+        $("toast").classList.remove("show");
+        await showMessage(
+            `迁移数据库失败：${getErrorMessage(error)}`,
+            "迁移失败",
             "error"
         );
     }
@@ -1325,13 +1365,20 @@ function updatePageHeader() {
 
     $("viewButtons").classList.toggle(
         "hidden",
-        state.currentView === "clips"
+        state.currentView === "clips" || state.currentView === "home"
     );
     updateFilterToggleIndicator();
 
     let title = "全部音乐";
     let description = "你的本地音乐素材";
     let searchPlaceholder = "搜索音乐名、专辑、作者、类型、年份或 Tag";
+
+
+    if (state.currentView === "home") {
+
+        title = "首页";
+        description = "声场档案的起始页";
+    }
 
 
     if (state.currentView === "clips") {
@@ -1393,11 +1440,29 @@ function updatePageHeader() {
 
 async function render() {
 
+    document.body.classList.toggle(
+        "view-home",
+        state.currentView === "home"
+    );
+
+    // 离开首页时唱机与唱片墙休眠（回到首页由 renderHome 重新 mount/唤醒）
+    if (state.currentView !== "home") {
+        window.Turntable?.sleep();
+        window.VinylWall?.sleep();
+    }
+
     updatePageHeader();
 
     const music = await dbGetAll("music");
 
     const clips = await dbGetAll("clips");
+
+    if (state.currentView === "home") {
+
+        renderHome(music, clips);
+
+        return;
+    }
 
     if (state.currentView === "clips") {
 
@@ -1500,6 +1565,442 @@ async function render() {
 
     syncPlayerQueue();
     await hydrateVisibleArtwork(page.items);
+}
+
+/* =========================================================
+   首页（声场唱机着陆页）
+========================================================= */
+
+function goToViewFromHome(view) {
+
+    const go = () => {
+        document.body.classList.remove("is-diving");
+        document.querySelector(`.nav-item[data-view="${view}"]`)?.click();
+    };
+
+    document.body.classList.add("is-diving");
+    document.body.classList.add("from-home");
+    setTimeout(() => document.body.classList.remove("from-home"), 1200);
+
+    if (window.Turntable) {
+        window.Turntable.diveIn(go);
+    } else {
+        go();
+    }
+}
+
+function renderHome(music, clips) {
+
+    const albumCount =
+        new Set(
+            music.map(m => m.album).filter(Boolean)
+        ).size;
+
+    visibleQueueMusic = [];
+    visibleClipIds = [];
+    renderSelectionToolbar();
+
+    $("resultInfo").textContent = "";
+
+    $("contentArea").innerHTML = `
+        <section class="home-hero">
+
+            <div class="home-bokeh" aria-hidden="true"></div>
+
+            <div class="home-stage" id="homeStage">
+                <span class="home-stage-hint" aria-hidden="true">点唱片播放 · 搓碟 · 拖拽旋转 · 滚轮缩放 · 双击复位</span>
+            </div>
+
+            <div class="home-kicker">CUT &amp; CUE · SOUND LIBRARY</div>
+
+            <h1 class="home-title-small">声场档案</h1>
+            <p class="home-subtitle">剪辑、标记、归档——你的本地音乐声场</p>
+
+            <div class="home-actions">
+                <button class="secondary-btn home-enter-btn" type="button" data-home-action="browse">
+                    进入曲库 →
+                </button>
+                <button class="secondary-btn home-crate-btn" type="button" data-home-action="crate">
+                    唱片箱
+                </button>
+            </div>
+
+            <div class="home-stats">
+                <span><b>${music.length}</b> TRACKS</span>
+                <span><b>${clips.length}</b> CLIPS</span>
+                <span><b>${albumCount}</b> ALBUMS</span>
+                <span><b>${tagRecordsCache.length}</b> TAGS</span>
+            </div>
+
+            <!-- 宽屏 editorial 构图：左标题块（窄屏隐藏，用上面的居中版） -->
+            <div class="home-editorial">
+                <h1 class="home-ed-title">声场档案</h1>
+                <p class="home-ed-eng">CUT &amp; CUE · SOUND LIBRARY</p>
+                <p class="home-ed-sub">剪辑、标记、归档<br>你的本地音乐声场。</p>
+                <p class="home-ed-script">Good Music<br>Lives Longer.</p>
+            </div>
+
+            <!-- 唱机上的悬浮提示胶囊：首次拖动/播放后淡出 -->
+            <div class="stage-tip stage-tip-left" aria-hidden="true">⟳&nbsp;拖动旋转</div>
+            <div class="stage-tip stage-tip-right" aria-hidden="true">◉&nbsp;放下唱针</div>
+
+            <div class="stage-orbit">
+                <button class="orbit-btn" type="button" data-orbit="-1" aria-label="向左环绕">‹</button>
+                <span class="orbit-label">360°</span>
+                <button class="orbit-btn" type="button" data-orbit="1" aria-label="向右环绕">›</button>
+            </div>
+
+            <div class="home-corner home-corner-l" aria-hidden="true">A LIBRARY<br>FOR BETTER EARS.</div>
+            <div class="home-corner home-corner-r" aria-hidden="true">MUSIC LIVES<br>IN DETAILS.</div>
+
+            <aside class="vinyl-wall" id="vinylWall" aria-label="唱片墙">
+                <div class="wall-head">
+                    <span>最近添加</span>
+                    <button class="wall-more" type="button" data-home-action="recent">查看全部 ›</button>
+                </div>
+                <div class="wall-frames"></div>
+            </aside>
+
+            <div id="cratePanel" class="crate-panel hidden" role="dialog" aria-label="唱片箱">
+                <div class="crate-header">
+                    <span class="crate-title">唱片箱 <b id="crateCount"></b></span>
+                    <div class="crate-pager">
+                        <button id="cratePrevBtn" class="crate-page-btn" type="button" aria-label="上一页">‹</button>
+                        <span id="cratePageInfo"></span>
+                        <button id="crateNextBtn" class="crate-page-btn" type="button" aria-label="下一页">›</button>
+                    </div>
+                    <button id="crateCloseBtn" class="icon-btn" type="button" aria-label="关闭唱片箱">×</button>
+                </div>
+                <div id="crateBody" class="crate-body"></div>
+            </div>
+        </section>
+    `;
+
+    scrollMainContentToTop();
+
+    const area = $("contentArea");
+
+    area.querySelector('[data-home-action="browse"]')
+        .addEventListener("click", () => goToViewFromHome("all"));
+
+    area.querySelector('[data-home-action="recent"]')
+        .addEventListener("click", () => goToViewFromHome("recent"));
+
+    // 环绕机位按钮 + 提示胶囊首次交互后淡出
+    area.querySelectorAll(".orbit-btn").forEach(btn => {
+        btn.addEventListener("click", () => {
+            window.Turntable?.orbit(Number(btn.dataset.orbit) * 0.55);
+        });
+    });
+    $("homeStage").addEventListener("pointerdown", () => {
+        area.querySelector(".home-hero").classList.add("tips-seen");
+    }, { once: true });
+
+    setupCrate(area, music);
+    setupVinylWall(area, music);
+
+    if (window.Turntable) {
+        window.Turntable.mount($("homeStage"));
+        window.Turntable.setProgram({
+            counts: {
+                tracks: music.length,
+                clips: clips.length,
+                albums: albumCount,
+                tags: tagRecordsCache.length
+            }
+        });
+    }
+}
+
+/* =========================================================
+   唱片箱（首页选片）
+========================================================= */
+
+const CRATE_PAGE_SIZE = 6;
+let cratePage = 0;
+
+function setupCrate(area, music) {
+
+    const panel = area.querySelector("#cratePanel");
+    if (!panel) return;
+
+    const body = area.querySelector("#crateBody");
+    const pageInfo = area.querySelector("#cratePageInfo");
+    const prevBtn = area.querySelector("#cratePrevBtn");
+    const nextBtn = area.querySelector("#crateNextBtn");
+
+    cratePage = 0;
+    area.querySelector("#crateCount").textContent = `· ${music.length} 张`;
+
+    const pageCount = Math.max(1, Math.ceil(music.length / CRATE_PAGE_SIZE));
+
+    const renderPage = () => {
+
+        const page = music.slice(
+            cratePage * CRATE_PAGE_SIZE,
+            (cratePage + 1) * CRATE_PAGE_SIZE
+        );
+
+        pageInfo.textContent = `${cratePage + 1} / ${pageCount}`;
+        prevBtn.disabled = cratePage <= 0;
+        nextBtn.disabled = cratePage >= pageCount - 1;
+
+        body.innerHTML = page.map(item => {
+            const cover = item.coverArt || coverArtCache.get(item.id) || "";
+            const sleeveStyle = cover ? ` style="background-image:url('${escapeHTML(cover)}')"` : "";
+            return `
+            <button class="crate-item" type="button" data-id="${escapeHTML(item.id)}" title="${escapeHTML(item.name)}">
+                <span class="crate-sleeve${cover ? " has-artwork" : ""}" data-cover="${escapeHTML(item.id)}"${sleeveStyle}>
+                    <span class="crate-disc"><span class="crate-disc-label">${escapeHTML((item.name || "♪").slice(0, 1))}</span></span>
+                </span>
+                <span class="crate-name">${escapeHTML(item.name)}</span>
+                <span class="crate-meta">${escapeHTML(item.album || "未分专辑")} · ${formatTime(item.duration)}</span>
+            </button>`;
+        }).join("");
+
+        body.querySelectorAll(".crate-item").forEach(btn => {
+            btn.addEventListener("click", () => {
+                const picked = music.find(m => m.id === btn.dataset.id);
+                if (picked) void playFromCrate(picked).catch(console.error);
+            });
+        });
+
+        // 没缓存的封面批量补拉
+        const missing = page
+            .filter(item => !item.coverArt && !coverArtCache.has(item.id))
+            .map(item => item.id);
+
+        if (missing.length) {
+            invoke("get_music_cover_arts", { ids: missing }).then(covers => {
+                covers.forEach(({ id, coverArt }) => {
+                    if (!coverArt) return;
+                    coverArtCache.set(id, coverArt);
+                    const sleeve = body.querySelector(`[data-cover="${CSS.escape(id)}"]`);
+                    if (sleeve) {
+                        sleeve.classList.add("has-artwork");
+                        sleeve.style.backgroundImage = `url("${coverArt}")`;
+                    }
+                });
+            }).catch(() => {});
+        }
+    };
+
+    area.querySelector('[data-home-action="crate"]')
+        .addEventListener("click", () => {
+            panel.classList.remove("hidden");
+            renderPage();
+        });
+
+    area.querySelector("#crateCloseBtn")
+        .addEventListener("click", () => panel.classList.add("hidden"));
+
+    prevBtn.addEventListener("click", () => {
+        if (cratePage > 0) {
+            cratePage--;
+            renderPage();
+        }
+    });
+
+    nextBtn.addEventListener("click", () => {
+        if (cratePage < pageCount - 1) {
+            cratePage++;
+            renderPage();
+        }
+    });
+}
+
+/* 选片即点歌：装载（不出声）→ 唱机换片 → 落针出声 */
+async function swapToMusic(music) {
+
+    await playMusic(music.id, { deferPlay: true });
+
+    const url = convertFileSrc(music.path);
+    const cover = music.coverArt || coverArtCache.get(music.id) || "";
+
+    if (!window.Turntable) {
+        getAudio().play().catch(() => {});
+        return;
+    }
+
+    window.Turntable.swapRecord(
+        { coverArt: cover, grooveUrl: url },
+        () => window.Turntable.dropNeedle(() => {
+            getAudio().play().catch(() => {});
+        })
+    );
+}
+
+async function playFromCrate(music) {
+
+    $("cratePanel")?.classList.add("hidden");
+
+    await swapToMusic(music);
+}
+
+/* =========================================================
+   唱片墙（首页右侧常驻选片）
+   排序：有封面的优先，同专辑相邻；每帧可独立左右翻，
+   翻到墙上已挂的唱片时两帧互换位置，不会挂重。
+========================================================= */
+
+const WALL_FRAME_COUNT = 6; // DOM 固定 6 帧，1×3 布局下 CSS 只露前 3 帧
+let wallList = [];
+let wallFrameIds = [];
+
+function wallSorted(music) {
+    return [...music].sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+}
+
+function setupVinylWall(area, music) {
+
+    const wall = area.querySelector("#vinylWall");
+    if (!wall) return;
+
+    wallList = wallSorted(music);
+    wallFrameIds = wallList.slice(0, WALL_FRAME_COUNT).map(item => item.id);
+
+    wall.querySelector(".wall-frames").innerHTML = Array.from({ length: WALL_FRAME_COUNT }, (_, i) => `
+        <div class="vinyl-frame" data-idx="${i}">
+            <span class="vinyl-spot" aria-hidden="true"></span>
+            <div class="vinyl-box">
+                <button class="vinyl-hit" type="button" aria-label="选片"></button>
+                <button class="vinyl-flip vinyl-flip-prev" type="button" aria-label="上一张">‹</button>
+                <button class="vinyl-flip vinyl-flip-next" type="button" aria-label="下一张">›</button>
+            </div>
+            <span class="vinyl-now" aria-hidden="true">ON AIR</span>
+            <span class="vinyl-caption"></span>
+        </div>`).join("");
+
+    const renderFrames = () => {
+
+        const slotsData = [];
+
+        wall.querySelectorAll(".vinyl-frame").forEach((frame, i) => {
+
+            const item = wallList.find(m => m.id === wallFrameIds[i]);
+
+            /* 库存不足时末尾只留一个「导入曲目」空相框，多余的藏掉 */
+            const gone = i > wallList.length;
+            frame.classList.toggle("is-gone", gone);
+            frame.classList.toggle("is-empty", !item && !gone);
+            frame.dataset.musicId = item ? item.id : "";
+
+            const hit = frame.querySelector(".vinyl-hit");
+            const caption = frame.querySelector(".vinyl-caption");
+
+            frame.querySelectorAll(".vinyl-flip")
+                .forEach(btn => { btn.disabled = wallList.length < 2; });
+
+            if (!item) {
+                hit.title = "曲库是空的，点击导入曲目";
+                caption.textContent = "";
+                slotsData.push(null);
+                return;
+            }
+
+            hit.title = `${item.name}（点击上机播放）`;
+            caption.textContent = item.name;
+            slotsData.push(gone ? null : {
+                id: item.id,
+                name: item.name,
+                coverArt: item.coverArt || coverArtCache.get(item.id) || ""
+            });
+        });
+
+        /* 3D 挂帧跟随 DOM 槽位 */
+        if (window.VinylWall) window.VinylWall.setSlots(slotsData);
+
+        syncWallPlayback();
+    };
+
+    const flip = (frameIdx, dir) => {
+
+        if (wallList.length < 2) return;
+
+        const cur = wallList.findIndex(m => m.id === wallFrameIds[frameIdx]);
+        if (cur < 0) return;
+
+        const candidateId =
+            wallList[(cur + dir + wallList.length) % wallList.length].id;
+
+        /* 候选已挂在别的帧上 → 两帧互换，保证墙上不重复 */
+        const holder = wallFrameIds.indexOf(candidateId);
+        if (holder >= 0 && holder !== frameIdx) {
+            wallFrameIds[holder] = wallFrameIds[frameIdx];
+        }
+        wallFrameIds[frameIdx] = candidateId;
+
+        renderFrames();
+    };
+
+    wall.querySelectorAll(".vinyl-frame").forEach((frame, i) => {
+
+        frame.querySelector(".vinyl-hit").addEventListener("click", () => {
+            const item = wallList.find(m => m.id === wallFrameIds[i]);
+            if (!item) {
+                $("importBtn")?.click();
+                return;
+            }
+            /* 点正在播/暂停的那张 = 播放/暂停（针臂编排由唱机自己听音频事件） */
+            if (state.player.music?.id === item.id && !state.player.segment) {
+                void togglePlay();
+                return;
+            }
+            void swapToMusic(item).catch(console.error);
+        });
+
+        /* hover 微倾：把指针位置转成画框的倾斜角 */
+        const box = frame.querySelector(".vinyl-box");
+        box.addEventListener("pointermove", e => {
+            if (!window.VinylWall) return;
+            const r = box.getBoundingClientRect();
+            window.VinylWall.setTilt(
+                i,
+                ((e.clientX - r.left) / r.width) * 2 - 1,
+                ((e.clientY - r.top) / r.height) * 2 - 1
+            );
+        });
+        box.addEventListener("pointerleave", () => {
+            window.VinylWall?.setTilt(i, 0, 0);
+        });
+
+        frame.querySelector(".vinyl-flip-prev")
+            .addEventListener("click", () => flip(i, -1));
+        frame.querySelector(".vinyl-flip-next")
+            .addEventListener("click", () => flip(i, 1));
+    });
+
+    if (window.VinylWall) window.VinylWall.mount(wall);
+
+    renderFrames();
+
+    /* 封面批量补拉：到位后重绘标签（顺序不变，只补图） */
+    const missing = wallList
+        .filter(item => !item.coverArt && !coverArtCache.has(item.id))
+        .slice(0, 24)
+        .map(item => item.id);
+
+    if (missing.length) {
+        invoke("get_music_cover_arts", { ids: missing }).then(covers => {
+            let changed = false;
+            covers.forEach(({ id, coverArt }) => {
+                if (!coverArt) return;
+                coverArtCache.set(id, coverArt);
+                changed = true;
+            });
+            if (changed) renderFrames();
+        }).catch(() => {});
+    }
+}
+
+/* 播放状态 → 墙上「ON AIR」小签 + 那张唱片真的转起来 */
+function syncWallPlayback() {
+    const p = state.player;
+    const activeId = !p.segment && p.playing ? p.music?.id : null;
+    document.querySelectorAll(".vinyl-frame").forEach(frame => {
+        frame.classList.toggle("is-playing", !!activeId && frame.dataset.musicId === activeId);
+    });
+    window.VinylWall?.setPlaying(activeId || null);
 }
 
 function renderTagResults(music, clips, tagId) {
@@ -1836,6 +2337,12 @@ function renderCatalogView(music, clips, type) {
 
                     </div>
 
+                    <canvas
+                        class="row-wave"
+                        ${item.path ? `data-wave-src="${escapeHTML(convertFileSrc(item.path))}"` : ""}
+                        aria-hidden="true"
+                    ></canvas>
+
                     <div class="music-actions">
 
                         <button
@@ -2036,6 +2543,12 @@ function renderClipLibrary(music, clips) {
                             ).join("")}
                         </div>
                     </div>
+                    <canvas
+                        class="row-wave"
+                        ${parent.path ? `data-wave-src="${escapeHTML(convertFileSrc(parent.path))}"` : ""}
+                        ${parent.duration ? `data-wave-from="${(clip.start / parent.duration).toFixed(4)}" data-wave-to="${(clip.end / parent.duration).toFixed(4)}"` : ""}
+                        aria-hidden="true"
+                    ></canvas>
                     <div class="clip-library-actions">
                         <button class="icon-action" data-clip-action="play" data-clip-id="${clip.id}" title="试听片段">▶</button>
                         <button class="icon-action" data-clip-action="edit" data-clip-id="${clip.id}" title="编辑片段">✎</button>
@@ -2119,6 +2632,12 @@ function renderList(music, clips) {
                         <div class="music-tags">${renderInlineMusicTags(item)}</div>
 
                     </div>
+
+                    <canvas
+                        class="row-wave"
+                        ${item.path ? `data-wave-src="${escapeHTML(convertFileSrc(item.path))}"` : ""}
+                        aria-hidden="true"
+                    ></canvas>
 
 
                     <div class="music-actions">
@@ -3318,14 +3837,6 @@ function updateBarTime() {
         formatTime(cur) +
         " / " +
         formatTime(dur || (p.music && p.music.duration) || 0);
-
-    if (!p.seeking) {
-
-        $("playerSeek").value =
-            dur
-                ? Math.round(cur / dur * 1000)
-                : 0;
-    }
 }
 
 
@@ -3357,6 +3868,11 @@ function setPlayingUI(playing) {
 
     state.player.playing =
         playing;
+
+    document.body.classList.toggle(
+        "is-playing",
+        playing
+    );
 
     $("playerPlayBtn").textContent =
         playing ? "⏸" : "▶";
@@ -3391,6 +3907,8 @@ function syncPlaybackIndicators() {
         row.classList.toggle("is-playing", row.dataset.musicId === activeMusicId);
     });
 
+    syncWallPlayback();
+
     document.querySelectorAll(".clip-library-row, .clip-item").forEach(row => {
         const clipId = row.dataset.clipId || row.dataset.panelClipId;
         row.classList.toggle("is-playing", clipId === activeClipId);
@@ -3411,7 +3929,7 @@ function skipBroken(music) {
 }
 
 
-async function loadAndPlay(music, segment = null) {
+async function loadAndPlay(music, segment = null, opts = {}) {
 
     const p = state.player;
 
@@ -3450,6 +3968,26 @@ async function loadAndPlay(music, segment = null) {
         const url =
             convertFileSrc(music.path);
 
+        // 唱机联动：标签换当前曲封面，纹槽换当前曲波形。
+        // deferPlay（唱片箱选片）时纹理由 swapRecord 在换片动画中替换。
+        if (window.Turntable && !opts.deferPlay) {
+            const cachedCover = music.coverArt || coverArtCache.get(music.id) || "";
+            window.Turntable.setTrack({ grooveUrl: url });
+            if (cachedCover) {
+                window.Turntable.setTrack({ coverArt: cachedCover });
+            } else {
+                invoke("get_music_cover_arts", { ids: [music.id] })
+                    .then(covers => {
+                        const art = covers[0]?.coverArt || "";
+                        if (art) {
+                            coverArtCache.set(music.id, art);
+                            window.Turntable?.setTrack({ coverArt: art });
+                        }
+                    })
+                    .catch(() => {});
+            }
+        }
+
         if (p.currentUrl === url) {
 
             if (segment) {
@@ -3486,6 +4024,16 @@ async function loadAndPlay(music, segment = null) {
                 "loadedmetadata",
                 handleMeta
             );
+        }
+
+        if (opts.deferPlay) {
+
+            /* 只装载不出声（唱片箱选片）：
+               等唱机换片、落针后由唱机驱动 a.play()，
+               UI 状态由新增的 play/pause 事件监听同步。 */
+            setPlayingUI(false);
+
+            return;
         }
 
         try {
@@ -3602,7 +4150,7 @@ async function playMusic(id, opts = {}) {
 
     updateBarControls();
 
-    await loadAndPlay(music);
+    await loadAndPlay(music, null, opts);
 }
 
 
@@ -3641,7 +4189,7 @@ async function playClip(clip, opts = {}) {
 
     updateBarControls();
 
-    await loadAndPlay(music, p.segment);
+    await loadAndPlay(music, p.segment, opts);
 }
 
 
@@ -3748,6 +4296,8 @@ function clearPlayer() {
     a.load();
 
     p.playing = false;
+
+    document.body.classList.remove("is-playing");
 
     p.music = null;
 
@@ -4158,18 +4708,25 @@ function initPlayer() {
         }
     );
 
+    /* 播放状态不只来自 app 内部：唱机（点唱片/落针）也会直接驱动 audio，
+       UI 统一由事件同步，手动 setPlayingUI 调用保持幂等。 */
+    a.addEventListener(
+        "play",
+        () => setPlayingUI(true)
+    );
+
+    a.addEventListener(
+        "pause",
+        () => setPlayingUI(false)
+    );
+
     a.addEventListener(
         "timeupdate",
         () => {
 
-            if (
-                !state.player.seeking
-            ) {
+            updateBarTime();
 
-                updateBarTime();
-
-                onSegmentTimeupdate();
-            }
+            onSegmentTimeupdate();
         }
     );
 
@@ -4284,36 +4841,6 @@ function initPlayer() {
     $("clearCandidatesBtn").addEventListener(
         "click",
         clearCandidates
-    );
-
-    $("playerSeek").addEventListener(
-        "input",
-        event => {
-
-            const p = state.player;
-
-            const audio = getAudio();
-
-            p.seeking = true;
-
-            if (audio.duration) {
-
-                audio.currentTime =
-                    event.target.value /
-                    1000 *
-                    audio.duration;
-            }
-
-            updateBarTime();
-        }
-    );
-
-    $("playerSeek").addEventListener(
-        "change",
-        () => {
-
-            state.player.seeking = false;
-        }
     );
 }
 
@@ -5983,6 +6510,12 @@ function setupEvents() {
             revealDatabaseFile
         );
 
+    $("changeDbLocationBtn")
+        .addEventListener(
+            "click",
+            changeDatabaseLocation
+        );
+
 
     $("chooseFileBtn")
         .addEventListener(
@@ -6431,6 +6964,16 @@ function setupEvents() {
             ".nav-item"
         )
         .forEach(button => {
+
+            /* 首页悬停导航时唱机给予联动反馈 */
+            button.addEventListener(
+                "mouseenter",
+                () => {
+                    if (state.currentView === "home" && button.dataset.view) {
+                        window.Turntable?.react(button.dataset.view);
+                    }
+                }
+            );
 
             button.addEventListener(
                 "click",
@@ -7751,6 +8294,66 @@ function setupEvents() {
 
 
 /* =========================================================
+   空间动效
+   指针只驱动 CSS 变量；低频、无依赖，并尊重系统的减少动态效果设置。
+========================================================= */
+
+function setupSpatialMotion() {
+    if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) return;
+
+    let frame = 0;
+    let pointerX = window.innerWidth / 2;
+    let pointerY = window.innerHeight / 2;
+    let activeSurface = null;
+
+    const paint = () => {
+        frame = 0;
+        const x = pointerX / Math.max(window.innerWidth, 1);
+        const y = pointerY / Math.max(window.innerHeight, 1);
+        document.documentElement.style.setProperty("--pointer-x", `${(x * 100).toFixed(2)}%`);
+        document.documentElement.style.setProperty("--pointer-y", `${(y * 100).toFixed(2)}%`);
+        document.documentElement.style.setProperty("--scene-x", `${((x - .5) * 10).toFixed(2)}px`);
+        document.documentElement.style.setProperty("--scene-y", `${((y - .5) * 8).toFixed(2)}px`);
+        document.documentElement.style.setProperty("--scene-x-reverse", `${((.5 - x) * 7).toFixed(2)}px`);
+        document.documentElement.style.setProperty("--scene-y-reverse", `${((.5 - y) * 5.6).toFixed(2)}px`);
+        document.documentElement.style.setProperty("--scene-x-soft", `${((x - .5) * 3.5).toFixed(2)}px`);
+        document.documentElement.style.setProperty("--scene-y-soft", `${((y - .5) * 2.8).toFixed(2)}px`);
+        document.documentElement.style.setProperty("--scene-x-subtle", `${((x - .5) * 1.2).toFixed(2)}px`);
+        document.documentElement.style.setProperty("--scene-y-subtle", `${((y - .5) * .96).toFixed(2)}px`);
+
+        if (!activeSurface) return;
+        const bounds = activeSurface.getBoundingClientRect();
+        const localX = (pointerX - bounds.left) / Math.max(bounds.width, 1);
+        const localY = (pointerY - bounds.top) / Math.max(bounds.height, 1);
+        activeSurface.style.setProperty("--tilt-x", `${((.5 - localY) * 2).toFixed(2)}deg`);
+        activeSurface.style.setProperty("--tilt-y", `${((localX - .5) * 2.4).toFixed(2)}deg`);
+        activeSurface.style.setProperty("--glow-x", `${(localX * 100).toFixed(1)}%`);
+        activeSurface.style.setProperty("--glow-y", `${(localY * 100).toFixed(1)}%`);
+    };
+
+    document.addEventListener("pointermove", event => {
+        pointerX = event.clientX;
+        pointerY = event.clientY;
+        const nextSurface = event.target.closest(".music-card, .music-row, .album-card, .clip-library-row");
+        if (nextSurface !== activeSurface) {
+            activeSurface?.classList.remove("is-pointer-lit");
+            activeSurface?.style.removeProperty("--tilt-x");
+            activeSurface?.style.removeProperty("--tilt-y");
+            activeSurface = nextSurface;
+            activeSurface?.classList.add("is-pointer-lit");
+        }
+        if (!frame) frame = requestAnimationFrame(paint);
+    }, { passive: true });
+
+    document.addEventListener("pointerout", event => {
+        if (event.relatedTarget || !activeSurface) return;
+        activeSurface.classList.remove("is-pointer-lit");
+        activeSurface = null;
+    });
+}
+
+
+/* =========================================================
    初始化
 ========================================================= */
 
@@ -7772,6 +8375,7 @@ async function init() {
         setSidebarCollapsed(getSavedSidebarCollapsed(), { persist: false });
         setupThemeSwitcher();
         setupEvents();
+        setupSpatialMotion();
 
         renderFilterPanel();
         renderSelectionToolbar();
