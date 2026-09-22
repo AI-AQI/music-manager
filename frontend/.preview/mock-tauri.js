@@ -36,6 +36,7 @@
         { id: 8, name: "快节奏", categoryId: 3, category: "节奏", parentId: null, path: "快节奏", musicCount: 1 }
     ];
     const candidates = [{ targetId: "m03", kind: "music" }];
+    const albumTags = new Map([["城市速写", [4, 5]], ["Midnight Tapes", [2]]]);
 
     const svgCover = (seed, ch) => "data:image/svg+xml;utf8," + encodeURIComponent(
         `<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256"><defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="hsl(${seed},52%,70%)"/><stop offset="1" stop-color="hsl(${(seed + 45) % 360},48%,40%)"/></linearGradient></defs><rect width="256" height="256" fill="url(#g)"/><text x="128" y="152" font-size="96" text-anchor="middle" fill="rgba(255,255,255,.88)" font-family="serif">${ch}</text></svg>`);
@@ -60,6 +61,21 @@
             case "list_tag_category_records": return categories;
             case "list_tag_categories": return categories.map(c => c.name);
             case "list_candidates": return candidates;
+            case "list_album_tags":
+                return [...albumTags.entries()].map(([album, tagIds]) => ({ album, tagIds }));
+            case "set_album_tags": {
+                const ids = [...(args.tagIds || [])];
+                (args.newTags || []).forEach(name => {
+                    const id = Math.max(0, ...tags.map(t => t.id)) + 1;
+                    tags.push({ id, name, categoryId: 4, category: "", parentId: null, path: name, musicCount: 0 });
+                    ids.push(id);
+                });
+                albumTags.set(args.album, ids);
+                return ids;
+            }
+            case "delete_album_tags":
+                albumTags.delete(args.album);
+                return null;
             case "file_exists": return true;
             case "find_existing_music_paths": return [];
             case "probe_file": return { exists: false };

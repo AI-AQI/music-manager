@@ -1008,9 +1008,10 @@ pub fn list_tags(state: tauri::State<'_, AppState>) -> Result<Vec<TagRecord>, St
     let conn = lock_db!(state);
     let mut stmt = conn.prepare(
         "WITH RECURSIVE tree(id, path) AS (SELECT t.id, t.name FROM tags t WHERE t.parent_id IS NULL UNION ALL SELECT t.id, tree.path || ' / ' || t.name FROM tags t JOIN tree ON t.parent_id=tree.id) \
-         SELECT t.id, t.name, t.category_id, CASE WHEN c.name='未分类' THEN '' ELSE c.name END, t.parent_id, tree.path, COUNT(DISTINCT mt.music_id) + COUNT(DISTINCT ct.clip_id) AS music_count \
+         SELECT t.id, t.name, t.category_id, CASE WHEN c.name='未分类' THEN '' ELSE c.name END, t.parent_id, tree.path, COUNT(DISTINCT mt.music_id) + COUNT(DISTINCT ct.clip_id) + COUNT(DISTINCT at.album) AS music_count \
          FROM tags t LEFT JOIN music_tags mt ON mt.tag_id = t.id \
          LEFT JOIN clip_tags ct ON ct.tag_id = t.id \
+         LEFT JOIN album_tags at ON at.tag_id = t.id \
          JOIN tag_categories c ON c.id=t.category_id JOIN tree ON tree.id=t.id \
          GROUP BY t.id, t.name, t.category_id, c.name, t.parent_id, tree.path \
          ORDER BY c.name COLLATE NOCASE, tree.path COLLATE NOCASE"
@@ -1219,6 +1220,67 @@ fn move_tag_in(conn: &mut rusqlite::Connection, id: i64, parent_id: Option<i64>,
     Ok(())
 }
 
+/* 专辑 Tag：专辑以名字为键（库里没有专辑实体），关联行挂在 album_tags 上。
+   Finder 改名的跟随迁移见 sync_library_locations / apply_album_renames。 */
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AlbumTagEntry {
+    album: String,
+    tag_ids: Vec<i64>,
+}
+
+#[tauri::command]
+pub fn list_album_tags(state: tauri::State<'_, AppState>) -> Result<Vec<AlbumTagEntry>, String> {
+    let conn = lock_db!(state);
+    let map = load_all_tag_ids(&conn, "album_tags", "album")?;
+    let mut entries: Vec<AlbumTagEntry> = map
+        .into_iter()
+        .map(|(album, tag_ids)| AlbumTagEntry { album, tag_ids })
+        .collect();
+    entries.sort_by(|a, b| a.album.cmp(&b.album));
+    Ok(entries)
+}
+
+#[tauri::command]
+pub fn set_album_tags(
+    state: tauri::State<'_, AppState>,
+    album: String,
+    tag_ids: Vec<i64>,
+    new_tags: Vec<String>,
+) -> Result<Vec<i64>, String> {
+    let album = album.trim().to_string();
+    if album.is_empty() {
+        return Err("专辑名不能为空".into());
+    }
+    let conn = lock_db!(state);
+    sync_tag_ids(&conn, &album, &tag_ids, &new_tags, "album_tags", "album")?;
+    load_tag_ids(&conn, &album, "album_tags", "album")
+}
+
+#[tauri::command]
+pub fn delete_album_tags(state: tauri::State<'_, AppState>, album: String) -> Result<(), String> {
+    let conn = lock_db!(state);
+    conn.execute("DELETE FROM album_tags WHERE album=?1", params![album])
+        .map_err(|e| format!("删除专辑 Tag 失败: {e}"))?;
+    Ok(())
+}
+
+/// 专辑随 Finder 文件夹改名后，专辑 Tag 跟到新名字：先 OR IGNORE 合并
+/// （新名字下已有同 Tag 的冲突行保持不动），再删掉仍挂在旧名字下的剩余行。
+fn apply_album_renames(conn: &rusqlite::Connection, renames: &HashMap<String, String>) -> Result<(), String> {
+    for (old, new) in renames {
+        if old == new {
+            continue;
+        }
+        conn.execute("UPDATE OR IGNORE album_tags SET album=?1 WHERE album=?2", params![new, old])
+            .map_err(|e| format!("迁移专辑 Tag 失败: {e}"))?;
+        conn.execute("DELETE FROM album_tags WHERE album=?1", params![old])
+            .map_err(|e| format!("清理专辑 Tag 失败: {e}"))?;
+    }
+    Ok(())
+}
+
 #[tauri::command]
 pub fn list_candidates(state: tauri::State<'_, AppState>) -> Result<Vec<CandidateEntry>, String> {
     let conn = lock_db!(state);
@@ -1303,6 +1365,7 @@ pub fn sync_library_locations(state: tauri::State<'_, AppState>) -> Result<Locat
 
     let mut result = LocationSyncResult { updated_paths: 0, updated_albums: 0 };
     let mut updates = Vec::new();
+    let mut album_renames: HashMap<String, String> = HashMap::new();
     for (id, old_path, old_album, old_source, bookmark) in entries {
         let mut source = old_source.clone();
         let resolved = match bookmark.as_deref().filter(|data| !data.is_empty()) {
@@ -1332,6 +1395,9 @@ pub fn sync_library_locations(state: tauri::State<'_, AppState>) -> Result<Locat
         if path_changed || album_changed || source_changed || bookmark_changed {
             result.updated_paths += usize::from(path_changed);
             result.updated_albums += usize::from(album_changed);
+            if album_changed {
+                album_renames.insert(old_album.clone(), album.clone());
+            }
             updates.push((path, file_name, refreshed_bookmark, album, source, id));
         }
     }
@@ -1344,6 +1410,8 @@ pub fn sync_library_locations(state: tauri::State<'_, AppState>) -> Result<Locat
                 params![path, file_name, bookmark, album, source, now_ms(), id],
             ).map_err(|e| format!("写入同步位置失败: {e}"))?;
         }
+        // 专辑 Tag 以名字为键，文件夹改名要跟过去，否则 Tag 悄悄丢在旧名字下。
+        apply_album_renames(&tx, &album_renames)?;
         tx.commit().map_err(|e| format!("提交位置同步失败: {e}"))?;
     }
     Ok(result)
@@ -1454,6 +1522,11 @@ mod tests {
                 tag_id INTEGER NOT NULL REFERENCES tags(id) ON DELETE CASCADE,
                 PRIMARY KEY (clip_id, tag_id)
             );
+            CREATE TABLE album_tags (
+                album TEXT NOT NULL,
+                tag_id INTEGER NOT NULL REFERENCES tags(id) ON DELETE CASCADE,
+                PRIMARY KEY (album, tag_id)
+            );
             INSERT INTO tag_categories (name, created_at) VALUES ('情绪', 1), ('未分类', 2);
             "#,
         ).unwrap();
@@ -1555,6 +1628,34 @@ mod tests {
             .query_map([], |r| r.get(0)).unwrap().collect::<Result<_, _>>().unwrap();
         assert_eq!(linked.len(), 2);
         assert!(linked.contains(&existing));
+    }
+
+    /// 专辑改名时专辑 Tag 要跟到新名字，并和新名字下已有 Tag 合并去重。
+    #[test]
+    fn apply_album_renames_moves_and_merges_tags() {
+        let conn = test_conn();
+        let tag_a = add_tag(&conn, "温暖", "情绪", None);
+        let tag_b = add_tag(&conn, "人声", "情绪", None);
+        conn.execute("INSERT INTO album_tags (album, tag_id) VALUES ('旧专辑', ?1)", params![tag_a]).unwrap();
+        conn.execute("INSERT INTO album_tags (album, tag_id) VALUES ('旧专辑', ?1)", params![tag_b]).unwrap();
+        conn.execute("INSERT INTO album_tags (album, tag_id) VALUES ('新专辑', ?1)", params![tag_a]).unwrap();
+
+        let renames = HashMap::from([("旧专辑".to_string(), "新专辑".to_string())]);
+        apply_album_renames(&conn, &renames).unwrap();
+
+        let remaining_old: i64 = conn
+            .query_row("SELECT COUNT(*) FROM album_tags WHERE album='旧专辑'", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(remaining_old, 0, "旧名字下不该再挂 Tag");
+        let mut new_tags: Vec<i64> = conn
+            .prepare("SELECT tag_id FROM album_tags WHERE album='新专辑' ORDER BY tag_id")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        new_tags.sort();
+        assert_eq!(new_tags, vec![tag_a.min(tag_b), tag_a.max(tag_b)], "冲突行应合并去重");
     }
 
     #[test]

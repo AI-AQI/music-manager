@@ -141,6 +141,8 @@
     let hasIntro = false;
     let hasDived = false;
     let pendingStats = null;
+    let emptyDropHandler = null;   // 空落针时由应用侧决定放哪张；返回 true 表示已接管
+    let lastTrackInfo = { title: "", artist: "" };
 
     // 标签配色：档案室=暖琥珀（参考图的橙标），云雾=玫瑰粉
     const LABEL_COLORS = { archive: ["#e08a3c", "#a85f1c"], sky: ["#e98aa6", "#c95d7d"] };
@@ -303,6 +305,62 @@
         state.counterTex.needsUpdate = true;
     }
 
+    /* 防尘盖曲目窗：LCD 风格——半透明深色底条 + 亮色荧光字，
+       烟熏/全透盖、深浅封面上都看得清。无曲目时整窗隐藏。 */
+    function drawLidHud(state) {
+        const c = state.lidHudCanvas;
+        if (!c) return;
+        const x = c.getContext("2d");
+        x.clearRect(0, 0, c.width, c.height);
+        const title = state.trackTitle || "";
+        if (!title) {
+            state.lidHud.visible = false;
+            state.lidHudTex.needsUpdate = true;
+            return;
+        }
+
+        // 底条：圆角深色玻璃（手写圆角，别依赖新 canvas API）
+        const pad = 26, bw = c.width - pad * 2, bh = c.height - pad * 2, r = 40;
+        x.beginPath();
+        x.moveTo(pad + r, pad);
+        x.arcTo(pad + bw, pad, pad + bw, pad + bh, r);
+        x.arcTo(pad + bw, pad + bh, pad, pad + bh, r);
+        x.arcTo(pad, pad + bh, pad, pad, r);
+        x.arcTo(pad, pad, pad + bw, pad, r);
+        x.closePath();
+        x.fillStyle = "rgba(10, 8, 7, .78)";
+        x.fill();
+        x.strokeStyle = state.theme === "sky" ? "rgba(255, 190, 205, .5)" : "rgba(255, 214, 150, .45)";
+        x.lineWidth = 3;
+        x.stroke();
+
+        const main = state.theme === "sky" ? "#ffeef3" : "#ffedcd";
+        const sub = state.theme === "sky" ? "#ffabbf" : "#ffc46e";
+
+        const fit = (text, font, maxWidth) => {
+            x.font = font;
+            if (x.measureText(text).width <= maxWidth) return text;
+            let t = text;
+            while (t.length > 1 && x.measureText(t + "…").width > maxWidth) t = t.slice(0, -1);
+            return t + "…";
+        };
+
+        x.textAlign = "center";
+        x.textBaseline = "middle";
+        x.shadowColor = sub;
+        x.shadowBlur = 16;
+        x.fillStyle = main;
+        x.fillText(fit(title, "600 74px 'Songti SC', serif", 860), 512, 96);
+        const subline = state.trackArtist || "";
+        if (subline) {
+            x.shadowBlur = 10;
+            x.fillStyle = sub;
+            x.fillText(fit(subline, "30px ui-monospace, monospace", 820), 512, 188);
+        }
+        state.lidHud.visible = true;
+        state.lidHudTex.needsUpdate = true;
+    }
+
     // 前立面：青铜拉丝面板 + 刻字
     function drawFrontPanel(state) {
         const c = document.createElement("canvas");
@@ -329,13 +387,12 @@
             x.lineTo(2048, y0 + (Math.random() - .5) * 3);
             x.stroke();
         }
-        x.fillStyle = state.theme === "sky" ? "#f2a9bd" : "#e3c07c";
-        x.font = "600 64px 'Songti SC', serif";
-        x.textAlign = "left";
-        x.fillText("声 场 档 案", 120, 118);
-        x.font = "26px ui-monospace, monospace";
+        /* 不在左侧刻大字：会压住左旋钮。型号行放在左旋钮与计数窗之间的空档。 */
         x.fillStyle = state.theme === "sky" ? "rgba(242,169,189,.72)" : "rgba(227,192,124,.72)";
-        x.fillText("CUT & CUE · STEREO SOUND ARCHIVE · MODEL CC-33", 122, 172);
+        x.font = "26px ui-monospace, monospace";
+        x.textAlign = "left";
+        x.textBaseline = "middle";
+        x.fillText("CUT & CUE · STEREO ARCHIVE", 450, 128);
         const tex = new THREE.CanvasTexture(c);
         tex.encoding = THREE.sRGBEncoding;
         tex.anisotropy = 8;
@@ -353,7 +410,7 @@
             camOffset: { theta: 0, phi: 0, radius: 0 },
             camOffsetTgt: { theta: 0, phi: 0, radius: 0 },
             camTarget: null,
-            needle: "parked",   // "parked"(回架) | "cued"(抬臂待命) | "down"(落针)
+            needle: "parked",   // "parked"(回架) | "down"(落针)
             cur: {
                 recordY: 1.15, speed: 0, armLift: 0, armAngle: -1.59, spin: 0, boost: 0, flash: 0,
                 recordX: 0, scratchV: 0, scratchTime: 0, knobFlick: 0, leverFlick: 0
@@ -370,7 +427,8 @@
             theme: "archive",
             stats: [], statIdx: 0, statTimer: 0,
             awake: false, busy: false, raf: 0,
-            platterTop: 0.78, armPark: -1.59, armPlay: -2.17
+            platterTop: 0.78, armPark: -1.59, armPlay: -2.17,
+            trackTitle: "", trackArtist: ""
         };
 
         const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
@@ -601,6 +659,20 @@
         wand.castShadow = true;
         armSwingG.add(wand);
 
+        /* 隐形加粗热区：臂杆本身太细难点，套一根看不见的粗管跟着臂走，
+           指针判定和 hover 光标都吃它。 */
+        const armHit = new THREE.Mesh(
+            new THREE.TubeGeometry(wandCurve, 20, 0.2, 8),
+            new THREE.MeshBasicMaterial({ transparent: true, opacity: 0, depthWrite: false })
+        );
+        armSwingG.add(armHit);
+        const headshellHit = new THREE.Mesh(
+            new THREE.BoxGeometry(0.6, 0.45, 0.4),
+            armHit.material
+        );
+        headshellHit.position.set(2.45, -0.12, 0.06);
+        armSwingG.add(headshellHit);
+
         const counterweight = new THREE.Mesh(new THREE.CylinderGeometry(0.13, 0.13, 0.24, 32), armMat);
         counterweight.rotation.z = Math.PI / 2;
         counterweight.position.set(-0.62, 0.02, 0);
@@ -764,6 +836,26 @@
         lid.add(lidBadge);
         state.lidBadge = lidBadge;
 
+        /* 盖面上的曲目信息窗：装片后显示歌名 + 艺人，
+           像贴在防尘盖内侧的一行小荧光字。 */
+        state.lidHudCanvas = document.createElement("canvas");
+        state.lidHudCanvas.width = 1024;
+        state.lidHudCanvas.height = 256;
+        state.lidHudTex = new THREE.CanvasTexture(state.lidHudCanvas);
+        state.lidHudTex.encoding = THREE.sRGBEncoding;
+        state.lidHudTex.anisotropy = 4;
+        state.lidHudMat = new THREE.MeshBasicMaterial({
+            map: state.lidHudTex,
+            transparent: true,
+            depthWrite: false
+        });
+        state.lidHud = new THREE.Mesh(new THREE.PlaneGeometry(2.5, 0.62), state.lidHudMat);
+        state.lidHud.position.set(0, 1.95, -0.44);
+        state.lidHud.rotation.x = -0.24;
+        state.lidHud.visible = false;
+        state.lidHud.renderOrder = 2;
+        lid.add(state.lidHud);
+
         /* ---------- LED 电源灯 ---------- */
 
         const ledMat = new THREE.MeshStandardMaterial({ color: 0x5a5142 });
@@ -874,22 +966,9 @@
                         state.scratchAudio = false;
                         audio.volume = state.prevVolume;
                     }
-                    const hit = pointerHit(e);
-                    if (moved < 6 && hit && audio && audio.currentSrc &&
-                        Number.isFinite(audio.duration) && audio.duration > 0) {
-                        // 点轨道带：按盘面半径 seek 到对应段落，针跟着落过去
-                        const r = Math.hypot(
-                            hit.point.x - state.platterPos.x,
-                            hit.point.z - state.platterPos.z
-                        );
-                        const p = radiusToProgress(r);
-                        audio.currentTime = p * audio.duration;
-                        state.cur.armAngleT = grooveAngle(p);
-                        if (audio.paused) {
-                            needleDropSequence(state, () => audio.play().catch(() => {}));
-                        }
-                    } else if (moved < 6) {
-                        // 点按唱片 = 播放/暂停
+                    if (moved < 6) {
+                        // 点按唱片 = 播放/停止（和唱臂同一个两态开关）；
+                        // 想定位段落就按住拖动搓碟
                         togglePlay(state);
                     } else {
                         // 松手带一点甩盘惯性
@@ -912,9 +991,16 @@
             })
         );
 
-        // 滚轮推拉镜头看细节；双击回到设计机位
+        // 滚轮推拉镜头看细节；悬停在旋钮上时滚轮改为调音量
         el.addEventListener("wheel", e => {
             e.preventDefault();
+            const hit = pointerHit(e);
+            if (hit?.object.userData.part === "knob" && audio) {
+                audio.volume = Math.min(1, Math.max(0, audio.volume - e.deltaY * 0.0012));
+                state.flickKnob = hit.object;
+                state.cur.knobFlick = Math.min(1, Math.abs(e.deltaY) * 0.01 + 0.3);
+                return;
+            }
             state.camOffsetTgt.radius = Math.min(3.2, Math.max(-3.4,
                 state.camOffsetTgt.radius + e.deltaY * 0.004));
         }, { passive: false });
@@ -947,11 +1033,6 @@
         return Math.min(1, Math.max(0, audio.currentTime / audio.duration));
     }
 
-    // 盘上半径 → 播放进度（点轨道带选段落）
-    function radiusToProgress(r) {
-        return Math.min(1, Math.max(0, (GROOVE_OUT - r) / (GROOVE_OUT - GROOVE_IN)));
-    }
-
     function ledOn(state) {
         state.ledMat.emissive.setHex(state.theme === "sky" ? 0x63b7cc : 0xe8b34c);
         state.ledMat.emissiveIntensity = 1.2;
@@ -961,18 +1042,10 @@
         state.ledMat.emissive.setHex(0x000000);
     }
 
-    /* 落针：回架 → 抬臂 → 对准当前进度的声槽 → 液压缓落 → 出声。
-       已在槽上方待命（cued）时直接落针。 */
+    /* 落针：回架 → 抬臂 → 对准当前进度的声槽 → 液压缓落 → 出声。 */
     function needleDropSequence(state, cb) {
         if (state.busy) { cb?.(); return; }
         state.busy = true;
-        if (state.needle === "cued") {
-            state.needle = "down";
-            state.cur.armLiftT = 0;
-            ledOn(state);
-            setTimeout(() => { state.busy = false; cb?.(); }, 260);
-            return;
-        }
         state.cur.armLiftT = 0.16;
         state.cur.speedT = FULL_SPEED;   // 转盘先转起来，再落针
         setTimeout(() => { state.cur.armAngleT = grooveAngle(playProgress()); }, 380);
@@ -982,13 +1055,6 @@
             ledOn(state);
         }, 1080);
         setTimeout(() => { state.busy = false; cb?.(); }, 1250);
-    }
-
-    /* 抬臂暂离：针抬起留在当前声槽上方，转盘不停——黑胶的「暂停」。 */
-    function needleCueUp(state) {
-        if (state.needle !== "down") return;
-        state.needle = "cued";
-        state.cur.armLiftT = 0.16;
     }
 
     /* 回架停转：抬臂 → 摆回臂架 → 落架 → 转盘缓停。 */
@@ -1013,8 +1079,22 @@
         }, 1000);
     }
 
-    /* 点唱片 / 唱臂 / 拨杆：有真实曲目就播放/暂停（暂停 = 抬臂暂离），
-       没有就进入演示态——唱臂落下、转盘转起来。 */
+    /* 没装片时点了播放：优先让应用侧决定放哪张（比如最近添加），
+       应用侧没接管（曲库为空）就进演示态——唱臂落下、转盘空转。 */
+    function handleNoTrack(state) {
+        if (state.demo) {
+            state.demo = false;
+            needleParkSequence(state);
+            return;
+        }
+        if (emptyDropHandler && emptyDropHandler() === true) return;
+        state.demo = true;
+        needleDropSequence(state);
+    }
+
+    /* 点唱臂 / 盘面 / 拨杆都是同一个两态开关：
+       停 → 落针、LED 亮、转盘起转、出声；
+       播 → 收针回架、LED 灭、转盘缓停、停声。 */
     function togglePlay(state) {
         if (audio && audio.currentSrc) {
             if (audio.paused) {
@@ -1024,12 +1104,7 @@
             }
             return;
         }
-        state.demo = !state.demo;
-        if (state.demo) {
-            needleDropSequence(state);
-        } else {
-            needleParkSequence(state);
-        }
+        handleNoTrack(state);
     }
 
     function playIntro(state) {
@@ -1066,13 +1141,13 @@
         state.camera.updateProjectionMatrix();
 
         /* 取景适配：FOV 只管垂直方向，容器越扁整机越容易被上下裁掉。
-           垂直项按斜俯机位反推——机位俯角约 21°，防尘盖顶比机位中心高 3.4
-           个单位，半径拉到 ≈12.8 时盖顶落在画面上半区 90% 处，既不被顶栏
-           裁掉，机身底部也刚好停在标题区上方；水平项保证木框加唱臂入画。 */
+           垂直项按斜俯机位反推——机位俯角约 21°，防尘盖顶比注视点高约 3.1
+           个单位（注视点已下移 0.3），留 ~0.5 余量保证盖顶不被顶栏裁掉；
+           水平项保证木框加唱臂入画。 */
         const halfTan = Math.tan(state.camera.fov * Math.PI / 360);
         state.camBase.radius = Math.max(
-            3.92 / halfTan,
-            3.9 / (halfTan * state.camera.aspect)
+            3.58 / halfTan,
+            3.55 / (halfTan * state.camera.aspect)
         );
     }
 
@@ -1083,8 +1158,7 @@
         cur.recordY += ((cur.recordYT ?? 0) - cur.recordY) * 0.055;
         cur.recordX += ((cur.recordXT ?? 0) - cur.recordX) * 0.055;
 
-        /* 电机逻辑：落针播放、抬臂待命（cued）、演示态都是满速 33⅓；
-           回架后用 speedT 缓停到 0。 */
+        /* 电机逻辑：落针播放、演示态都是满速 33⅓；回架后用 speedT 缓停到 0。 */
         const motorOn = isPlaying() || state.demo || state.needle !== "parked";
         const speedTgt = (state.scratching ? 0 : (motorOn ? FULL_SPEED : (cur.speedT ?? 0))) + cur.boost;
         cur.speed += (speedTgt - cur.speed) * 0.02;
@@ -1119,6 +1193,14 @@
         state.recordGroup.rotation.y = cur.spin;
         state.armLiftG.position.y = 0.42 + cur.armLift;
         state.armSwingG.rotation.y = cur.armAngle;
+
+        /* 待机呼吸：完全停机时 LED 缓慢起伏，暗示「可以点我」；
+           落针播放 / 演示空转时由 ledOn 常亮接管。 */
+        if (state.needle === "parked" && !state.demo && !isPlaying()) {
+            const t = performance.now() / 1000;
+            state.ledMat.emissive.setHex(state.theme === "sky" ? 0x63b7cc : 0xe8b34c);
+            state.ledMat.emissiveIntensity = 0.2 + 0.16 * (0.5 + 0.5 * Math.sin(t * 1.6));
+        }
 
         /* 旋钮拧动 / 拨杆回弹 */
         if (state.flickKnob && cur.knobFlick > 0.02) {
@@ -1172,9 +1254,12 @@
         if (!S) {
             S = buildScene(container);
             S.theme = document.body.dataset.theme === "sky" ? "sky" : "archive";
+            S.trackTitle = lastTrackInfo.title;
+            S.trackArtist = lastTrackInfo.artist;
             applyTheme(S);
             drawRecord(S);
             drawCounter(S);
+            drawLidHud(S);
             container.appendChild(S.renderer.domElement);
 
             if (audio && !audio.paused && audio.currentSrc) {
@@ -1207,13 +1292,8 @@
                 S.cur.armAngle = S.cur.armAngleT = grooveAngle(playProgress());
                 S.cur.armLift = S.cur.armLiftT = 0;
                 ledOn(S);
-            } else if (audio && audio.currentSrc) {
-                // 暂停待命：针抬在当前声槽上方，转盘不停
-                S.needle = "cued";
-                S.cur.armAngle = S.cur.armAngleT = grooveAngle(playProgress());
-                S.cur.armLift = S.cur.armLiftT = 0.16;
-                ledOn(S);
             } else {
+                // 没在播：无论暂停还是收针停止，针都待在臂架上
                 S.needle = "parked";
                 S.cur.armAngle = S.cur.armAngleT = S.armPark;
                 S.cur.armLift = S.cur.armLiftT = 0;
@@ -1297,7 +1377,18 @@
         }
     }
 
-    function setTrack({ coverArt, grooveUrl } = {}) {
+    function setTrack({ coverArt, grooveUrl, title, artist } = {}) {
+        /* 曲目信息窗：title/artist 任一显式给出（含空串）就刷新盖子上的显示；
+           唱机还没挂载时先记着，mount 时补上。 */
+        if (title !== undefined || artist !== undefined) {
+            lastTrackInfo = { title: title || "", artist: artist || "" };
+            if (S) {
+                S.trackTitle = lastTrackInfo.title;
+                S.trackArtist = lastTrackInfo.artist;
+                drawLidHud(S);
+                if (reducedMotion.matches) frame(S);
+            }
+        }
         if (coverArt) {
             miniSetCover(coverArt);
             const img = new Image();
@@ -1357,7 +1448,7 @@
             state.renderer.setClearColor(0xe9f1f5, 0);
             // 与背景照片的桌面视角对齐：镜头放平一点、机位压低一点
             state.camBase.phi = 1.3;
-            state.camTarget.y = 0.9;
+            state.camTarget.y = 1.2;
             state.keyLight.color.setHex(0xffe8dc);
             state.keyLight.intensity = 1.15;
         } else {
@@ -1395,7 +1486,7 @@
             state.lidMat.envMapIntensity = 1.4;
             state.renderer.setClearColor(0x000000, 0);
             state.camBase.phi = 1.2;
-            state.camTarget.y = 0.6;
+            state.camTarget.y = 0.9;
             state.keyLight.color.setHex(0xffd9a0);
             state.keyLight.intensity = 1.35;
         }
@@ -1410,6 +1501,7 @@
         state.frontMat.needsUpdate = true;
         drawRecord(state);
         drawCounter(state);
+        drawLidHud(state);
         if (reducedMotion.matches) frame(state);
     }
 
@@ -1428,8 +1520,10 @@
     }
 
     /* 换唱片：针回架 → 旧片升起滑出 → 换标签/波形 → 新片落下。
-       cb 在新片落稳后触发（调用方决定何时落针出声）。 */
-    function swapRecord(track = {}, cb) {
+       cb 在新片落稳后触发（调用方决定何时落针出声）。
+       keepRecord：调用方已经用 DOM 做了「飞片上机」，旧片原地换纹理，
+       不再升起滑出——否则用户会看着刚飞到的唱片又自己飞走。 */
+    function swapRecord(track = {}, cb, { keepRecord = false } = {}) {
         if (!S) { cb?.(); return; }
         if (reducedMotion.matches || !S.awake) {
             setTrack(track);
@@ -1449,6 +1543,28 @@
             S.cur.armAngleT = S.armPark;
         }
 
+        if (keepRecord) {
+            /* DOM 飞片约 0.7s 落到转盘，贴着落点换纹理、转不停 */
+            setTimeout(() => {
+                S.coverImg = null;
+                if (track.coverArt) {
+                    setTrack(track);
+                } else {
+                    setTrack({ grooveUrl: track.grooveUrl, title: track.title, artist: track.artist });
+                    drawRecord(S);
+                    miniSetCover(null);
+                }
+            }, t0 + 560);
+            setTimeout(() => {
+                S.needle = "parked";
+                S.cur.armLiftT = 0;
+                ledOff(S);
+                S.busy = false;
+                cb?.();
+            }, t0 + 700);
+            return;
+        }
+
         // 旧片升起并向左滑出
         setTimeout(() => {
             S.cur.recordYT = 1.5;
@@ -1462,7 +1578,7 @@
             if (track.coverArt) {
                 setTrack(track);
             } else {
-                setTrack({ grooveUrl: track.grooveUrl });
+                setTrack({ grooveUrl: track.grooveUrl, title: track.title, artist: track.artist });
                 drawRecord(S);
                 miniSetCover(null);
             }
@@ -1506,14 +1622,8 @@
         audio.addEventListener("pause", () => {
             playing = false;
             miniKick();
-            // 暂停 = 抬臂暂离，转盘不停；曲目被卸载才回架
-            if (S && S.awake && S.needle === "down") {
-                if (audio.currentSrc) {
-                    needleCueUp(S);
-                } else {
-                    needleParkSequence(S);
-                }
-            }
+            // 停止 = 收针回架、转盘缓停（暂停也只有这一种姿态）
+            if (S && S.awake && S.needle !== "parked") needleParkSequence(S);
         });
         audio.addEventListener("ended", () => {
             playing = false;
@@ -1521,9 +1631,14 @@
             // 播完自动回臂、转盘缓停
             if (S && S.awake && S.needle === "down") needleParkSequence(S);
         });
-        // 卸载曲目（关闭播放器）：针回架
+        // 卸载曲目（关闭播放器）：针回架，盖子上的曲目窗也撤掉
         audio.addEventListener("emptied", () => {
-            if (S && S.awake && S.needle !== "parked") needleParkSequence(S);
+            lastTrackInfo = { title: "", artist: "" };
+            if (!S) return;
+            S.trackTitle = "";
+            S.trackArtist = "";
+            drawLidHud(S);
+            if (S.awake && S.needle !== "parked") needleParkSequence(S);
         });
     }
 
@@ -1545,6 +1660,24 @@
         S.camOffsetTgt.theta += delta;
     }
 
+    /* 转盘中心的屏幕坐标（clientX/Y）：唱片墙「飞片上机」的落点。 */
+    function platterScreenPoint() {
+        if (!S || !S.renderer) return null;
+        const rect = S.renderer.domElement.getBoundingClientRect();
+        if (!rect.width || !rect.height) return null;
+        const v = S.platterPos.clone().project(S.camera);
+        return {
+            x: rect.left + (v.x * 0.5 + 0.5) * rect.width,
+            y: rect.top + (-v.y * 0.5 + 0.5) * rect.height
+        };
+    }
+
+    /* 空落针（没装片就点唱臂/唱片）时由应用侧接管选片；
+       处理器返回 true 表示已开始装片，false 则回落到演示空转。 */
+    function setEmptyDropHandler(fn) {
+        emptyDropHandler = typeof fn === "function" ? fn : null;
+    }
+
     window.Turntable = {
         mount,
         sleep,
@@ -1555,6 +1688,8 @@
         diveIn,
         swapRecord,
         dropNeedle,
-        orbit
+        orbit,
+        platterScreenPoint,
+        setEmptyDropHandler
     };
 })();

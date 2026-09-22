@@ -1,0 +1,92 @@
+<svg width="1024" height="1024" viewBox="0 0 1024 1024" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <!-- 圆角方底（macOS squircle 近似） -->
+    <clipPath id="sq"><rect x="0" y="0" width="1024" height="1024" rx="228" ry="228"/></clipPath>
+
+    <radialGradient id="bgG" cx="38%" cy="30%" r="90%">
+      <stop offset="0" stop-color="#262329"/>
+      <stop offset="0.6" stop-color="#1a181d"/>
+      <stop offset="1" stop-color="#100f12"/>
+    </radialGradient>
+
+    <radialGradient id="discG" cx="42%" cy="36%" r="75%">
+      <stop offset="0" stop-color="#211f24"/>
+      <stop offset="0.75" stop-color="#131216"/>
+      <stop offset="1" stop-color="#0a090c"/>
+    </radialGradient>
+
+    <radialGradient id="labelG" cx="40%" cy="34%" r="80%">
+      <stop offset="0" stop-color="#f4aec0"/>
+      <stop offset="1" stop-color="#cf6a89"/>
+    </radialGradient>
+
+    <!-- 盘面缎面高光弧 -->
+    <linearGradient id="sheenG" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0"/>
+      <stop offset="0.45" stop-color="#ffffff" stop-opacity="0"/>
+      <stop offset="0.52" stop-color="#fff2e8" stop-opacity="0.16"/>
+      <stop offset="0.6" stop-color="#ffffff" stop-opacity="0"/>
+      <stop offset="1" stop-color="#ffffff" stop-opacity="0"/>
+    </linearGradient>
+
+    <linearGradient id="armG" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#e8e3d8"/>
+      <stop offset="1" stop-color="#8f8a80"/>
+    </linearGradient>
+
+    <filter id="soft" x="-30%" y="-30%" width="160%" height="160%">
+      <feGaussianBlur stdDeviation="18"/>
+    </filter>
+  </defs>
+
+  <g clip-path="url(#sq)">
+    <!-- 底 -->
+    <rect width="1024" height="1024" fill="url(#bgG)"/>
+
+    <!-- 唱片的落影 -->
+    <ellipse cx="512" cy="556" rx="392" ry="386" fill="#000000" opacity="0.5" filter="url(#soft)"/>
+
+    <!-- 唱片本体 -->
+    <circle cx="512" cy="512" r="382" fill="url(#discG)"/>
+
+    <!-- 声槽 -->
+    <g fill="none" stroke="#ffffff">
+      <circle cx="512" cy="512" r="366" stroke-opacity="0.045" stroke-width="2.5"/>
+      <circle cx="512" cy="512" r="348" stroke-opacity="0.06" stroke-width="2"/>
+      <circle cx="512" cy="512" r="330" stroke-opacity="0.04" stroke-width="3"/>
+      <circle cx="512" cy="512" r="312" stroke-opacity="0.055" stroke-width="2"/>
+      <circle cx="512" cy="512" r="294" stroke-opacity="0.045" stroke-width="2.5"/>
+      <circle cx="512" cy="512" r="276" stroke-opacity="0.06" stroke-width="2"/>
+      <circle cx="512" cy="512" r="258" stroke-opacity="0.04" stroke-width="3"/>
+      <circle cx="512" cy="512" r="240" stroke-opacity="0.055" stroke-width="2"/>
+      <circle cx="512" cy="512" r="222" stroke-opacity="0.045" stroke-width="2.5"/>
+      <circle cx="512" cy="512" r="204" stroke-opacity="0.06" stroke-width="2"/>
+      <circle cx="512" cy="512" r="186" stroke-opacity="0.05" stroke-width="2.5"/>
+    </g>
+
+    <!-- 缎面高光 -->
+    <circle cx="512" cy="512" r="382" fill="url(#sheenG)"/>
+
+    <!-- 标签 -->
+    <circle cx="512" cy="512" r="138" fill="url(#labelG)"/>
+    <circle cx="512" cy="512" r="138" fill="none" stroke="#ffffff" stroke-opacity="0.35" stroke-width="3"/>
+    <text x="512" y="462" font-family="'Songti SC','Noto Serif CJK SC',serif" font-weight="700"
+          font-size="104" text-anchor="middle" fill="#fff8f4" opacity="0.92">声</text>
+
+    <!-- 轴孔 -->
+    <circle cx="512" cy="512" r="14" fill="#0b0a0d"/>
+    <circle cx="512" cy="512" r="14" fill="none" stroke="#ffffff" stroke-opacity="0.22" stroke-width="2"/>
+
+    <!-- 唱臂：右上角落进来 -->
+    <g>
+      <circle cx="852" cy="238" r="52" fill="#2a282e"/>
+      <circle cx="852" cy="238" r="52" fill="none" stroke="#3d3a40" stroke-width="3"/>
+      <circle cx="852" cy="238" r="20" fill="#454149"/>
+      <path d="M 852 238 L 700 430" stroke="url(#armG)" stroke-width="24" stroke-linecap="round" fill="none"/>
+      <g transform="rotate(38 700 430)">
+        <rect x="664" y="412" width="72" height="44" rx="8" fill="#c9c4bb"/>
+        <rect x="676" y="452" width="14" height="26" rx="4" fill="#3a373d"/>
+      </g>
+    </g>
+  </g>
+</svg>

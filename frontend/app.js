@@ -42,6 +42,7 @@ let state = {
     clipsPanelMusic: null,
     playOnRowClick: true,
     quickTagMusicId: null,
+    quickTagAlbumKey: null,
     quickTagSuggestions: [],
 
     importFiles: [],
@@ -90,8 +91,12 @@ let importAlbumNameScrollTimer = null;
 let importAlbumNameScrollElement = null;
 let locationSyncPromise = null;
 let tagRecordsCache = [];
+/* 专辑名 → [tagId]。专辑没有独立实体，Tag 关联按专辑名存（后端 album_tags 表）。 */
+let albumTagsCache = new Map();
 let searchRenderTimer = null;
 let albumFilterTimer = null;
+/* IME（中文/日文输入法）组词期间不入库筛选，避免拼音串先触发重渲染把候选框顶掉 */
+let albumFilterComposing = false;
 const libraryCache = { music: null, clips: null };
 const coverArtCache = new Map();
 const PAGE_SIZE = 50;
@@ -156,6 +161,24 @@ function restoreCatalogScroll({ list = 0, detail = 0 } = {}) {
         const catalogDetail = document.querySelector(".catalog-detail");
         if (catalogList) catalogList.scrollTop = list;
         if (catalogDetail) catalogDetail.scrollTop = detail;
+    });
+}
+
+/* 快速打 Tag 后的重渲染不该挪动任何滚动位置：目录视图的两个滚动列
+   每次 render 都会重建，主列表滚动容器也可能被内容替换重置，
+   统一在渲染后恢复到原处。 */
+async function renderPreservingScroll() {
+    const mainTop = document.querySelector(".main-scroll-area")?.scrollTop ?? 0;
+    const listTop = document.querySelector(".catalog-list")?.scrollTop ?? 0;
+    const detailTop = document.querySelector(".catalog-detail")?.scrollTop ?? 0;
+    await render();
+    requestAnimationFrame(() => {
+        const main = document.querySelector(".main-scroll-area");
+        if (main) main.scrollTop = mainTop;
+        const list = document.querySelector(".catalog-list");
+        if (list) list.scrollTop = listTop;
+        const detail = document.querySelector(".catalog-detail");
+        if (detail) detail.scrollTop = detailTop;
     });
 }
 
@@ -451,6 +474,8 @@ async function refreshLocationsAfterFinderChanges() {
         const selectedMusicId = state.selectedMusic?.id;
         await updateCounts();
         await renderSidebarTags();
+        // Finder 改名会让专辑 Tag 迁到新名字，缓存也要跟着刷新。
+        await loadAlbumTags();
         await render();
         if (selectedMusicId) await openDetail(selectedMusicId);
     })();
@@ -590,7 +615,7 @@ function renderInlineMusicTags(item) {
 }
 
 async function saveQuickTag(musicId, rawValue, tagId = null) {
-    const selected = Number.isInteger(Number(tagId)) && tagId !== null
+    let selected = Number.isInteger(Number(tagId)) && tagId !== null
         ? tagRecordsCache.find(item => item.id === Number(tagId))
         : null;
     const tag = selected?.name || normalizeTag(rawValue);
@@ -599,11 +624,17 @@ async function saveQuickTag(musicId, rawValue, tagId = null) {
         return;
     }
 
+    /* 手输入的名字命中已有 Tag 时直接关联它，而不是按新 Tag 处理。 */
+    if (!selected) {
+        const typed = tag.toLowerCase();
+        selected = tagRecordsCache.find(item => item.name.toLowerCase() === typed) || null;
+    }
+
     const music = await dbGet("music", musicId);
     if (!music) return;
     if ((selected && (music.tagIds || []).includes(selected.id)) || (!selected && (music.tags || []).includes(tag))) {
         state.quickTagMusicId = null;
-        await render();
+        await renderPreservingScroll();
         showToast("该 Tag 已添加");
         return;
     }
@@ -616,8 +647,94 @@ async function saveQuickTag(musicId, rawValue, tagId = null) {
     await updateCounts();
     await renderSidebarTags();
     await renderFilterPanel();
-    await render();
+    await renderPreservingScroll();
     showToast(`已添加 #${tag}`);
+}
+
+
+/* =========================================================
+   专辑 Tag（专辑页右侧标题下方）
+   与音乐的快速 Tag 同一套交互：选已有 Tag 或直接输入新 Tag。
+========================================================= */
+
+function renderAlbumTags(album) {
+    const tagIds = albumTagsCache.get(album) || [];
+    const chips = tagIds
+        .map(id => {
+            const record = tagRecordsCache.find(tag => tag.id === id);
+            if (!record) return "";
+            return `<span class="tag album-tag" title="${escapeHTML(record.path || record.name)}">#${escapeHTML(record.name)}<button type="button" class="album-tag-remove" data-album-tag-remove="${id}" data-album="${escapeHTML(album)}" title="从专辑移除该 Tag" aria-label="从专辑移除 Tag ${escapeHTML(record.name)}">×</button></span>`;
+        })
+        .join("");
+
+    const editing = state.quickTagAlbumKey === album;
+    const used = new Set(tagIds.filter(Number.isInteger));
+    const grouped = new Map();
+    state.quickTagSuggestions
+        .filter(tag => !used.has(tag.id))
+        .forEach(tag => {
+            const category = tag.category || "未分类";
+            if (!grouped.has(category)) grouped.set(category, []);
+            grouped.get(category).push(tag);
+        });
+    const options = [...grouped.entries()].map(([category, categoryTags]) =>
+        `<optgroup label="${escapeHTML(category)}">${categoryTags.map(tag => `<option value="${tag.id}">#${escapeHTML(tag.path)}</option>`).join("")}</optgroup>`
+    ).join("");
+
+    return `${chips}<button type="button" class="quick-tag-button" data-action="album-quick-tag" data-album="${escapeHTML(album)}" title="为这张专辑添加 Tag">＋ Tag</button>${editing ? `<span class="quick-tag-editor"><select data-album-tag-select aria-label="选择已有 Tag"><option value="">选择已有 Tag</option>${options}</select><input data-album-tag-input type="text" placeholder="新 Tag，按 Enter" aria-label="输入新 Tag"><button type="button" data-action="album-quick-tag-save" data-album="${escapeHTML(album)}" title="保存新 Tag">添加</button></span>` : ""}`;
+}
+
+async function saveAlbumQuickTag(album, rawValue, tagId = null) {
+    if (!album) return;
+    let selected = Number.isInteger(Number(tagId)) && tagId !== null
+        ? tagRecordsCache.find(item => item.id === Number(tagId))
+        : null;
+    const tag = selected?.name || normalizeTag(rawValue);
+    if (!tag) {
+        showToast("请输入 Tag 名称");
+        return;
+    }
+
+    /* 手输入的名字命中已有 Tag 时直接关联它，而不是按新 Tag 处理。 */
+    if (!selected) {
+        const typed = tag.toLowerCase();
+        selected = tagRecordsCache.find(item => item.name.toLowerCase() === typed) || null;
+    }
+
+    const current = albumTagsCache.get(album) || [];
+    const duplicated = selected
+        ? current.includes(selected.id)
+        : current.some(id => tagRecordsCache.find(record => record.id === id)?.name === tag);
+    if (duplicated) {
+        state.quickTagAlbumKey = null;
+        await renderPreservingScroll();
+        showToast("该 Tag 已添加");
+        return;
+    }
+
+    const tagIds = await invoke("set_album_tags", {
+        album,
+        tagIds: selected ? [...current, selected.id] : current,
+        newTags: selected ? [] : [tag]
+    });
+    albumTagsCache.set(album, tagIds);
+    state.quickTagAlbumKey = null;
+    await updateCounts();
+    await renderSidebarTags();
+    await renderFilterPanel();
+    await renderPreservingScroll();
+    showToast(`已添加 #${tag}`);
+}
+
+async function removeAlbumTag(album, tagId) {
+    const current = albumTagsCache.get(album) || [];
+    const tagIds = await invoke("set_album_tags", {
+        album,
+        tagIds: current.filter(id => id !== tagId),
+        newTags: []
+    });
+    albumTagsCache.set(album, tagIds);
+    await renderPreservingScroll();
 }
 
 function getErrorMessage(error) {
@@ -840,6 +957,14 @@ async function showMessage(message, title = "提示", kind = "info") {
 async function getAllTagRecords() {
     tagRecordsCache = await invoke("list_tags");
     return tagRecordsCache;
+}
+
+async function loadAlbumTags() {
+    const entries = await invoke("list_album_tags");
+    albumTagsCache = new Map(
+        entries.map(entry => [entry.album, entry.tagIds || []])
+    );
+    return albumTagsCache;
 }
 
 
@@ -1607,9 +1732,7 @@ function renderHome(music, clips) {
 
             <div class="home-bokeh" aria-hidden="true"></div>
 
-            <div class="home-stage" id="homeStage">
-                <span class="home-stage-hint" aria-hidden="true">点唱片播放 · 搓碟 · 拖拽旋转 · 滚轮缩放 · 双击复位</span>
-            </div>
+            <div class="home-stage" id="homeStage"></div>
 
             <div class="home-kicker">CUT &amp; CUE · SOUND LIBRARY</div>
 
@@ -1635,23 +1758,20 @@ function renderHome(music, clips) {
             <!-- 宽屏 editorial 构图：左标题块（窄屏隐藏，用上面的居中版） -->
             <div class="home-editorial">
                 <h1 class="home-ed-title">声场档案</h1>
-                <p class="home-ed-eng">CUT &amp; CUE · SOUND LIBRARY</p>
-                <p class="home-ed-sub">剪辑、标记、归档<br>你的本地音乐声场。</p>
                 <p class="home-ed-script">Good Music<br>Lives Longer.</p>
+                <button class="home-ed-enter" type="button" data-home-action="browse">进入曲库 →</button>
             </div>
 
-            <!-- 唱机上的悬浮提示胶囊：首次拖动/播放后淡出 -->
+            <!-- 唱机上的悬浮提示胶囊：只在首次访问显示，碰过唱机后永久消失 -->
             <div class="stage-tip stage-tip-left" aria-hidden="true">⟳&nbsp;拖动旋转</div>
             <div class="stage-tip stage-tip-right" aria-hidden="true">◉&nbsp;放下唱针</div>
 
-            <div class="stage-orbit">
-                <button class="orbit-btn" type="button" data-orbit="-1" aria-label="向左环绕">‹</button>
-                <span class="orbit-label">360°</span>
-                <button class="orbit-btn" type="button" data-orbit="1" aria-label="向右环绕">›</button>
-            </div>
-
-            <div class="home-corner home-corner-l" aria-hidden="true">A LIBRARY<br>FOR BETTER EARS.</div>
-            <div class="home-corner home-corner-r" aria-hidden="true">MUSIC LIVES<br>IN DETAILS.</div>
+            ${music.length === 0 ? `
+            <!-- 空库引导：新用户第一眼知道该干嘛 -->
+            <div class="home-empty">
+                <p>唱片机上还没有唱片</p>
+                <button class="primary-btn" type="button" data-home-action="import">导入第一张唱片 →</button>
+            </div>` : ""}
 
             <aside class="vinyl-wall" id="vinylWall" aria-label="唱片墙">
                 <div class="wall-head">
@@ -1680,27 +1800,45 @@ function renderHome(music, clips) {
 
     const area = $("contentArea");
 
-    area.querySelector('[data-home-action="browse"]')
-        .addEventListener("click", () => goToViewFromHome("all"));
+    area.querySelectorAll('[data-home-action="browse"]')
+        .forEach(btn => btn.addEventListener("click", () => goToViewFromHome("all")));
 
     area.querySelector('[data-home-action="recent"]')
         .addEventListener("click", () => goToViewFromHome("recent"));
 
-    // 环绕机位按钮 + 提示胶囊首次交互后淡出
-    area.querySelectorAll(".orbit-btn").forEach(btn => {
-        btn.addEventListener("click", () => {
-            window.Turntable?.orbit(Number(btn.dataset.orbit) * 0.55);
-        });
-    });
-    $("homeStage").addEventListener("pointerdown", () => {
-        area.querySelector(".home-hero").classList.add("tips-seen");
-    }, { once: true });
+    area.querySelector('[data-home-action="import"]')
+        ?.addEventListener("click", () => $("importBtn")?.click());
+
+    /* 提示胶囊只在第一次进首页时显示；碰过唱机（拖/点）或从墙上
+       点过歌之后永久消失（localStorage 记住），老用户首页是干净的。 */
+    const hero = area.querySelector(".home-hero");
+    if (localStorage.getItem("sfHomeTipsSeen")) {
+        hero.classList.add("tips-seen");
+    } else {
+        $("homeStage").addEventListener("pointerdown", () => {
+            localStorage.setItem("sfHomeTipsSeen", "1");
+            hero.classList.add("tips-seen");
+        }, { once: true });
+    }
 
     setupCrate(area, music);
     setupVinylWall(area, music);
 
     if (window.Turntable) {
         window.Turntable.mount($("homeStage"));
+        /* 没装片就落针：自动装最近添加的那一首，并从墙上飞片上机 */
+        window.Turntable.setEmptyDropHandler?.(() => {
+            const latest = wallList[0];
+            if (!latest) {
+                showToast("曲库还是空的，先导入曲目");
+                return false;
+            }
+            const frame = document.querySelector(
+                `.vinyl-frame[data-music-id="${CSS.escape(latest.id)}"]`
+            );
+            void swapToMusic(latest, { fromEl: frame?.querySelector(".vinyl-box") }).catch(console.error);
+            return true;
+        });
         window.Turntable.setProgram({
             counts: {
                 tracks: music.length,
@@ -1809,8 +1947,39 @@ function setupCrate(area, music) {
     });
 }
 
+/* 唱片从墙上（或任意元素）飞到唱机转盘的 DOM 动画：
+   克隆一张唱片掠过屏幕，落点由唱机投影给出，到位时正好
+   碰上唱机换片动画里新片落下，看起来像真的装上了机。 */
+function flyRecordToStage(fromEl, coverArt) {
+    if (!fromEl || !window.Turntable?.platterScreenPoint) return;
+    if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) return;
+    const target = window.Turntable.platterScreenPoint();
+    if (!target) return;
+
+    const from = fromEl.getBoundingClientRect();
+    if (!from.width || !from.height) return;
+    const size = Math.min(from.width, from.height);
+
+    const disc = document.createElement("div");
+    disc.className = "vinyl-fly";
+    if (coverArt) disc.style.setProperty("--fly-cover", `url("${coverArt}")`);
+    disc.style.left = `${from.left + (from.width - size) / 2}px`;
+    disc.style.top = `${from.top + (from.height - size) / 2}px`;
+    disc.style.width = disc.style.height = `${size}px`;
+    document.body.appendChild(disc);
+
+    const dx = target.x - (from.left + from.width / 2);
+    const dy = target.y - (from.top + from.height / 2);
+    requestAnimationFrame(() => {
+        disc.style.transform = `translate(${dx}px, ${dy}px) rotate(320deg) scale(0.45)`;
+        disc.style.opacity = "0.2";
+    });
+    disc.addEventListener("transitionend", () => disc.remove(), { once: true });
+    setTimeout(() => disc.remove(), 1400); // 兜底：过渡被打断也别留残影
+}
+
 /* 选片即点歌：装载（不出声）→ 唱机换片 → 落针出声 */
-async function swapToMusic(music) {
+async function swapToMusic(music, { fromEl } = {}) {
 
     await playMusic(music.id, { deferPlay: true });
 
@@ -1822,11 +1991,15 @@ async function swapToMusic(music) {
         return;
     }
 
+    if (fromEl) flyRecordToStage(fromEl, cover);
+
+    /* 有飞片动画时唱机原地换纹理（keepRecord），别让旧片再向左飞出 */
     window.Turntable.swapRecord(
-        { coverArt: cover, grooveUrl: url },
+        { coverArt: cover, grooveUrl: url, title: music.name, artist: music.artist || music.album || "" },
         () => window.Turntable.dropNeedle(() => {
             getAudio().play().catch(() => {});
-        })
+        }),
+        { keepRecord: !!fromEl }
     );
 }
 
@@ -1941,12 +2114,15 @@ function setupVinylWall(area, music) {
                 $("importBtn")?.click();
                 return;
             }
+            // 点过墙上唱片 = 已经会用了，提示胶囊永久收起
+            localStorage.setItem("sfHomeTipsSeen", "1");
+            frame.closest(".home-hero")?.classList.add("tips-seen");
             /* 点正在播/暂停的那张 = 播放/暂停（针臂编排由唱机自己听音频事件） */
             if (state.player.music?.id === item.id && !state.player.segment) {
                 void togglePlay();
                 return;
             }
-            void swapToMusic(item).catch(console.error);
+            void swapToMusic(item, { fromEl: frame.querySelector(".vinyl-box") }).catch(console.error);
         });
 
         /* hover 微倾：把指针位置转成画框的倾斜角 */
@@ -2437,6 +2613,8 @@ function renderCatalogView(music, clips, type) {
                     </span>
                     ${type === "album" && current.key !== "未设置专辑" ? `<button class="text-btn danger-btn" data-delete-album="${escapeHTML(current.key)}">删除专辑</button>` : ""}
                 </div>
+
+                ${type === "album" && current.key !== "未设置专辑" ? `<div class="catalog-detail-tags">${renderAlbumTags(current.key)}</div>` : ""}
 
                 ${detailContent}
                 ${paginationHTML(musicPage, musicPageKey, "首音乐")}
@@ -3421,7 +3599,8 @@ async function openDetail(id) {
             event => {
 
                 if (
-                    event.key === "Enter"
+                    event.key === "Enter" &&
+                    !event.isComposing
                 ) {
 
                     event.preventDefault();
@@ -3968,11 +4147,11 @@ async function loadAndPlay(music, segment = null, opts = {}) {
         const url =
             convertFileSrc(music.path);
 
-        // 唱机联动：标签换当前曲封面，纹槽换当前曲波形。
+        // 唱机联动：标签换当前曲封面，纹槽换当前曲波形，盖子曲目窗换歌名。
         // deferPlay（唱片箱选片）时纹理由 swapRecord 在换片动画中替换。
         if (window.Turntable && !opts.deferPlay) {
             const cachedCover = music.coverArt || coverArtCache.get(music.id) || "";
-            window.Turntable.setTrack({ grooveUrl: url });
+            window.Turntable.setTrack({ grooveUrl: url, title: music.name, artist: music.artist || music.album || "" });
             if (cachedCover) {
                 window.Turntable.setTrack({ coverArt: cachedCover });
             } else {
@@ -7338,8 +7517,15 @@ function setupEvents() {
                     return;
                 }
 
-                if (event.target.closest("[data-quick-tag-input], [data-quick-tag-select]")) {
+                if (event.target.closest("[data-quick-tag-input], [data-quick-tag-select], [data-album-tag-input], [data-album-tag-select]")) {
                     event.stopPropagation();
+                    return;
+                }
+
+                const albumTagRemove = event.target.closest("[data-album-tag-remove]");
+                if (albumTagRemove) {
+                    event.stopPropagation();
+                    await removeAlbumTag(albumTagRemove.dataset.album, Number(albumTagRemove.dataset.albumTagRemove));
                     return;
                 }
 
@@ -7490,6 +7676,22 @@ function setupEvents() {
                     if (act === "quick-tag-save") {
                         const input = action.closest(".quick-tag-editor")?.querySelector("[data-quick-tag-input]");
                         await saveQuickTag(id, input?.value);
+                        return;
+                    }
+
+                    if (act === "album-quick-tag") {
+                        state.quickTagAlbumKey = action.dataset.album;
+                        state.quickTagSuggestions = await getAllTagRecords();
+                        await render();
+                        requestAnimationFrame(() =>
+                            document.querySelector("[data-album-tag-input]")?.focus()
+                        );
+                        return;
+                    }
+
+                    if (act === "album-quick-tag-save") {
+                        const input = action.closest(".quick-tag-editor")?.querySelector("[data-album-tag-input]");
+                        await saveAlbumQuickTag(action.dataset.album, input?.value);
                         return;
                     }
 
@@ -7667,6 +7869,8 @@ function setupEvents() {
                     const ok = await confirm(`确定删除专辑「${album}」及其 ${ids.length} 首音乐和全部片段吗？此操作无法撤销。`, "删除专辑");
                     if (!ok) return;
                     await invoke("delete_music_batch", { ids });
+                    await invoke("delete_album_tags", { album }).catch(console.error);
+                    albumTagsCache.delete(album);
                     invalidateLibraryCache();
                     state.catalogSelection = null;
                     await updateCounts();
@@ -7700,9 +7904,18 @@ function setupEvents() {
             }
         );
 
-    $("contentArea").addEventListener("input", event => {
+    $("contentArea").addEventListener("compositionstart", event => {
+        if (event.target.closest("[data-album-filter]")) albumFilterComposing = true;
+    });
+
+    $("contentArea").addEventListener("compositionend", event => {
         const input = event.target.closest("[data-album-filter]");
         if (!input) return;
+        albumFilterComposing = false;
+        scheduleAlbumFilter(input);
+    });
+
+    const scheduleAlbumFilter = input => {
         state.albumSearch = input.value;
         state.catalogSelection = null;
         state.pages["catalog:album:groups"] = 1;
@@ -7715,6 +7928,12 @@ function setupEvents() {
                 nextInput.setSelectionRange(nextInput.value.length, nextInput.value.length);
             }
         }, 140);
+    };
+
+    $("contentArea").addEventListener("input", event => {
+        const input = event.target.closest("[data-album-filter]");
+        if (!input || albumFilterComposing || event.isComposing) return;
+        scheduleAlbumFilter(input);
     });
 
     $("contentArea").addEventListener("keydown", async event => {
@@ -7730,26 +7949,52 @@ function setupEvents() {
             return;
         }
         const input = event.target.closest("[data-quick-tag-input]");
-        if (!input) return;
+        if (input) {
 
-        if (event.key === "Escape") {
-            event.preventDefault();
-            state.quickTagMusicId = null;
-            await render();
+            if (event.key === "Escape" && !event.isComposing) {
+                event.preventDefault();
+                state.quickTagMusicId = null;
+                await renderPreservingScroll();
+                return;
+            }
+
+            /* 中文输入法组词中的 Enter 是选字，不能当成提交——否则拼音串
+               会被当成新 Tag 存进去，而用户想打的其实是已有的那个中文 Tag。 */
+            if (event.key === "Enter" && !event.isComposing) {
+                event.preventDefault();
+                await saveQuickTag(input.dataset.quickTagInput, input.value);
+            }
             return;
         }
 
-        if (event.key === "Enter") {
+        const albumTagInput = event.target.closest("[data-album-tag-input]");
+        if (!albumTagInput) return;
+
+        if (event.key === "Escape" && !event.isComposing) {
             event.preventDefault();
-            await saveQuickTag(input.dataset.quickTagInput, input.value);
+            state.quickTagAlbumKey = null;
+            await renderPreservingScroll();
+            return;
+        }
+
+        /* 中文输入法组词中的 Enter 是选字，不能当成提交。 */
+        if (event.key === "Enter" && !event.isComposing) {
+            event.preventDefault();
+            await saveAlbumQuickTag(state.quickTagAlbumKey, albumTagInput.value);
         }
     });
 
     $("contentArea").addEventListener("change", async event => {
         const select = event.target.closest("[data-quick-tag-select]");
-        if (!select?.value) return;
+        if (select?.value) {
+            event.stopPropagation();
+            await saveQuickTag(select.dataset.id, "", Number(select.value));
+            return;
+        }
+        const albumSelect = event.target.closest("[data-album-tag-select]");
+        if (!albumSelect?.value) return;
         event.stopPropagation();
-        await saveQuickTag(select.dataset.id, "", Number(select.value));
+        await saveAlbumQuickTag(state.quickTagAlbumKey, "", Number(albumSelect.value));
     });
 
 
@@ -8383,6 +8628,8 @@ async function init() {
         await updateCounts();
 
         await renderSidebarTags();
+
+        await loadAlbumTags();
 
         await render();
 

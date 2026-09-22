@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use tauri::Manager;
 
 pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 
 #[derive(Serialize, Deserialize, Default)]
 struct AppSettings {
@@ -198,6 +198,15 @@ fn migrate(conn: &mut Connection) -> Result<(), String> {
             PRIMARY KEY (clip_id, tag_id)
         );
         CREATE INDEX IF NOT EXISTS idx_clip_tags_tag ON clip_tags(tag_id);
+
+        /* 专辑不是独立实体，用专辑名做键；Finder 改名同步时由
+           sync_library_locations 把关联行迁到新名字。 */
+        CREATE TABLE IF NOT EXISTS album_tags (
+            album       TEXT NOT NULL,
+            tag_id      INTEGER NOT NULL REFERENCES tags(id) ON DELETE CASCADE,
+            PRIMARY KEY (album, tag_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_album_tags_tag ON album_tags(tag_id);
 
         CREATE TRIGGER IF NOT EXISTS trg_music_candidate_cleanup
         AFTER DELETE ON music
@@ -574,6 +583,22 @@ mod tests {
         conn.execute("UPDATE app_metadata SET value='999' WHERE key='schema_version'", []).unwrap();
         let error = migrate(&mut conn).unwrap_err();
         assert!(error.contains("高于当前程序支持"));
+    }
+
+    #[test]
+    fn migrate_creates_album_tags_table() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        migrate(&mut conn).unwrap();
+        let exists: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='album_tags')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(exists, "迁移后应存在 album_tags 表");
+        // 重复迁移（已有库升级路径）也不能报错。
+        migrate(&mut conn).unwrap();
     }
 
     #[test]
