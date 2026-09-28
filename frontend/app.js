@@ -18,6 +18,7 @@ let state = {
     albumSearch: "",
     layout: "list",
     tagResultTab: null,
+    recentMode: "added",
     /* 侧栏内联编辑：新增/重命名维度与 Tag 都在原位输入，不再弹浮层。
        { type: "create-category" | "edit-category" | "create-tag" | "edit-tag",
          categoryId?, categoryName?, parentId?, tagId?, tagName?, value? } */
@@ -78,7 +79,8 @@ let state = {
         loading: false,
         audio: null,
         currentUrl: "",
-        candidates: []
+        candidates: [],
+        loopSegment: false
     }
 };
 
@@ -95,6 +97,9 @@ let tagRecordsCache = [];
 let albumTagsCache = new Map();
 let searchRenderTimer = null;
 let albumFilterTimer = null;
+/* 双击判定（J/L shuttle） */
+let lastShuttleKey = null;
+let lastShuttleAt = 0;
 /* IME（中文/日文输入法）组词期间不入库筛选，避免拼音串先触发重渲染把候选框顶掉 */
 let albumFilterComposing = false;
 const libraryCache = { music: null, clips: null };
@@ -1405,11 +1410,22 @@ async function getCurrentMusicList(allMusic, clips) {
 
     if (state.currentView === "recent") {
 
-        music.sort(
-            (a, b) => b.createdAt - a.createdAt
-        );
+        if (state.recentMode === "used") {
 
-        music = music.slice(0, 100);
+            /* 最近使用：按使用历史打点排序 */
+            music = music
+                .filter(item => item.lastPlayedAt)
+                .sort((a, b) => (b.lastPlayedAt || 0) - (a.lastPlayedAt || 0))
+                .slice(0, 100);
+
+        } else {
+
+            music.sort(
+                (a, b) => b.createdAt - a.createdAt
+            );
+
+            music = music.slice(0, 100);
+        }
     }
 
 
@@ -1682,6 +1698,22 @@ async function render() {
             page.items,
             clips
         );
+    }
+
+    /* 最近视图：添加/使用 两种口径切换 */
+    if (state.currentView === "recent") {
+        $("contentArea").insertAdjacentHTML("afterbegin", `
+            <div class="recent-mode-bar">
+                <button class="recent-mode-btn ${state.recentMode !== "used" ? "active" : ""}" data-recent-mode="added">最近添加</button>
+                <button class="recent-mode-btn ${state.recentMode === "used" ? "active" : ""}" data-recent-mode="used">最近使用</button>
+            </div>`);
+        $("contentArea").querySelectorAll("[data-recent-mode]").forEach(btn => {
+            btn.addEventListener("click", () => {
+                if (state.recentMode === btn.dataset.recentMode) return;
+                state.recentMode = btn.dataset.recentMode;
+                void render();
+            });
+        });
     }
 
     $("contentArea").insertAdjacentHTML("beforeend", paginationHTML(page, pageKey, "首音乐"));
@@ -2215,7 +2247,7 @@ function renderTagResults(music, clips, tagId) {
         <div class="clip-library-row" data-clip-id="${clip.id}">
             <div class="clip-library-icon">◈</div>
             <div class="clip-library-main"><div class="clip-library-name">${escapeHTML(clip.name || "未命名片段")}</div><div class="clip-library-source-name">${escapeHTML(parent.name)}</div><div class="clip-library-meta"><span>${formatTime(clip.start)} – ${formatTime(clip.end)}</span><span>${formatTime(clip.end - clip.start)}</span>${(clip.tags || []).map(value => `<span class="tag">#${escapeHTML(value)}</span>`).join("")}</div></div>
-            <div class="clip-library-actions"><button class="icon-action" data-clip-action="play" data-clip-id="${clip.id}" title="试听片段">▶</button><button class="icon-action" data-clip-action="edit" data-clip-id="${clip.id}" title="编辑片段">✎</button><button class="icon-action ${isCandidate ? "is-candidate" : ""}" data-clip-action="candidate" data-clip-id="${clip.id}" title="${isCandidate ? "移出候选" : "加入候选"}">${isCandidate ? "★" : "☆"}</button></div>
+            <div class="clip-library-actions"><button class="icon-action" data-clip-action="play" data-clip-id="${clip.id}" title="试听片段">▶</button><button class="icon-action" data-clip-action="edit" data-clip-id="${clip.id}" title="编辑片段">✎</button><button class="icon-action" data-clip-action="export" data-clip-id="${clip.id}" title="导出为 WAV">⤓</button><button class="icon-action ${isCandidate ? "is-candidate" : ""}" data-clip-action="candidate" data-clip-id="${clip.id}" title="${isCandidate ? "移出候选" : "加入候选"}">${isCandidate ? "★" : "☆"}</button></div>
         </div>`;
     }).join("");
 
@@ -2507,6 +2539,12 @@ function renderCatalogView(music, clips, type) {
                                     : ""
                             }
 
+                            ${
+                                item.playCount > 0
+                                    ? `<span class="usage-badge" title="累计使用 ${item.playCount} 次${item.lastPlayedAt ? ` · 最近 ${new Date(item.lastPlayedAt).toLocaleDateString("zh-CN")}` : ""}">用过 ${item.playCount} 次</span>`
+                                    : ""
+                            }
+
                         </div>
 
                         <div class="music-tags">${renderInlineMusicTags(item)}</div>
@@ -2730,6 +2768,7 @@ function renderClipLibrary(music, clips) {
                     <div class="clip-library-actions">
                         <button class="icon-action" data-clip-action="play" data-clip-id="${clip.id}" title="试听片段">▶</button>
                         <button class="icon-action" data-clip-action="edit" data-clip-id="${clip.id}" title="编辑片段">✎</button>
+                        <button class="icon-action" data-clip-action="export" data-clip-id="${clip.id}" title="导出为 WAV">⤓</button>
                         <button class="icon-action ${isClipCandidate(clip.id) ? "is-candidate" : ""}" data-clip-action="candidate" data-clip-id="${clip.id}" title="${isClipCandidate(clip.id) ? "移出候选" : "加入候选"}">${isClipCandidate(clip.id) ? "★" : "☆"}</button>
                         <button class="icon-action" data-clip-action="delete" data-clip-id="${clip.id}" title="删除片段">🗑</button>
                     </div>
@@ -2802,6 +2841,12 @@ function renderList(music, clips) {
                             ${
                                 itemClips.length
                                     ? `<span>◈ ${itemClips.length} 个片段</span>`
+                                    : ""
+                            }
+
+                            ${
+                                item.playCount > 0
+                                    ? `<span class="usage-badge" title="累计使用 ${item.playCount} 次${item.lastPlayedAt ? ` · 最近 ${new Date(item.lastPlayedAt).toLocaleDateString("zh-CN")}` : ""}">用过 ${item.playCount} 次</span>`
                                     : ""
                             }
 
@@ -3314,6 +3359,15 @@ async function openDetail(id) {
                                                 title="编辑片段"
                                             >
                                                 ✎
+                                            </button>
+
+                                            <button
+                                                class="icon-action"
+                                                data-clip-action="export"
+                                                data-clip-id="${clip.id}"
+                                                title="导出为 WAV"
+                                            >
+                                                ⤓
                                             </button>
 
                                             <button
@@ -3909,6 +3963,19 @@ async function revealInFinder(music) {
 }
 
 
+/* 使用历史打点：每曲 10s 内只记一次（resume 不算新使用） */
+let lastUsedMark = { id: null, at: 0 };
+function markCurrentTrackUsed() {
+    const music = state.player.music;
+    if (!music) return;
+    const now = Date.now();
+    if (lastUsedMark.id === music.id && now - lastUsedMark.at < 10000) return;
+    lastUsedMark = { id: music.id, at: now };
+    music.playCount = (music.playCount || 0) + 1;
+    music.lastPlayedAt = now;
+    invoke("mark_music_played", { id: music.id }).catch(() => {});
+}
+
 /* =========================================================
    底部播放器
 ========================================================= */
@@ -4040,6 +4107,12 @@ function updateBarControls() {
         !hasQueue ||
         p.index >=
             p.queue.length - 1;
+
+    /* AB 循环按钮只在播放片段时可用 */
+    const loopBtn = $("playerLoopBtn");
+    loopBtn.disabled = !p.segment;
+    loopBtn.classList.toggle("is-active", !!p.segment && p.loopSegment);
+    loopBtn.title = p.loopSegment ? "关闭片段循环" : "片段循环（AB）";
 }
 
 
@@ -4264,6 +4337,13 @@ function onSegmentTimeupdate() {
         p.segment.end
     ) {
 
+        /* 片段 AB 循环：回到 A 点继续播（候选队列连播时不循环） */
+        if (p.loopSegment && p.queueSource !== "candidates") {
+            a.currentTime = p.segment.start;
+            void a.play().catch(() => {});
+            return;
+        }
+
         a.pause();
         if (p.queueSource === "candidates") {
             nextTrack(true);
@@ -4371,7 +4451,27 @@ async function playClip(clip, opts = {}) {
     await loadAndPlay(music, p.segment, opts);
 }
 
-
+/* 片段导出为 WAV：弹保存对话框选目标位置，后端解码切片 */
+async function exportClip(clip, music) {
+    const safe = value =>
+        String(value || "").replace(/[\\/:*?"<>|]/g, "_").trim() || "未命名";
+    const dest = await __TAURI__.dialog.save({
+        defaultPath: `${safe(music.name)}-${safe(clip.name || "片段")}.wav`,
+        filters: [{ name: "WAV 音频", extensions: ["wav"] }]
+    });
+    if (!dest) return;
+    try {
+        await invoke("export_clip_wav", {
+            sourcePath: music.path,
+            start: clip.start,
+            end: clip.end,
+            destPath: dest
+        });
+        showToast("片段已导出为 WAV");
+    } catch (error) {
+        showToast(String(error?.message || error || "导出失败"));
+    }
+}
 async function togglePlay() {
 
     const p = state.player;
@@ -4891,7 +4991,10 @@ function initPlayer() {
        UI 统一由事件同步，手动 setPlayingUI 调用保持幂等。 */
     a.addEventListener(
         "play",
-        () => setPlayingUI(true)
+        () => {
+            setPlayingUI(true);
+            markCurrentTrackUsed();
+        }
     );
 
     a.addEventListener(
@@ -4938,6 +5041,14 @@ function initPlayer() {
         "click",
         togglePlay
     );
+
+    $("playerLoopBtn").addEventListener("click", () => {
+        const p = state.player;
+        if (!p.segment) return;
+        p.loopSegment = !p.loopSegment;
+        updateBarControls();
+        showToast(p.loopSegment ? "片段循环已开（AB）" : "片段循环已关");
+    });
 
     $("playerNextBtn").addEventListener(
         "click",
@@ -7609,6 +7720,11 @@ function setupEvents() {
                         return;
                     }
 
+                    if (act === "export") {
+                        void exportClip(clipData, parent);
+                        return;
+                    }
+
                     if (act === "candidate") {
                         toggleClipCandidate(clipId);
                         return;
@@ -8229,6 +8345,20 @@ function setupEvents() {
             saveClip
         );
 
+    /* 导出当前选区为 WAV（无需先保存片段） */
+    $("clipExportBtn")
+        .addEventListener("click", () => {
+            if (!state.clipMusic) return;
+            void exportClip(
+                {
+                    name: $("clipName").value || "片段",
+                    start: state.clipStart,
+                    end: state.clipEnd
+                },
+                state.clipMusic
+            );
+        });
+
     $("previewClipBtn")
         .addEventListener(
             "click",
@@ -8269,12 +8399,51 @@ function setupEvents() {
             }
             return;
         }
-        if (!isTyping && event.key === "/") {
+        if (isTyping || event.metaKey || event.ctrlKey || event.altKey) return;
+        if (event.key === "/") {
             event.preventDefault();
             $("searchInput").focus();
-        } else if (!isTyping && event.key === " " && state.player.music) {
+            return;
+        }
+
+        /* 剪辑师快捷键：J/K/L shuttle + 空格播放暂停 + ←→ 快进倒退 + M 边听边裁。
+           J/L 按住自动连发；双击 L 切倍速，双击 J 退 15 秒。 */
+        const key = event.key.toLowerCase();
+        const a = state.player.music ? getAudio() : null;
+
+        if (key === " " || key === "k") {
+            if (!a || event.repeat) return;
             event.preventDefault();
-            togglePlay();
+            void togglePlay();
+            return;
+        }
+
+        if (!a || !Number.isFinite(a.duration)) return;
+
+        const now = Date.now();
+        const dbl = !event.repeat && lastShuttleKey === key && now - lastShuttleAt < 350;
+        if (!event.repeat) {
+            lastShuttleKey = key;
+            lastShuttleAt = now;
+        }
+
+        if (key === "j" || event.key === "ArrowLeft") {
+            event.preventDefault();
+            a.currentTime = Math.max(0, a.currentTime - (dbl ? 15 : 5));
+        } else if (key === "l" || event.key === "ArrowRight") {
+            event.preventDefault();
+            if (dbl) {
+                /* 双击 L：1 → 1.5 → 2 → 1 倍速试听 */
+                const rates = [1, 1.5, 2];
+                const cur = rates.findIndex(r => Math.abs(a.playbackRate - r) < 0.01);
+                a.playbackRate = rates[(cur + 1) % rates.length];
+                showToast(a.playbackRate === 1 ? "恢复原速" : `${a.playbackRate}× 倍速试听`);
+            } else {
+                a.currentTime = Math.min(a.duration, a.currentTime + 5);
+            }
+        } else if (key === "m") {
+            event.preventDefault();
+            void openClipEditor(state.player.music);
         }
     });
 

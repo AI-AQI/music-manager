@@ -421,6 +421,110 @@ pub fn probe_file(path: String) -> ProbeResult {
     probe_path(path)
 }
 
+/* 把源文件的 [start, end) 秒区间解码切片并写成 16-bit PCM WAV。
+   解码走 symphonia（库内素材均为 mp3），编码走 hound。 */
+#[tauri::command]
+pub fn export_clip_wav(source_path: String, start: f64, end: f64, dest_path: String) -> Result<String, String> {
+    use symphonia::core::audio::SampleBuffer;
+    use symphonia::core::codecs::DecoderOptions;
+    use symphonia::core::formats::FormatOptions;
+    use symphonia::core::io::MediaSourceStream;
+    use symphonia::core::meta::MetadataOptions;
+    use symphonia::core::probe::Hint;
+
+    if end <= start {
+        return Err("选区为空，无法导出".into());
+    }
+
+    let file = std::fs::File::open(&source_path).map_err(|e| format!("打开源文件失败: {e}"))?;
+    let mss = MediaSourceStream::new(Box::new(file), Default::default());
+    let mut hint = Hint::new();
+    if let Some(ext) = std::path::Path::new(&source_path).extension().and_then(|e| e.to_str()) {
+        hint.with_extension(ext);
+    }
+    let probed = symphonia::default::get_probe()
+        .format(&hint, mss, &FormatOptions::default(), &MetadataOptions::default())
+        .map_err(|e| format!("无法解析音频: {e}"))?;
+    let mut format = probed.format;
+    let track = format.default_track().ok_or("找不到音轨")?;
+    let track_id = track.id;
+    let sample_rate = track.codec_params.sample_rate.ok_or("未知采样率")?;
+    let channels = track.codec_params.channels.ok_or("未知声道数")?.count();
+    let mut decoder = symphonia::default::get_codecs()
+        .make(&track.codec_params, &DecoderOptions::default())
+        .map_err(|e| format!("解码器创建失败: {e}"))?;
+
+    let start_frame = (start.max(0.0) * sample_rate as f64) as u64;
+    let end_frame = (end * sample_rate as f64) as u64;
+
+    let spec = hound::WavSpec {
+        channels: channels as u16,
+        sample_rate,
+        bits_per_sample: 16,
+        sample_format: hound::SampleFormat::Int,
+    };
+    let mut writer = hound::WavWriter::create(&dest_path, spec)
+        .map_err(|e| format!("创建 WAV 失败: {e}"))?;
+
+    let mut frames_written: u64 = 0;
+    let mut cursor: u64 = 0;
+    let mut sample_buf: Option<SampleBuffer<f32>> = None;
+    let mut buf_spec: Option<symphonia::core::audio::SignalSpec> = None;
+
+    loop {
+        let packet = match format.next_packet() {
+            Ok(p) => p,
+            Err(_) => break,
+        };
+        if packet.track_id() != track_id {
+            continue;
+        }
+        let decoded = match decoder.decode(&packet) {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
+        let spec = *decoded.spec();
+        let n_frames = decoded.frames() as u64;
+        if buf_spec != Some(spec)
+            || sample_buf.as_ref().map_or(true, |b| b.capacity() < n_frames as usize)
+        {
+            sample_buf = Some(SampleBuffer::<f32>::new(n_frames, spec));
+            buf_spec = Some(spec);
+        }
+        let buf = sample_buf.as_mut().unwrap();
+        buf.copy_interleaved_ref(decoded);
+
+        let buf_start = cursor;
+        let buf_end = cursor + n_frames;
+        cursor = buf_end;
+        if buf_end <= start_frame {
+            continue;
+        }
+        if buf_start >= end_frame {
+            break;
+        }
+
+        let from = start_frame.saturating_sub(buf_start);
+        let to = if end_frame >= buf_end { n_frames } else { end_frame.saturating_sub(buf_start) };
+        let ch = spec.channels.count();
+        for f in from..to {
+            let base = (f as usize) * ch;
+            for c in 0..ch {
+                let s = buf.samples()[base + c];
+                let s16 = (s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
+                writer.write_sample(s16).map_err(|e| format!("写入 WAV 失败: {e}"))?;
+            }
+            frames_written += 1;
+        }
+    }
+
+    writer.finalize().map_err(|e| format!("完成 WAV 失败: {e}"))?;
+    if frames_written == 0 {
+        return Err("选区内没有可导出的音频".into());
+    }
+    Ok(dest_path)
+}
+
 fn collect_audio_files(folder: &Path, files: &mut Vec<PathBuf>) {
     let entries = match fs::read_dir(folder) { Ok(entries) => entries, Err(_) => return };
     for entry in entries.flatten() {
@@ -464,6 +568,8 @@ pub struct Music {
     file_size: u64,
     mime_type: String,
     cover_art: String,
+    last_played_at: Option<i64>,
+    play_count: i64,
     created_at: i64,
     updated_at: i64,
 }
@@ -503,6 +609,8 @@ impl Music {
             file_size: row.get("file_size")?,
             mime_type: row.get("mime_type")?,
             cover_art: row.get("cover_art")?,
+            last_played_at: row.get("last_played_at").ok(),
+            play_count: row.get("play_count").unwrap_or(0),
             created_at: row.get("created_at")?,
             updated_at: row.get("updated_at")?,
         })
@@ -689,7 +797,7 @@ pub fn list_music(
         // get_music_cover_arts 按需加载，避免数千首音乐在一次 IPC 中传输。
         .prepare("SELECT id, name, file_name, path, album, album_source, artist, genre, year,
                          channels, sample_rate, bitrate, duration, file_size, mime_type,
-                         '' AS cover_art, created_at, updated_at
+                         '' AS cover_art, last_played_at, play_count, created_at, updated_at
                   FROM music ORDER BY created_at ASC")
         .map_err(|e| format!("准备查询失败: {e}"))?;
 
@@ -708,9 +816,19 @@ pub fn list_music(
     Ok(music)
 }
 
+/* 使用历史：开始播放时打点（前端按曲防抖，resume 不重复计数） */
 #[tauri::command]
-pub fn get_library_counts(state: tauri::State<'_, AppState>) -> Result<LibraryCounts, String> {
+pub fn mark_music_played(state: tauri::State<'_, AppState>, id: String) -> Result<(), String> {
     let conn = lock_db!(state);
+    conn.execute(
+        "UPDATE music SET last_played_at = ?1, play_count = COALESCE(play_count, 0) + 1 WHERE id = ?2",
+        rusqlite::params![now_ms(), id],
+    ).map_err(|e| format!("记录播放历史失败: {e}"))?;
+    Ok(())
+}
+
+#[tauri::command]
+pub fn get_library_counts(state: tauri::State<'_, AppState>) -> Result<LibraryCounts, String> {    let conn = lock_db!(state);
     let music = conn.query_row("SELECT COUNT(*) FROM music", [], |row| row.get(0))
         .map_err(|e| format!("统计音乐失败: {e}"))?;
     let clips = conn.query_row("SELECT COUNT(*) FROM clips", [], |row| row.get(0))
@@ -1793,5 +1911,36 @@ mod tests {
         let emotional = category_id_of(&conn, "情绪");
         move_tag_in(&mut conn, tag, None, Some(emotional)).unwrap();
         assert_eq!(category_of(&conn, tag), "情绪");
+    }
+
+    /// 导出 WAV 切片：2 秒正弦源里取 0.5–1.5s，产物帧数与格式必须正确。
+    #[test]
+    fn export_clip_wav_slices_expected_range() {
+        let dir = std::env::temp_dir().join(format!("mm_export_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("src.wav");
+        let dest = dir.join("out.wav");
+
+        // 2 秒 440Hz 正弦（16-bit PCM，48kHz 单声道）
+        let spec = hound::WavSpec { channels: 1, sample_rate: 48000, bits_per_sample: 16, sample_format: hound::SampleFormat::Int };
+        let mut writer = hound::WavWriter::create(&src, spec).unwrap();
+        for i in 0..(48000 * 2) {
+            let s = (i as f32 / 48000.0 * 440.0 * std::f32::consts::TAU).sin();
+            writer.write_sample((s * 0.5 * i16::MAX as f32) as i16).unwrap();
+        }
+        writer.finalize().unwrap();
+
+        let out = export_clip_wav(src.to_string_lossy().into_owned(), 0.5, 1.5, dest.to_string_lossy().into_owned()).unwrap();
+        assert_eq!(out, dest.to_string_lossy());
+
+        let mut reader = hound::WavReader::open(&dest).unwrap();
+        assert_eq!(reader.spec().sample_rate, 48000);
+        assert_eq!(reader.spec().channels, 1);
+        assert_eq!(reader.duration(), 48000, "0.5s×1s 区间应导出 48000 帧");
+        // 0.5s 处起点的采样值不应全为零（切在正弦中段）
+        let max_amp = reader.samples::<i16>().take(1000).map(|s| s.unwrap().abs()).max().unwrap_or(0);
+        assert!(max_amp > 1000, "导出内容不应是静音");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

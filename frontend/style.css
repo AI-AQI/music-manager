@@ -8518,3 +8518,53 @@ body[data-theme="archive"] .home-subtitle {
         0 1px 2px rgba(250, 244, 230, .55),
         0 4px 30px rgba(250, 244, 230, .75);
 }
+
+/* 片段 AB 循环按钮的激活态 */
+.player-btn.is-active {
+    color: #fff;
+    background: var(--primary-grad, var(--primary));
+    border-color: transparent;
+    font-weight: 800;
+}
+
+body[data-theme="sky"] .player-btn.is-active {
+    color: #fff;
+    background: var(--primary-grad);
+    border-color: transparent;
+}
+
+/* 最近视图：添加/使用 口径切换 + 使用次数徽标 */
+.recent-mode-bar {
+    display: flex;
+    gap: 8px;
+    margin-bottom: 12px;
+}
+
+.recent-mode-btn {
+    padding: 5px 14px;
+    border-radius: 999px;
+    border: 1px solid var(--border-strong);
+    background: transparent;
+    color: var(--subtext);
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: .08em;
+    cursor: pointer;
+    transition: color .2s, border-color .2s, background .2s;
+}
+
+.recent-mode-btn:hover {
+    color: var(--primary-strong, var(--primary));
+    border-color: var(--primary);
+}
+
+.recent-mode-btn.active {
+    color: #fff;
+    background: var(--primary-grad, var(--primary));
+    border-color: transparent;
+}
+
+.usage-badge {
+    color: var(--primary-strong, var(--primary));
+    font-weight: 700;
+}

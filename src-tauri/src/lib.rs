@@ -52,6 +52,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::init_db,
             commands::probe_file,
+            commands::export_clip_wav,
             commands::scan_import_sources,
             commands::create_music,
             commands::update_music,
@@ -59,6 +60,7 @@ pub fn run() {
             commands::delete_music_batch,
             commands::get_music,
             commands::list_music,
+            commands::mark_music_played,
             commands::get_library_counts,
             commands::get_music_cover_arts,
             commands::find_existing_music_paths,

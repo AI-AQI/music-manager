@@ -257,6 +257,7 @@ fn migrate(conn: &mut Connection) -> Result<(), String> {
         ("artist", "TEXT DEFAULT ''"), ("genre", "TEXT DEFAULT ''"), ("year", "TEXT DEFAULT ''"),
         ("channels", "TEXT DEFAULT ''"), ("sample_rate", "INTEGER DEFAULT 0"),
         ("bitrate", "INTEGER DEFAULT 0"), ("cover_art", "TEXT DEFAULT ''"),
+        ("last_played_at", "INTEGER"), ("play_count", "INTEGER NOT NULL DEFAULT 0"),
     ] {
         if !has_column(conn, "music", column) {
             conn.execute(&format!("ALTER TABLE music ADD COLUMN {column} {definition}"), [])
