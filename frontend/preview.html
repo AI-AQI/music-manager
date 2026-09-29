@@ -95,6 +95,7 @@
                 <span aria-hidden="true">★</span>
                 <span id="candidateNavCount" class="candidate-trigger-count">0</span>
             </button>
+            <button id="shortcutHelpBtn" class="secondary-btn shortcut-help-trigger" type="button" title="快捷键（按 ? 打开）" aria-label="快捷键帮助">?</button>
             <button id="importBtn" class="primary-btn">
                 <span class="button-index">01</span> 导入曲目
             </button>
@@ -350,6 +351,49 @@
 
 </div>
 
+
+<!-- ============================= -->
+<!-- 快捷键速查 -->
+<!-- ============================= -->
+
+<div id="shortcutsModal" class="modal hidden">
+
+    <div class="modal-box shortcuts-box">
+
+        <div class="modal-header">
+            <h2>快捷键</h2>
+            <button class="icon-btn" data-close-modal>×</button>
+        </div>
+
+        <div class="modal-body">
+
+            <div class="shortcut-group">
+                <div class="shortcut-group-title">试听</div>
+                <div class="shortcut-row"><span class="shortcut-keys"><kbd>空格</kbd><kbd>K</kbd></span><span>播放 / 暂停</span></div>
+                <div class="shortcut-row"><span class="shortcut-keys"><kbd>J</kbd><kbd>←</kbd></span><span>倒退 5 秒（按住连发）· 双击退 15 秒</span></div>
+                <div class="shortcut-row"><span class="shortcut-keys"><kbd>L</kbd><kbd>→</kbd></span><span>前进 5 秒（按住连发）· 双击切换 1× / 1.5× / 2× 倍速</span></div>
+                <div class="shortcut-row"><span class="shortcut-keys"><kbd>M</kbd></span><span>边听边裁：在当前播放位置打开裁剪器</span></div>
+            </div>
+
+            <div class="shortcut-group">
+                <div class="shortcut-group-title">裁剪器</div>
+                <div class="shortcut-row"><span class="shortcut-keys"><kbd>空格</kbd></span><span>从头试听整曲</span></div>
+                <div class="shortcut-row"><span class="shortcut-keys"><kbd>I</kbd></span><span>当前位置设为片段起点</span></div>
+                <div class="shortcut-row"><span class="shortcut-keys"><kbd>O</kbd></span><span>当前位置设为片段终点</span></div>
+            </div>
+
+            <div class="shortcut-group">
+                <div class="shortcut-group-title">通用</div>
+                <div class="shortcut-row"><span class="shortcut-keys"><kbd>/</kbd></span><span>聚焦搜索框</span></div>
+                <div class="shortcut-row"><span class="shortcut-keys"><kbd>Esc</kbd></span><span>关闭弹窗 / 清除筛选</span></div>
+                <div class="shortcut-row"><span class="shortcut-keys"><kbd>?</kbd></span><span>打开本面板</span></div>
+            </div>
+
+        </div>
+
+    </div>
+
+</div>
 
 <!-- ============================= -->
 <!-- 导入音乐弹窗 -->

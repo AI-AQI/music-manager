@@ -79,8 +79,7 @@ let state = {
         loading: false,
         audio: null,
         currentUrl: "",
-        candidates: [],
-        loopSegment: false
+        candidates: []
     }
 };
 
@@ -382,6 +381,7 @@ function setupThemeSwitcher() {
 
 const importModal = $("importModal");
 const editModal = $("editModal");
+const shortcutsModal = $("shortcutsModal");
 const clipEditorPanel = $("clipEditorPanel");
 
 
@@ -2069,11 +2069,15 @@ function setupVinylWall(area, music) {
             <span class="vinyl-spot" aria-hidden="true"></span>
             <div class="vinyl-box">
                 <button class="vinyl-hit" type="button" aria-label="选片"></button>
-                <button class="vinyl-flip vinyl-flip-prev" type="button" aria-label="上一张">‹</button>
-                <button class="vinyl-flip vinyl-flip-next" type="button" aria-label="下一张">›</button>
             </div>
             <span class="vinyl-now" aria-hidden="true">ON AIR</span>
-            <span class="vinyl-caption"></span>
+            <div class="vinyl-caption">
+                <div class="vinyl-caption-inner">
+                    <button class="vinyl-flip" type="button" data-flip="-1" aria-label="上一张">‹</button>
+                    <span class="vinyl-caption-text"></span>
+                    <button class="vinyl-flip" type="button" data-flip="1" aria-label="下一张">›</button>
+                </div>
+            </div>
         </div>`).join("");
 
     const renderFrames = () => {
@@ -2091,7 +2095,7 @@ function setupVinylWall(area, music) {
             frame.dataset.musicId = item ? item.id : "";
 
             const hit = frame.querySelector(".vinyl-hit");
-            const caption = frame.querySelector(".vinyl-caption");
+            const caption = frame.querySelector(".vinyl-caption-text");
 
             frame.querySelectorAll(".vinyl-flip")
                 .forEach(btn => { btn.disabled = wallList.length < 2; });
@@ -2172,10 +2176,12 @@ function setupVinylWall(area, music) {
             window.VinylWall?.setTilt(i, 0, 0);
         });
 
-        frame.querySelector(".vinyl-flip-prev")
-            .addEventListener("click", () => flip(i, -1));
-        frame.querySelector(".vinyl-flip-next")
-            .addEventListener("click", () => flip(i, 1));
+        frame.querySelectorAll(".vinyl-flip").forEach(btn => {
+            btn.addEventListener("click", event => {
+                event.stopPropagation();
+                flip(i, Number(btn.dataset.flip));
+            });
+        });
     });
 
     if (window.VinylWall) window.VinylWall.mount(wall);
@@ -2539,12 +2545,6 @@ function renderCatalogView(music, clips, type) {
                                     : ""
                             }
 
-                            ${
-                                item.playCount > 0
-                                    ? `<span class="usage-badge" title="累计使用 ${item.playCount} 次${item.lastPlayedAt ? ` · 最近 ${new Date(item.lastPlayedAt).toLocaleDateString("zh-CN")}` : ""}">用过 ${item.playCount} 次</span>`
-                                    : ""
-                            }
-
                         </div>
 
                         <div class="music-tags">${renderInlineMusicTags(item)}</div>
@@ -2841,12 +2841,6 @@ function renderList(music, clips) {
                             ${
                                 itemClips.length
                                     ? `<span>◈ ${itemClips.length} 个片段</span>`
-                                    : ""
-                            }
-
-                            ${
-                                item.playCount > 0
-                                    ? `<span class="usage-badge" title="累计使用 ${item.playCount} 次${item.lastPlayedAt ? ` · 最近 ${new Date(item.lastPlayedAt).toLocaleDateString("zh-CN")}` : ""}">用过 ${item.playCount} 次</span>`
                                     : ""
                             }
 
@@ -4107,12 +4101,6 @@ function updateBarControls() {
         !hasQueue ||
         p.index >=
             p.queue.length - 1;
-
-    /* AB 循环按钮只在播放片段时可用 */
-    const loopBtn = $("playerLoopBtn");
-    loopBtn.disabled = !p.segment;
-    loopBtn.classList.toggle("is-active", !!p.segment && p.loopSegment);
-    loopBtn.title = p.loopSegment ? "关闭片段循环" : "片段循环（AB）";
 }
 
 
@@ -4336,13 +4324,6 @@ function onSegmentTimeupdate() {
         a.currentTime >=
         p.segment.end
     ) {
-
-        /* 片段 AB 循环：回到 A 点继续播（候选队列连播时不循环） */
-        if (p.loopSegment && p.queueSource !== "candidates") {
-            a.currentTime = p.segment.start;
-            void a.play().catch(() => {});
-            return;
-        }
 
         a.pause();
         if (p.queueSource === "candidates") {
@@ -5041,14 +5022,6 @@ function initPlayer() {
         "click",
         togglePlay
     );
-
-    $("playerLoopBtn").addEventListener("click", () => {
-        const p = state.player;
-        if (!p.segment) return;
-        p.loopSegment = !p.loopSegment;
-        updateBarControls();
-        showToast(p.loopSegment ? "片段循环已开（AB）" : "片段循环已关");
-    });
 
     $("playerNextBtn").addEventListener(
         "click",
@@ -6794,6 +6767,9 @@ function setupEvents() {
             openImportModal
         );
 
+    $("shortcutHelpBtn")
+        .addEventListener("click", () => shortcutsModal.classList.remove("hidden"));
+
     $("databasePathLink")
         .addEventListener(
             "click",
@@ -8001,6 +7977,9 @@ function setupEvents() {
                         "[data-music-id]"
                     );
 
+                /* 首页唱片墙有自己的点按逻辑（翻片/上机），
+                   别走「点行即播」的全局委托——否则翻片也会误触发播放 */
+                if (row && row.closest(".vinyl-wall")) return;
 
                 if (row) {
 
@@ -8400,6 +8379,11 @@ function setupEvents() {
             return;
         }
         if (isTyping || event.metaKey || event.ctrlKey || event.altKey) return;
+        if (event.key === "?") {
+            event.preventDefault();
+            shortcutsModal.classList.toggle("hidden");
+            return;
+        }
         if (event.key === "/") {
             event.preventDefault();
             $("searchInput").focus();
@@ -8468,6 +8452,10 @@ function setupEvents() {
                         .classList
                         .add("hidden");
 
+                    shortcutsModal
+                        .classList
+                        .add("hidden");
+
                 }
             );
         });
@@ -8482,6 +8470,12 @@ function setupEvents() {
             if (
                 event.key === "Escape"
             ) {
+
+                if (!shortcutsModal.classList.contains("hidden")) {
+                    event.preventDefault();
+                    shortcutsModal.classList.add("hidden");
+                    return;
+                }
 
                 if (!clipEditorPanel.classList.contains("hidden")) {
                     event.preventDefault();

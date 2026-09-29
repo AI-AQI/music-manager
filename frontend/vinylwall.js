@@ -1,9 +1,9 @@
 /* =========================================================
-   首页唱片墙（Three.js）：透明亚克力相框 + 黑胶
-   一整块画布渲染所有挂帧：亚克力方板（四角金属螺丝）里
-   一张真圆形黑胶，中心是圆形标签（有封面用封面，没封面
-   用暖色纸标签 + 首字）。DOM 只管箭头、歌名、ON AIR 小签，
-   帧的位置和尺寸直接读 DOM 槽位（.vinyl-box），布局随 CSS。
+   首页唱片墙（Three.js）：裸盘悬浮
+   一整块画布渲染所有挂帧：一张真圆形黑胶 + 一团圆形软投影，
+   中心是圆形标签（有封面用封面，没封面用暖色纸标签 + 首字）。
+   DOM 只管翻片、歌名、ON AIR 小签；帧的位置和尺寸直接读
+   DOM 槽位（.vinyl-box），布局随 CSS。
 ========================================================= */
 (function () {
 
@@ -58,7 +58,7 @@
         return grooveTex;
     }
 
-    /* 挂在墙上的软阴影：圆角矩形渐变，贴在亚克力板右下 */
+    /* 裸盘的圆形软投影 */
     function getShadowTexture() {
         if (shadowTex) return shadowTex;
         const c = document.createElement("canvas");
@@ -67,7 +67,7 @@
         x.filter = "blur(10px)";
         x.fillStyle = "rgba(24,18,10,.18)";
         x.beginPath();
-        x.roundRect(28, 28, 200, 200, 10);
+        x.arc(128, 128, 100, 0, Math.PI * 2);
         x.fill();
         shadowTex = new THREE.CanvasTexture(c);
         return shadowTex;
@@ -151,61 +151,15 @@
         return entry.mat;
     }
 
-    /* 玻璃上的斜向反光带 */
-    let sheenTex = null;
-    function getSheenTexture() {
-        if (sheenTex) return sheenTex;
-        const c = document.createElement("canvas");
-        c.width = c.height = 256;
-        const x = c.getContext("2d");
-        const g = x.createLinearGradient(30, 226, 226, 30);
-        g.addColorStop(0, "rgba(255,255,255,0)");
-        g.addColorStop(.38, "rgba(255,255,255,0)");
-        g.addColorStop(.48, "rgba(255,255,255,.4)");
-        g.addColorStop(.55, "rgba(255,255,255,.1)");
-        g.addColorStop(.63, "rgba(255,255,255,0)");
-        g.addColorStop(1, "rgba(255,255,255,0)");
-        x.fillStyle = g;
-        x.fillRect(0, 0, 256, 256);
-        sheenTex = new THREE.CanvasTexture(c);
-        return sheenTex;
-    }
-
     /* ---------------- 共享几何/材质 ---------------- */
 
     let kit = null;
     function getKit() {
         if (kit) return kit;
-        const acrylicGeo = new THREE.BoxGeometry(1, 1, 0.05);
         kit = {
-            acrylicGeo,
-            edgeGeo: new THREE.EdgesGeometry(new THREE.BoxGeometry(1.002, 1.002, 0.052)),
             discGeo: new THREE.CylinderGeometry(0.36, 0.36, 0.02, 72),
             labelGeo: new THREE.CircleGeometry(0.124, 48),
-            postGeo: new THREE.CylinderGeometry(0.03, 0.03, 0.08, 24),
-            capGeo: new THREE.CylinderGeometry(0.042, 0.042, 0.016, 24),
             shadowGeo: new THREE.PlaneGeometry(1.32, 1.32),
-            sheenGeo: new THREE.PlaneGeometry(1, 1),
-            sheenMat: new THREE.MeshBasicMaterial({
-                map: getSheenTexture(), transparent: true, opacity: .55, depthWrite: false
-            }),
-            /* 亚克力：真玻璃。transmission 必须满 1——少一点，
-               残余白色漫反射会把深色唱片洗白（实测结论） */
-            acrylicMat: new THREE.MeshPhysicalMaterial({
-                color: 0xffffff,
-                metalness: 0,
-                roughness: 0.03,
-                transmission: 1,
-                thickness: 0.06,
-                ior: 1.49,
-                clearcoat: 0.5,
-                clearcoatRoughness: 0.2,
-                envMapIntensity: 1.2
-            }),
-            edgeMat: new THREE.LineBasicMaterial({ color: 0x6b6357, transparent: true, opacity: 0.55 }),
-            metalMat: new THREE.MeshStandardMaterial({
-                color: 0xc9cacd, metalness: 1, roughness: 0.3, envMapIntensity: 1.3
-            }),
             sideMat: new THREE.MeshStandardMaterial({ color: 0x1c1815, roughness: 0.35 }),
             grooveMat: new THREE.MeshStandardMaterial({
                 map: getGrooveTexture(), roughness: 0.28, metalness: 0.05, envMapIntensity: 0.8
@@ -226,6 +180,7 @@
 
         const shadow = new THREE.Mesh(k.shadowGeo, k.shadowMat);
         shadow.position.set(0.03, -0.04, -0.08);
+        shadow.scale.setScalar(0.78);
         group.add(shadow);
 
         // 唱片（标签随盘一起转）
@@ -237,29 +192,6 @@
         label.position.z = 0.012;
         spin.add(label);
         group.add(spin);
-
-        // 罩在唱片前面的亚克力板 + 斜向高光带
-        const acrylic = new THREE.Mesh(k.acrylicGeo, k.acrylicMat);
-        acrylic.position.z = 0.045;
-        group.add(acrylic);
-        const edges = new THREE.LineSegments(k.edgeGeo, k.edgeMat);
-        edges.position.z = 0.045;
-        group.add(edges);
-        const sheen = new THREE.Mesh(k.sheenGeo, k.sheenMat);
-        sheen.position.z = 0.075;
-        group.add(sheen);
-
-        // 四角广告钉
-        [[-1, -1], [1, -1], [-1, 1], [1, 1]].forEach(([sx, sy]) => {
-            const post = new THREE.Mesh(k.postGeo, k.metalMat);
-            post.rotation.x = Math.PI / 2;
-            post.position.set(sx * 0.44, sy * 0.44, 0.07);
-            group.add(post);
-            const cap = new THREE.Mesh(k.capGeo, k.metalMat);
-            cap.rotation.x = Math.PI / 2;
-            cap.position.set(sx * 0.44, sy * 0.44, 0.115);
-            group.add(cap);
-        });
 
         group.visible = false;
         S.scene.add(group);
@@ -292,7 +224,7 @@
         warm.addColorStop(1, "rgba(255,190,120,0)");
         x.fillStyle = warm;
         x.fillRect(0, 0, 1024, 512);
-        // 正前方的亮窗：亚克力的反射光源
+        // 正前方的亮窗：盘面反光的来源
         const front = x.createRadialGradient(512, 200, 8, 512, 200, 150);
         front.addColorStop(0, "rgba(255,246,230,.85)");
         front.addColorStop(1, "rgba(255,246,230,0)");
@@ -314,8 +246,6 @@
         renderer.outputEncoding = THREE.sRGBEncoding;
         renderer.toneMapping = THREE.ACESFilmicToneMapping;
         renderer.toneMappingExposure = 1.05;
-        // transmission 采样空背景处返回清屏色：给浅纸色，玻璃边缘才不会发黑
-        renderer.setClearColor(0xf0efe9, 0);
 
         const scene = new THREE.Scene();
         makeEnv(renderer, scene);
@@ -395,15 +325,11 @@
             (S.cw !== S.container.clientWidth || S.ch !== S.container.clientHeight)) {
             S.cw = S.container.clientWidth;
             S.ch = S.container.clientHeight;
-            layout();
         }
 
-        /* transmission 的空背景处采样清屏色：跟随主题，云雾=照片淡蓝白 */
-        const sky = document.body.dataset.theme === "sky";
-        if (sky !== S.skyClear) {
-            S.skyClear = sky;
-            S.renderer.setClearColor(sky ? 0xe9f1f5 : 0xf0efe9, 0);
-        }
+        /* 入场动画期间 DOM 槽位在位移，rect 每帧重读（6 个元素，开销可忽略），
+           否则 3D 帧会停在动画半途的位置，首次翻片时才跳回正位 */
+        layout();
 
         S.slots.forEach(slot => {
             if (!slot.group.visible) return;
