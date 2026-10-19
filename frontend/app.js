@@ -474,8 +474,53 @@ const dbDelete = async (storeName, id) => {
 };
 
 async function initDB() {
+    document.body.inert = true;
+    while (true) {
+        try {
+            if (!await invoke("init_db")) {
+                const configured = await configureStartupLibrary();
+                if (configured === null) continue;
+                if (!configured) return false;
+            }
+            document.body.inert = false;
+            return true;
+        } catch (error) {
+            const retry = await __TAURI__.dialog.ask(
+                `${getErrorMessage(error)}\n\n如果数据库在移动硬盘，请先连接硬盘并确认它已在 Finder 中显示，再点击“重试”。未打开音乐库前不会创建替代空库。`,
+                { title: "音乐库暂不可用", kind: "warning", okLabel: "重试", cancelLabel: "退出" }
+            );
+            if (!retry) {
+                await invoke("cancel_database_startup");
+                return false;
+            }
+        }
+    }
+}
 
-    await invoke("init_db");
+async function configureStartupLibrary() {
+    const open = "打开已有音乐库";
+    const create = "创建新音乐库";
+    const choice = await __TAURI__.dialog.message(
+        "未找到本机的音乐库位置配置。如果已有音乐库（例如在移动硬盘上），请连接硬盘后选择“打开已有音乐库”。只有主动选择创建，才会生成新库。",
+        { title: "选择音乐库", kind: "info", buttons: { yes: open, no: create, cancel: "退出" } }
+    );
+    if (choice !== open && choice !== create) {
+        await invoke("cancel_database_startup");
+        return false;
+    }
+    const createNew = choice === create;
+    const selected = await __TAURI__.dialog.open({
+        directory: true,
+        multiple: false,
+        title: createNew ? "选择新音乐库的保存文件夹" : "选择已有 library.db 所在文件夹"
+    });
+    if (!selected) return null;
+    if (createNew && !await __TAURI__.dialog.ask(
+        `确认在此文件夹创建一个空音乐库？\n${String(selected)}\n\n如果已有音乐库，请返回并选择“打开已有音乐库”。已有 library.db 不会被覆盖。`,
+        { title: "创建新音乐库", kind: "warning", okLabel: "创建空音乐库", cancelLabel: "返回" }
+    )) return null;
+    await invoke("configure_database_startup", { dir: String(selected), createNew });
+    return true;
 }
 
 async function refreshLocationsAfterFinderChanges() {
@@ -8786,7 +8831,7 @@ async function init() {
 
         ensureTauri();
 
-        await initDB();
+        if (!await initDB()) return;
 
         await setupDatabasePath();
 

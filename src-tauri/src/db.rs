@@ -3,7 +3,6 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use tauri::Manager;
 
 pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 const SCHEMA_VERSION: i64 = 3;
@@ -17,41 +16,49 @@ fn settings_path(dir: &Path) -> PathBuf {
     dir.join("settings.json")
 }
 
-fn load_settings(settings_file: &Path) -> AppSettings {
-    fs::read_to_string(settings_file)
-        .ok()
-        .and_then(|raw| serde_json::from_str(&raw).ok())
-        .unwrap_or_default()
-}
-
-fn resolve_db_path(custom: Option<&str>, default_dir: &Path) -> Result<PathBuf, String> {
-    match custom {
-        Some(custom) if !custom.trim().is_empty() => {
-            let path = PathBuf::from(custom);
-            if let Some(parent) = path.parent() {
-                fs::create_dir_all(parent)
-                    .map_err(|e| format!("无法创建数据库目录: {e}"))?;
-            }
-            Ok(path)
-        }
-        _ => {
-            fs::create_dir_all(default_dir)
-                .map_err(|e| format!("无法创建数据目录: {e}"))?;
-            Ok(default_dir.join("library.db"))
-        }
+fn load_settings(settings_file: &Path) -> Result<Option<AppSettings>, String> {
+    match fs::read_to_string(settings_file) {
+        Ok(raw) => serde_json::from_str(&raw).map(Some)
+            .map_err(|e| format!("音乐库位置设置损坏，已停止打开音乐库，请保留并检查 {}：{e}", settings_file.display())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound
+            && matches!(settings_file.symlink_metadata(), Err(ref cause) if cause.kind() == std::io::ErrorKind::NotFound) => Ok(None),
+        Err(error) => Err(format!("无法读取音乐库位置设置，已停止打开音乐库：{}：{error}", settings_file.display())),
     }
 }
 
-pub fn db_path(app: &tauri::App) -> Result<PathBuf, String> {
-    let dir = app
-        .path()
-        .app_data_dir()
-        .map_err(|e| format!("无法获取数据目录: {e}"))?;
-    let settings = load_settings(&settings_path(&dir));
-    resolve_db_path(settings.db_path.as_deref(), &dir)
+pub fn open_startup_database(default_dir: &Path) -> Result<Option<(PathBuf, Connection)>, String> {
+    let settings_file = settings_path(default_dir);
+    if let Some(settings) = load_settings(&settings_file)? {
+        let path = settings.db_path.filter(|value| !value.trim().is_empty())
+            .map(PathBuf::from).filter(|path| path.is_absolute())
+            .ok_or_else(|| format!("音乐库位置设置缺失或无效，已停止打开音乐库，请检查 {}", settings_file.display()))?;
+        // 已配置的位置只能打开现有库，绝不补建目录、创建替代库或回退默认库。
+        let conn = open_selected_database(&path, false).map_err(|error| format!(
+            "无法打开上次使用的音乐库：\n{}\n\n如果音乐库位于移动硬盘，请连接硬盘，并确认原 library.db 文件仍在后重试。\n\n{error}", path.display()
+        ))?;
+        return Ok(Some((path, conn)));
+    }
+    // 缺配置不能证明首次使用。交给用户选择已有库或明确创建新库。
+    Ok(None)
+}
+
+pub fn configure_startup_database(default_dir: &Path, library_dir: &Path, create_new: bool) -> Result<(PathBuf, Connection), String> {
+    let settings_file = settings_path(default_dir);
+    if load_settings(&settings_file)?.is_some() {
+        return Err("已经保存过音乐库位置，请连接原硬盘后重试，不会创建替代音乐库".into());
+    }
+    let dir = library_dir.canonicalize().map_err(|e| format!("所选目录不可用，请检查移动硬盘是否已连接: {e}"))?;
+    if !dir.is_dir() { return Err("请选择音乐库所在的文件夹".into()); }
+    let path = dir.join("library.db");
+    let mode = if create_new { OpenLibraryMode::CreateNew } else { OpenLibraryMode::Existing };
+    let conn = open_database_file(&path, mode)?;
+    fs::create_dir_all(default_dir).map_err(|e| format!("无法保存音乐库位置: {e}"))?;
+    save_db_path_to(&settings_file, &path)?;
+    Ok((path, conn))
 }
 
 pub fn save_db_path(app: &tauri::AppHandle, path: &Path) -> Result<(), String> {
+    use tauri::Manager;
     let dir = app
         .path()
         .app_data_dir()
@@ -78,32 +85,9 @@ fn save_db_path_to(settings_file: &Path, path: &Path) -> Result<(), String> {
     result.map_err(|e: std::io::Error| format!("保存数据库位置失败: {e}"))
 }
 
-pub fn open_conn(path: &Path) -> Result<Connection, String> {
-    let conn = Connection::open(path)
-        .map_err(|e| format!("无法打开数据库: {e}"))?;
-
-    conn.pragma_update(None, "journal_mode", "WAL")
-        .map_err(|e| format!("设置 WAL 失败: {e}"))?;
-
-    conn.pragma_update(None, "foreign_keys", "ON")
-        .map_err(|e| format!("设置外键失败: {e}"))?;
-
-    Ok(conn)
-}
-
-pub fn init(path: &Path) -> Result<Connection, String> {
-    let mut conn = open_conn(path)?;
-
-    if has_column(&conn, "tags", "category")
-        || has_column(&conn, "music", "tags")
-        || has_column(&conn, "clips", "tags")
-    {
-        backup_legacy_database(&conn, path)?;
-    }
-
-    migrate(&mut conn)?;
-
-    Ok(conn)
+#[cfg(test)]
+fn init(path: &Path) -> Result<Connection, String> {
+    open_selected_database(path, true)
 }
 
 fn backup_legacy_database(conn: &Connection, path: &std::path::Path) -> Result<(), String> {
@@ -115,11 +99,23 @@ fn backup_legacy_database(conn: &Connection, path: &std::path::Path) -> Result<(
 }
 
 fn open_selected_database(target: &Path, create_if_missing: bool) -> Result<Connection, String> {
+    open_database_file(target, if create_if_missing { OpenLibraryMode::CreateIfMissing } else { OpenLibraryMode::Existing })
+}
+
+#[derive(Clone, Copy)]
+enum OpenLibraryMode { Existing, CreateIfMissing, CreateNew }
+
+fn open_database_file(target: &Path, mode: OpenLibraryMode) -> Result<Connection, String> {
+    if !matches!(mode, OpenLibraryMode::Existing) && !target.exists()
+        && ["library.db-wal", "library.db-shm"].iter().any(|name| target.with_file_name(name).exists()) {
+        return Err("数据库主文件缺失，但仍有 SQLite 辅助文件，请先保留并恢复原库，不会创建空库".into());
+    }
     // 只在用户明确确认创建时使用 create_new，绝不截断已有文件。
-    let created = if create_if_missing {
+    let created = if !matches!(mode, OpenLibraryMode::Existing) {
         match fs::OpenOptions::new().write(true).create_new(true).open(target) {
             Ok(_) => true,
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => false,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists && matches!(mode, OpenLibraryMode::CreateIfMissing) => false,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => return Err("该位置已有 library.db，请选择“打开已有音乐库”，不会覆盖它".into()),
             Err(error) => return Err(format!("无法创建数据库: {error}")),
         }
     } else {
@@ -496,24 +492,189 @@ mod tests {
     }
 
     #[test]
-    fn settings_roundtrip_and_fallback_to_default() {
+    fn missing_settings_require_explicit_selection_and_creation() {
         let dir = temp_test_dir("settings");
-        let settings_file = settings_path(&dir);
+        let local = dir.join("app-data");
+        let settings_file = settings_path(&local);
+        assert!(load_settings(&settings_file).unwrap().is_none());
+        assert!(open_startup_database(&local).unwrap().is_none());
+        assert!(!local.exists(), "缺配置不能触发任何建库或建目录");
+        let selected = dir.join("selected");
+        fs::create_dir(&selected).unwrap();
+        let (path, conn) = configure_startup_database(&local, &selected, true).unwrap();
+        assert_eq!(path, selected.canonicalize().unwrap().join("library.db"));
+        assert_eq!(load_settings(&settings_file).unwrap().unwrap().db_path.as_deref(), path.to_str());
+        insert_music(&conn, "default-music");
+        drop(conn);
+        let (_, conn) = open_startup_database(&local).unwrap().unwrap();
+        assert_eq!(music_ids(&conn), ["default-music"]);
+        drop(conn);
+        fs::remove_dir_all(dir).unwrap();
+    }
 
-        let resolved = resolve_db_path(load_settings(&settings_file).db_path.as_deref(), &dir).unwrap();
-        assert_eq!(resolved, dir.join("library.db"), "缺 settings.json 时用默认路径");
+    #[test]
+    fn missing_settings_do_not_automatically_open_even_an_existing_default_library() {
+        let dir = temp_test_dir("startup-legacy-default");
+        let path = dir.join("library.db");
+        let conn = init(&path).unwrap();
+        insert_music(&conn, "existing-default-music");
+        drop(conn);
+        assert!(!settings_path(&dir).exists());
+        let before = fs::read(&path).unwrap();
+        assert!(open_startup_database(&dir).unwrap().is_none());
+        assert_eq!(fs::read(&path).unwrap(), before);
+        assert!(!settings_path(&dir).exists());
+        let (selected_path, conn) = configure_startup_database(&dir, &dir, false).unwrap();
+        assert_eq!(music_ids(&conn), ["existing-default-music"]);
+        assert_eq!(load_settings(&settings_path(&dir)).unwrap().unwrap().db_path.as_deref(), selected_path.to_str());
+        drop(conn);
+        fs::remove_dir_all(dir).unwrap();
+    }
 
-        let custom = dir.join("custom").join("sub").join("library.db");
-        save_db_path_to(&settings_file, &custom).unwrap();
-        let resolved = resolve_db_path(load_settings(&settings_file).db_path.as_deref(), &dir).unwrap();
-        assert_eq!(resolved, custom, "应读回自定义路径");
-        assert!(custom.parent().unwrap().is_dir(), "自定义路径的父目录应已创建");
+    #[cfg(unix)]
+    #[test]
+    fn dangling_settings_link_is_not_treated_as_first_startup() {
+        let dir = temp_test_dir("startup-dangling-settings");
+        let link = settings_path(&dir);
+        std::os::unix::fs::symlink(dir.join("offline/settings.json"), &link).unwrap();
+        assert!(open_startup_database(&dir).is_err());
+        assert!(!dir.join("library.db").exists());
+        assert!(link.symlink_metadata().unwrap().file_type().is_symlink());
+        fs::remove_dir_all(dir).unwrap();
+    }
 
-        std::fs::write(&settings_file, "{ 不是合法 json").unwrap();
-        let resolved = resolve_db_path(load_settings(&settings_file).db_path.as_deref(), &dir).unwrap();
-        assert_eq!(resolved, dir.join("library.db"), "settings.json 损坏时回退默认路径");
+    #[test]
+    fn disconnected_drive_never_creates_directories_or_falls_back_and_can_retry() {
+        let dir = temp_test_dir("startup-disconnected");
+        let local = dir.join("app-data");
+        fs::create_dir(&local).unwrap();
+        let local_conn = init(&local.join("library.db")).unwrap();
+        insert_music(&local_conn, "local-library");
+        drop(local_conn);
+        let mounted = dir.join("external-drive");
+        fs::create_dir(&mounted).unwrap();
+        let external_path = mounted.join("library.db");
+        let external = init(&external_path).unwrap();
+        insert_music(&external, "external-library");
+        drop(external);
+        let settings = settings_path(&local);
+        save_db_path_to(&settings, &external_path).unwrap();
+        let settings_before = fs::read(&settings).unwrap();
+        let external_before = fs::read(&external_path).unwrap();
+        let local_before = fs::read(local.join("library.db")).unwrap();
 
-        std::fs::remove_dir_all(dir).unwrap();
+        let offline = dir.join("disconnected");
+        fs::rename(&mounted, &offline).unwrap();
+        let error = open_startup_database(&local).err().expect("未接硬盘必须停止启动");
+        assert!(error.contains("请连接硬盘"), "{error}");
+        assert!(error.contains(external_path.to_str().unwrap()));
+        assert!(!mounted.exists(), "不能补建挂载点或父目录");
+        assert_eq!(fs::read(&settings).unwrap(), settings_before);
+        assert_eq!(fs::read(offline.join("library.db")).unwrap(), external_before);
+        assert_eq!(fs::read(local.join("library.db")).unwrap(), local_before, "不能打开或改写默认库");
+        assert!(configure_startup_database(&local, &dir, true).is_err(), "已有配置不能通过启动配置接口创建替代库");
+        assert!(!dir.join("library.db").exists());
+        assert_eq!(fs::read(&settings).unwrap(), settings_before);
+
+        fs::rename(&offline, &mounted).unwrap();
+        let (opened_path, conn) = open_startup_database(&local).unwrap().unwrap();
+        assert_eq!(opened_path, external_path);
+        assert_eq!(music_ids(&conn), ["external-library"], "重试应重新打开硬盘原库");
+        drop(conn);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn configured_file_missing_in_existing_directory_is_not_recreated() {
+        let dir = temp_test_dir("startup-missing-file");
+        let target_dir = dir.join("external");
+        fs::create_dir(&target_dir).unwrap();
+        let path = target_dir.join("library.db");
+        let conn = init(&path).unwrap();
+        insert_music(&conn, "keep-original");
+        drop(conn);
+        let settings = settings_path(&dir);
+        save_db_path_to(&settings, &path).unwrap();
+        let saved = target_dir.join("original.db");
+        fs::rename(&path, &saved).unwrap();
+        let before = fs::read(&saved).unwrap();
+        assert!(open_startup_database(&dir).is_err());
+        assert!(!path.exists(), "父目录存在也不能新建替代数据库");
+        assert!(!dir.join("library.db").exists(), "不能回退并创建默认库");
+        assert_eq!(fs::read(saved).unwrap(), before);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn remembered_default_database_is_not_recreated_if_missing() {
+        let dir = temp_test_dir("startup-missing-default");
+        let (path, conn) = configure_startup_database(&dir, &dir, true).unwrap();
+        drop(conn);
+        fs::remove_file(&path).unwrap();
+        assert!(open_startup_database(&dir).is_err());
+        assert!(!path.exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn invalid_settings_never_fall_back_or_change_the_settings() {
+        let dir = temp_test_dir("startup-invalid-settings");
+        let settings = settings_path(&dir);
+        for invalid in ["{ 不合法 json", "{}", r#"{"db_path":null}"#, r#"{"db_path":" "}"#, r#"{"db_path":"relative/library.db"}"#] {
+            fs::write(&settings, invalid).unwrap();
+            assert!(open_startup_database(&dir).is_err(), "应拒绝：{invalid}");
+            assert!(!dir.join("library.db").exists());
+            assert_eq!(fs::read_to_string(&settings).unwrap(), invalid);
+        }
+        fs::remove_file(&settings).unwrap();
+        fs::create_dir(&settings).unwrap();
+        assert!(open_startup_database(&dir).is_err(), "设置不可读时不能当作首次启动");
+        assert!(!dir.join("library.db").exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn orphaned_wal_is_preserved_even_when_user_requests_a_new_library() {
+        let dir = temp_test_dir("startup-orphaned-wal");
+        fs::write(dir.join("library.db-wal"), b"preserve-wal").unwrap();
+        assert!(open_startup_database(&dir).unwrap().is_none());
+        assert!(configure_startup_database(&dir, &dir, true).is_err());
+        assert!(!dir.join("library.db").exists());
+        assert!(!settings_path(&dir).exists());
+        assert_eq!(fs::read(dir.join("library.db-wal")).unwrap(), b"preserve-wal");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn startup_creation_never_overwrites_an_existing_library() {
+        let dir = temp_test_dir("startup-create-existing");
+        let local = dir.join("app-data");
+        let selected = dir.join("external");
+        fs::create_dir(&selected).unwrap();
+        let path = selected.join("library.db");
+        let original = init(&path).unwrap();
+        insert_music(&original, "old-library");
+        drop(original);
+        let before = fs::read(&path).unwrap();
+        assert!(configure_startup_database(&local, &selected, true).is_err());
+        assert_eq!(fs::read(&path).unwrap(), before);
+        assert!(!local.exists());
+        let (_, conn) = configure_startup_database(&local, &selected, false).unwrap();
+        assert_eq!(music_ids(&conn), ["old-library"]);
+        drop(conn);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn startup_open_existing_never_creates_a_missing_library() {
+        let dir = temp_test_dir("startup-open-missing");
+        let local = dir.join("app-data");
+        let selected = dir.join("external");
+        fs::create_dir(&selected).unwrap();
+        assert!(configure_startup_database(&local, &selected, false).is_err());
+        assert!(!selected.join("library.db").exists());
+        assert!(!local.exists());
+        fs::remove_dir_all(dir).unwrap();
     }
 
     fn insert_music(conn: &Connection, id: &str) {
@@ -552,7 +713,7 @@ mod tests {
         assert_eq!(conn.query_row("SELECT tag_id FROM music_tags WHERE music_id='old-music'", [], |r| r.get::<_, i64>(0)).unwrap(), tag);
         assert_eq!(conn.query_row("SELECT tag_id FROM clip_tags WHERE clip_id='old-clip'", [], |r| r.get::<_, i64>(0)).unwrap(), tag);
         assert_eq!(conn.query_row("SELECT target_id FROM candidate_entries", [], |r| r.get::<_, String>(0)).unwrap(), "old-clip");
-        assert_eq!(load_settings(&settings_file).db_path.as_deref(), current.to_str());
+        assert_eq!(load_settings(&settings_file).unwrap().unwrap().db_path.as_deref(), current.to_str());
 
         insert_music(&conn, "new-music");
         assert_eq!(music_ids(&old_library), ["new-music", "old-music"], "新操作应写到外置硬盘的库");

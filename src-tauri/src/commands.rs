@@ -1,6 +1,7 @@
 use crate::AppState;
 use rusqlite::{params, params_from_iter, OptionalExtension};
 use serde::{Deserialize, Serialize};
+use tauri::Manager;
 use std::{
     collections::HashMap,
     fs::{self, File},
@@ -411,9 +412,18 @@ fn probe_path(path: String) -> ProbeResult {
 }
 
 #[tauri::command]
-pub fn init_db() -> Result<(), String> {
-    // 数据库连接在 setup 阶段已建立并建表，这里确认就绪即可
-    Ok(())
+pub fn init_db(app: tauri::AppHandle) -> Result<bool, String> {
+    crate::initialize_database(&app)
+}
+
+#[tauri::command]
+pub fn configure_database_startup(app: tauri::AppHandle, dir: String, create_new: bool) -> Result<(), String> {
+    crate::configure_database_startup(&app, Path::new(&dir), create_new)
+}
+
+#[tauri::command]
+pub fn cancel_database_startup(app: tauri::AppHandle) {
+    if app.try_state::<AppState>().is_none() { app.exit(0); }
 }
 
 #[tauri::command]

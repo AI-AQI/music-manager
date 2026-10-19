@@ -8,11 +8,16 @@ const source = fs.readFileSync(path.join(__dirname, "../frontend/app.js"), "utf8
 const bridge = source.slice(0, source.indexOf("const TAG_GROUP_COLLAPSED_STORAGE_KEY"));
 const start = source.indexOf("async function changeDatabaseLocation()");
 const switcher = source.slice(start, source.indexOf("\n\n/* ===", start));
+const startup = source.slice(source.indexOf("async function initDB()"), source.indexOf("async function refreshLocationsAfterFinderChanges()"));
+const initialize = source.slice(source.indexOf("async function init()"), source.lastIndexOf("\n\ninit();"));
 
-function setup({ exists = true, selected = "/external/music-library", confirmed = true, onInvoke } = {}) {
+function setup({ exists = true, selected = "/external/music-library", confirmed = true, onInvoke, retryAnswers = [], startupChoices = [], creationAnswers = [] } = {}) {
     const calls = [];
     const messages = [];
     const confirmations = [];
+    const startupPrompts = [];
+    const libraryChoices = [];
+    const creationPrompts = [];
     const button = { disabled: false };
     const body = { inert: false };
     let reloads = 0;
@@ -25,23 +30,40 @@ function setup({ exists = true, selected = "/external/music-library", confirmed 
         showToast() {},
         showMessage: async message => messages.push(message),
         getErrorMessage: error => error.message || String(error),
+        ensureTauri() {},
+        alert: message => { throw new Error(`Unexpected initialization alert: ${message}`); },
         __TAURI__: {
             core: {
                 convertFileSrc() {},
                 invoke: async (command, args) => {
                     calls.push({ command, args });
-                    if (onInvoke) await onInvoke(command, args);
+                    const result = onInvoke ? await onInvoke(command, args) : undefined;
+                    if (command === "init_db") return result ?? true;
                     if (command === "file_exists") return exists;
                     if (command === "set_database_location") return `${selected}/library.db`;
                 }
             },
-            dialog: { open: async () => selected }
+            dialog: {
+                open: async () => selected,
+                ask: async (message, options) => {
+                    if (options.title === "创建新音乐库") {
+                        creationPrompts.push({ message, options });
+                        return creationAnswers.shift() ?? false;
+                    }
+                    startupPrompts.push({ message, options });
+                    return retryAnswers.shift() ?? false;
+                },
+                message: async (message, options) => {
+                    libraryChoices.push({ message, options });
+                    return startupChoices.shift() ?? "退出";
+                }
+            }
         }
     };
     context.window.__TAURI__ = context.__TAURI__;
     vm.createContext(context);
-    vm.runInContext(`${bridge}\n${switcher}`, context);
-    return { context, calls, messages, confirmations, button, body, reloads: () => reloads };
+    vm.runInContext(`${bridge}\n${switcher}\n${startup}\n${initialize}`, context);
+    return { context, calls, messages, confirmations, startupPrompts, libraryChoices, creationPrompts, button, body, reloads: () => reloads };
 }
 
 test("existing external library is opened without an overwrite parameter, then UI reloads", async () => {
@@ -107,4 +129,98 @@ test("switch waits for an old-library write and blocks its follow-up writes", as
     await switching;
     assert.equal(app.calls.some(c => c.command === "create_clip"), false);
     assert.equal(app.reloads(), 1);
+});
+
+test("successful startup enables the interface only after opening the database", async () => {
+    let finishOpening;
+    const opening = new Promise(resolve => { finishOpening = resolve; });
+    const app = setup({ onInvoke: async command => {
+        if (command === "init_db") await opening;
+    } });
+    const startup = app.context.initDB();
+    assert.equal(app.body.inert, true);
+    finishOpening();
+    assert.equal(await startup, true);
+    assert.equal(app.body.inert, false);
+    assert.equal(app.startupPrompts.length, 0);
+});
+
+test("missing drive prompts to connect and retries without selecting or creating another library", async () => {
+    let attempts = 0;
+    const app = setup({ retryAnswers: [true], onInvoke: async command => {
+        if (command === "init_db" && attempts++ === 0) throw new Error("无法打开 /Volumes/Music/library.db，请连接硬盘");
+    } });
+    assert.equal(await app.context.initDB(), true);
+    assert.deepEqual(app.calls.map(c => c.command), ["init_db", "init_db"]);
+    assert.match(app.startupPrompts[0].message, /请先连接硬盘/);
+    assert.equal(app.startupPrompts[0].options.okLabel, "重试");
+    assert.equal(app.startupPrompts[0].options.cancelLabel, "退出");
+    assert.equal(app.body.inert, false);
+});
+
+test("cancelling startup exits without loading candidates, rendering or binding library actions", async () => {
+    const app = setup({ retryAnswers: [false], onInvoke: async command => {
+        if (command === "init_db") throw new Error("请连接硬盘");
+    } });
+    await app.context.init();
+    assert.deepEqual(app.calls.map(c => c.command), ["init_db", "cancel_database_startup"]);
+    assert.equal(app.body.inert, true);
+    assert.equal(app.reloads(), 0);
+});
+
+test("failed retries remain blocked and never fall back to an empty library", async () => {
+    const app = setup({ retryAnswers: [true, false], onInvoke: async command => {
+        if (command === "init_db") throw new Error("音乐库不可用");
+    } });
+    assert.equal(await app.context.initDB(), false);
+    assert.deepEqual(app.calls.map(c => c.command), ["init_db", "init_db", "cancel_database_startup"]);
+    assert.equal(app.startupPrompts.length, 2);
+    assert.equal(app.body.inert, true);
+});
+
+test("missing configuration requires explicit choice to open an existing library", async () => {
+    const app = setup({ startupChoices: ["打开已有音乐库"], onInvoke: async command => {
+        if (command === "init_db") return false;
+    } });
+    assert.equal(await app.context.initDB(), true);
+    assert.deepEqual(app.calls.map(c => c.command), ["init_db", "configure_database_startup"]);
+    assert.equal(app.calls[1].args.createNew, false);
+    assert.equal(app.calls[1].args.dir, "/external/music-library");
+    assert.equal(app.creationPrompts.length, 0);
+    assert.equal(app.body.inert, false);
+});
+
+test("creating a startup library requires choosing create and confirming it", async () => {
+    const app = setup({ startupChoices: ["创建新音乐库"], creationAnswers: [true], onInvoke: async command => {
+        if (command === "init_db") return false;
+    } });
+    assert.equal(await app.context.initDB(), true);
+    assert.equal(app.creationPrompts.length, 1);
+    assert.equal(app.calls.find(c => c.command === "configure_database_startup").args.createNew, true);
+});
+
+test("cancelling creation never configures or creates a library", async () => {
+    const app = setup({ startupChoices: ["创建新音乐库", "退出"], creationAnswers: [false], onInvoke: async command => {
+        if (command === "init_db") return false;
+    } });
+    assert.equal(await app.context.initDB(), false);
+    assert.equal(app.calls.some(c => c.command === "configure_database_startup"), false);
+    assert.equal(app.body.inert, true);
+});
+
+test("cancelling directory selection does not substitute a default library", async () => {
+    const app = setup({ selected: null, startupChoices: ["打开已有音乐库", "退出"], onInvoke: async command => {
+        if (command === "init_db") return false;
+    } });
+    assert.equal(await app.context.initDB(), false);
+    assert.equal(app.calls.some(c => c.command === "configure_database_startup"), false);
+});
+
+test("damaged configuration shows an error, never the create-new-library choice", async () => {
+    const app = setup({ startupChoices: ["创建新音乐库"], onInvoke: async command => {
+        if (command === "init_db") throw new Error("位置设置损坏");
+    } });
+    assert.equal(await app.context.initDB(), false);
+    assert.equal(app.libraryChoices.length, 0);
+    assert.equal(app.calls.some(c => c.command === "configure_database_startup"), false);
 });

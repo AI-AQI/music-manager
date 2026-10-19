@@ -9,6 +9,29 @@ pub struct AppState {
     pub db_path: Mutex<std::path::PathBuf>,
 }
 
+struct DatabaseStartupLock(Mutex<()>);
+
+pub fn initialize_database(app: &tauri::AppHandle) -> Result<bool, String> {
+    let startup = app.state::<DatabaseStartupLock>();
+    let _guard = startup.0.lock().map_err(|e| format!("音乐库初始化锁获取失败: {e}"))?;
+    if app.try_state::<AppState>().is_some() { return Ok(true); }
+    let dir = app.path().app_data_dir().map_err(|e| format!("无法获取数据目录: {e}"))?;
+    let Some((path, conn)) = db::open_startup_database(&dir)? else { return Ok(false); };
+    // 只有真正打开了目标库才注册数据库状态，失败时不提供临时或默认连接。
+    app.manage(AppState { db: Mutex::new(conn), db_path: Mutex::new(path) });
+    Ok(true)
+}
+
+pub fn configure_database_startup(app: &tauri::AppHandle, dir: &std::path::Path, create_new: bool) -> Result<(), String> {
+    let startup = app.state::<DatabaseStartupLock>();
+    let _guard = startup.0.lock().map_err(|e| format!("音乐库初始化锁获取失败: {e}"))?;
+    if app.try_state::<AppState>().is_some() { return Err("音乐库已经打开，请使用“切换音乐库”".into()); }
+    let default_dir = app.path().app_data_dir().map_err(|e| format!("无法获取数据目录: {e}"))?;
+    let (path, conn) = db::configure_startup_database(&default_dir, dir, create_new)?;
+    app.manage(AppState { db: Mutex::new(conn), db_path: Mutex::new(path) });
+    Ok(())
+}
+
 /* cargo tauri dev 跑的是裸二进制，没有 .app bundle，macOS 无从读取 bundle 图标——
    dev 构建下运行时手动把图标设到 Dock 上；release 走 bundle 里的 icon.icns，不需要 */
 #[cfg(all(target_os = "macos", debug_assertions))]
@@ -40,17 +63,15 @@ pub fn run() {
             #[cfg(all(target_os = "macos", debug_assertions))]
             set_dock_icon();
 
-            let path = db::db_path(app)?;
-            let conn = db::init(&path)?;
-            app.manage(AppState {
-                db: Mutex::new(conn),
-                db_path: Mutex::new(path),
-            });
+            // 初始化交给首个 init_db 请求，失败时窗口仍能提示连接硬盘并重试。
+            app.manage(DatabaseStartupLock(Mutex::new(())));
 
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             commands::init_db,
+            commands::configure_database_startup,
+            commands::cancel_database_startup,
             commands::probe_file,
             commands::export_clip_wav,
             commands::scan_import_sources,
