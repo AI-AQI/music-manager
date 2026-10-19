@@ -35,23 +35,31 @@
 
 > 如果你是剪辑师朋友、完全不碰代码 —— 这部分就够了。
 
-你收到的是一个 `.dmg` 安装包，**不需要安装 Node、Rust 或任何开发环境**。当前版本尚未进行 Apple 签名和公证；因此从浏览器下载后，macOS 可能会阻止直接打开。
+你收到的是一个 `.dmg` 安装包，**不需要安装 Node、Rust 或任何开发环境**。新打包流程使用免费的 ad-hoc（临时）签名，未进行 Apple Developer ID 签名或公证；从浏览器下载后，macOS 仍可能要求首次手动允许打开。已经发布的旧包不会自动得到这个签名修复。
 
 ### 安装与打开
 
-1. 双击 `.dmg`，把「声场档案」拖进「应用程序」。
-2. 请按 Mac 芯片选择 DMG：M1/M2/M3/M4 下载文件名含 `aarch64` 的版本；Intel Mac 下载文件名含 `x64` 的版本。若 macOS 显示“已损坏”或阻止打开，请从同一个 GitHub Release 一并下载 `install-macos.sh`，然后在终端运行（DMG 路径按实际下载位置填写）：
-   ```bash
-   bash "$HOME/Downloads/install-macos.sh" "$HOME/Downloads/music-manager_0.1.2_aarch64.dmg"
-   ```
-   脚本会校验 DMG、复制应用并移除**该应用**的下载隔离标记；它会要求输入 Mac 管理员密码。
-   已有旧版本时，在命令末尾加 `--replace`。
-   ```bash
-   bash "$HOME/Downloads/install-macos.sh" "$HOME/Downloads/music-manager_0.1.2_aarch64.dmg" --replace
-   ```
-3. 打开后点击右上角 **「＋ 导入音乐」**,选择或拖入你的音频文件。
+1. 请按 Mac 芯片选择 DMG：M 系列芯片下载文件名含 `aarch64` 的版本；Intel Mac 下载文件名含 `x64` 的版本。
+2. 双击 `.dmg`，把「声场档案」拖进「应用程序」，再从「应用程序」中双击打开。
+3. 若提示无法验证开发者或 Apple 无法检查，请打开 **「系统设置 → 隐私与安全性」**，找到「声场档案」，点击 **「仍要打开」**，再确认「打开」。以后通常可以直接双击。这是 Apple 提供的单应用放行流程，是否可用取决于 macOS 版本和设备策略，详见 [Apple 说明](https://support.apple.com/zh-cn/102445)。
+4. 打开后点击右上角 **「＋ 导入音乐」**，选择或拖入你的音频文件。
 
-> 这是小范围测试的临时安装方式。未签名应用无法保证在所有 macOS 设置下都能无提示安装；正式发布仍需要 Apple Developer ID 签名与公证。
+### 旧包或仍无法打开时
+
+若提示“已损坏”，先重新下载带有完整 ad-hoc 签名的新包。若仍无法安装，或正在使用旧版本，可从同一个 GitHub Release 下载 `install-macos.sh`，然后在终端运行（版本号和 DMG 路径按实际下载位置填写）：
+
+```bash
+bash "$HOME/Downloads/install-macos.sh" "$HOME/Downloads/music-manager_0.2.3_aarch64.dmg"
+```
+
+脚本会校验 DMG、复制应用并移除**该应用**的下载隔离标记；它会要求输入 Mac 管理员密码。
+已有旧版本时，在命令末尾加 `--replace`。
+
+```bash
+bash "$HOME/Downloads/install-macos.sh" "$HOME/Downloads/music-manager_0.2.3_aarch64.dmg" --replace
+```
+
+> 脚本是小范围测试的备用方式，只用于确认来源的本项目安装包。ad-hoc 签名验证文件完整性，不认证开发者身份，也不能保证 macOS 自动放行。顺畅的正式站外分发仍需要 Apple Developer ID 签名与公证。
 
 ### 数据存在哪里
 
@@ -147,7 +155,9 @@ cd src-tauri && cargo tauri build --target x86_64-apple-darwin
 
 > 备选:也可以打 Universal Binary(一个 dmg 通吃两种 Mac),`cargo tauri build --target universal-apple-darwin`,产物为 `声场档案_0.1.2_universal.dmg`,但体积约大一倍。我们默认用上面的分架构方式。
 
-发布 GitHub Release 时，同时上传 `aarch64` 和 `x64` 两个 `.dmg`，以及仓库中的 `scripts/install-macos.sh`。未签名应用从浏览器下载后可能显示“已损坏”；按上方「给使用者的说明」运行安装脚本。要彻底免提示需 Apple 开发者账号签名与公证($99/年)。
+`tauri.conf.json` 中的 `bundle.macOS.signingIdentity` 设为 `"-"`，让 Tauri 对完整 App 进行免费的 ad-hoc 签名。仅有编译器对可执行文件生成的链接器签名不能替代整个 App 的签名；旧的 0.2.2 安装包在此处校验失败。发布流程会执行 `codesign --verify --deep --strict` 和 DMG 校验，失败则停止发布。该检查通过不代表 Gatekeeper 会自动放行。
+
+发布 GitHub Release 时，同时上传 `aarch64` 和 `x64` 两个 `.dmg`，以及备用的 `scripts/install-macos.sh`。使用者优先按上方图形界面步骤安装；已有 Release 需要重新打包发布才会包含修复。Apple Developer ID 签名与公证需要开发者会员（通常 $99/年），即使完成后首次打开仍可能出现“从互联网下载”的普通确认。
 
 ### 常用命令(增删改查)
 

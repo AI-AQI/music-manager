@@ -89,6 +89,15 @@ jobs:
         run: cargo tauri build --target ${{ matrix.target }}
         working-directory: src-tauri
 
+      # 免费 ad-hoc 签名也必须覆盖整个 App；只有链接器签名的包会在这里失败。
+      # 此检查验证完整性，不代表通过 Gatekeeper 或完成 Apple 公证。
+      - name: Verify app signature and DMG integrity
+        run: |
+          codesign --verify --deep --strict --verbose=2 "src-tauri/target/${{ matrix.target }}/release/bundle/macos/声场档案.app"
+          for dmg in src-tauri/target/${{ matrix.target }}/release/bundle/dmg/*.dmg; do
+            hdiutil verify "$dmg"
+          done
+
       # 关键一步：把中文名 dmg 重命名成纯 ASCII 名，再上传，避免中文在发布时被“删掉”
       - name: Rename to ASCII asset name
         id: rename
@@ -130,9 +139,11 @@ jobs:
           generate_release_notes: true
           # 加了 body 后，它会被放在自动生成的 release notes 之前
           body: |
+            修复旧安装包仅含可执行文件链接器签名、整个 App 签名校验失败的问题。两个 Mac 架构均使用完整的免费 ad-hoc 签名，并在发布前检查 App 签名和 DMG 完整性。
+
             ### 下载文件
 
-            请根据你的 Mac 芯片下载对应的 DMG，并同时下载 `install-macos.sh`：
+            请根据你的 Mac 芯片下载对应的 DMG：
 
             | 设备 | 下载文件 |
             | --- | --- |
@@ -141,7 +152,17 @@ jobs:
 
             ### 安装
 
-            当前版本尚未进行 Apple 签名与公证。浏览器下载后，如果 macOS 提示“已损坏”或阻止打开，请打开“终端”，运行以下命令。
+            安装包使用免费的 ad-hoc（临时）签名，未进行 Apple Developer ID 签名或公证。macOS 仍可能要求首次手动允许打开。
+
+            1. 打开 DMG，将「声场档案」拖到「应用程序」。
+            2. 在「应用程序」中双击「声场档案」。
+            3. 若提示无法验证开发者或 Apple 无法检查，请打开「系统设置 → 隐私与安全性」，找到「声场档案」并点击「仍要打开」，再确认「打开」。以后通常可直接双击。
+
+            「仍要打开」是否出现取决于 macOS 版本和设备策略；修复签名不代表系统会自动放行。
+
+            ### 旧包或仍无法打开时
+
+            若提示“已损坏”，先重新下载本 Release 的 DMG。仍无法安装时，或正在使用旧版本，可从同一个 Release 下载 `install-macos.sh`，再打开“终端”运行以下命令。不要将此脚本用于来源不明的安装包。
 
             Apple Silicon Mac：
 
@@ -166,7 +187,7 @@ jobs:
             ### 注意
 
             - 删除音乐或片段只会移除软件中的记录，不会删除原始音频文件。
-            - 当前安装脚本用于小范围测试；正式无提示安装仍需要 Apple Developer ID 签名与公证。
+            - 当前安装脚本用于小范围测试；顺畅的正式站外分发需要 Apple Developer ID 签名与公证，首次打开仍可能有普通的下载确认提示。
           # 想先人工确认再发，就打开下面这行：
           # draft: true
           # 预发布版本（如 v0.1.0-beta.1）打开下面这行：
