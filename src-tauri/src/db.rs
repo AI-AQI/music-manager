@@ -1,6 +1,7 @@
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use tauri::Manager;
 
@@ -62,8 +63,19 @@ fn save_db_path_to(settings_file: &Path, path: &Path) -> Result<(), String> {
     let settings = AppSettings { db_path: Some(path.to_string_lossy().into_owned()) };
     let raw = serde_json::to_string_pretty(&settings)
         .map_err(|e| format!("序列化设置失败: {e}"))?;
-    fs::write(settings_file, raw)
-        .map_err(|e| format!("保存数据库位置失败: {e}"))
+    let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| format!("保存数据库位置失败: {e}"))?.as_nanos();
+    let temporary = settings_file.with_extension(format!("json.{}.{nonce}.tmp", std::process::id()));
+    let mut file = fs::OpenOptions::new().write(true).create_new(true).open(&temporary)
+        .map_err(|e| format!("保存数据库位置失败: {e}"))?;
+    let result = (|| {
+        file.write_all(raw.as_bytes())?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&temporary, settings_file)
+    })();
+    if result.is_err() { let _ = fs::remove_file(&temporary); }
+    result.map_err(|e: std::io::Error| format!("保存数据库位置失败: {e}"))
 }
 
 pub fn open_conn(path: &Path) -> Result<Connection, String> {
@@ -102,19 +114,81 @@ fn backup_legacy_database(conn: &Connection, path: &std::path::Path) -> Result<(
     Ok(())
 }
 
-pub fn migrate_database_file(conn: &Connection, target: &Path) -> Result<(), String> {
-    conn.execute("VACUUM main INTO ?1", params![target.to_string_lossy().as_ref()])
-        .map_err(|e| format!("迁移数据库失败: {e}"))?;
-    let check = Connection::open(target)
-        .map_err(|e| format!("校验新数据库失败: {e}"))?;
-    if let Err(e) = check.query_row("SELECT COUNT(*) FROM music", [], |row| row.get::<_, i64>(0)) {
-        let _ = fs::remove_file(target);
-        return Err(format!("校验新数据库失败: {e}"));
+fn open_selected_database(target: &Path, create_if_missing: bool) -> Result<Connection, String> {
+    // 只在用户明确确认创建时使用 create_new，绝不截断已有文件。
+    let created = if create_if_missing {
+        match fs::OpenOptions::new().write(true).create_new(true).open(target) {
+            Ok(_) => true,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => false,
+            Err(error) => return Err(format!("无法创建数据库: {error}")),
+        }
+    } else {
+        false
+    };
+    // 不使用 SQLITE_OPEN_CREATE：已经存在的库在切换过程中消失时应报错，不能偷偷新建空库。
+    let mut conn = Connection::open_with_flags(target, OpenFlags::SQLITE_OPEN_READ_WRITE)
+        .map_err(|e| format!("无法打开所选数据库，请检查文件和移动硬盘是否可用: {e}"))?;
+    if !created {
+        let check: String = conn.query_row("PRAGMA quick_check", [], |row| row.get(0))
+            .map_err(|e| format!("所选数据库无效: {e}"))?;
+        if check != "ok" { return Err(format!("所选数据库校验失败: {check}")); }
+        for query in ["SELECT id, name, path FROM music LIMIT 0", "SELECT id, music_id, start, end FROM clips LIMIT 0"] {
+            conn.prepare(query).map_err(|e| format!("所选文件不是有效的声场档案数据库: {e}"))?;
+        }
+        // 兼容性检查必须先于 WAL 设置和表结构升级，拒绝新版本库时不写入它。
+        check_schema_version(&conn)?;
+    }
+    conn.pragma_update(None, "journal_mode", "WAL")
+        .map_err(|e| format!("设置 WAL 失败: {e}"))?;
+    conn.pragma_update(None, "foreign_keys", "ON")
+        .map_err(|e| format!("设置外键失败: {e}"))?;
+    if has_column(&conn, "tags", "category") || has_column(&conn, "music", "tags") || has_column(&conn, "clips", "tags") {
+        backup_legacy_database(&conn, target)?;
+    }
+    migrate(&mut conn)?;
+    Ok(conn)
+}
+
+pub fn switch_database_location(
+    conn: &mut Connection,
+    current_path: &mut PathBuf,
+    dir: &Path,
+    create_if_missing: bool,
+    persist: impl FnOnce(&Path) -> Result<(), String>,
+) -> Result<String, String> {
+    let dir = dir.canonicalize().map_err(|e| format!("所选目录不可用，请检查移动硬盘是否已连接: {e}"))?;
+    if !dir.is_dir() { return Err("请选择数据库所在的文件夹".into()); }
+    let target = dir.join("library.db");
+    if target == *current_path || target.canonicalize().ok().is_some_and(|resolved| current_path.canonicalize().ok() == Some(resolved)) {
+        return Err("所选位置就是当前数据库位置".into());
+    }
+    let new_conn = open_selected_database(&target, create_if_missing)?;
+    // 设置保存成功后才发布新连接；失败时原连接和路径保持有效。两个库都不删除。
+    persist(&target)?;
+    *conn = new_conn;
+    *current_path = target.clone();
+    Ok(target.to_string_lossy().into_owned())
+}
+
+fn check_schema_version(conn: &Connection) -> Result<(), String> {
+    let has_metadata: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='app_metadata')",
+        [], |row| row.get(0),
+    ).map_err(|e| format!("读取数据库版本失败: {e}"))?;
+    if !has_metadata { return Ok(()); }
+    let recorded_schema = conn.query_row(
+        "SELECT value FROM app_metadata WHERE key='schema_version'", [], |row| row.get::<_, String>(0),
+    ).optional().map_err(|e| format!("读取数据库版本失败: {e}"))?
+        .map(|value| value.parse::<i64>().map_err(|_| "数据库版本记录无效".to_string()))
+        .transpose()?.unwrap_or(0);
+    if recorded_schema > SCHEMA_VERSION {
+        return Err(format!("数据库版本 {recorded_schema} 高于当前程序支持的版本 {SCHEMA_VERSION}，已停止写入"));
     }
     Ok(())
 }
 
 fn migrate(conn: &mut Connection) -> Result<(), String> {
+    check_schema_version(conn)?;
     conn.execute_batch(
         r#"
         CREATE TABLE IF NOT EXISTS music (
@@ -225,16 +299,6 @@ fn migrate(conn: &mut Connection) -> Result<(), String> {
 
     // 旧版本的分类表以 name 为主键，tags 以 category 文本引用。先在保留
     // Tag ID 的前提下重建为维度 + 自关联节点，关联表无需改写数据。
-    let recorded_schema = conn.query_row(
-        "SELECT value FROM app_metadata WHERE key='schema_version'",
-        [],
-        |row| row.get::<_, String>(0),
-    ).optional().map_err(|e| format!("读取数据库版本失败: {e}"))?
-        .and_then(|value| value.parse::<i64>().ok()).unwrap_or(0);
-    if recorded_schema > SCHEMA_VERSION {
-        return Err(format!("数据库版本 {recorded_schema} 高于当前程序支持的版本 {SCHEMA_VERSION}，已停止写入"));
-    }
-
     if has_column(conn, "tags", "category") { migrate_legacy_tag_tree(conn)?; }
     conn.execute_batch("CREATE UNIQUE INDEX IF NOT EXISTS idx_tags_sibling_name ON tags(category_id, COALESCE(parent_id, -1), name COLLATE NOCASE); CREATE INDEX IF NOT EXISTS idx_tags_category_parent ON tags(category_id, parent_id);")
         .map_err(|e| format!("建立 Tag 树索引失败: {e}"))?;
@@ -452,39 +516,166 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
-    #[test]
-    fn migrate_database_copies_wal_data() {
-        let dir = temp_test_dir("migrate");
-        let source = dir.join("library.db");
-        let conn = Connection::open(&source).unwrap();
-        conn.pragma_update(None, "journal_mode", "WAL").unwrap();
-        conn.execute_batch("CREATE TABLE music(id TEXT PRIMARY KEY); INSERT INTO music VALUES ('m1');").unwrap();
+    fn insert_music(conn: &Connection, id: &str) {
+        conn.execute("INSERT INTO music(id, name, path, created_at, updated_at) VALUES (?1, ?1, ?1, 1, 1)", [id]).unwrap();
+    }
 
-        let target = dir.join("moved").join("library.db");
-        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
-        migrate_database_file(&conn, &target).unwrap();
-
-        let migrated = Connection::open(&target).unwrap();
-        let count: i64 = migrated.query_row("SELECT COUNT(*) FROM music", [], |row| row.get(0)).unwrap();
-        assert_eq!(count, 1, "WAL 中未 checkpoint 的数据也要迁过去");
-        drop(migrated);
-        drop(conn);
-        std::fs::remove_dir_all(dir).unwrap();
+    fn music_ids(conn: &Connection) -> Vec<String> {
+        conn.prepare("SELECT id FROM music ORDER BY id").unwrap()
+            .query_map([], |row| row.get(0)).unwrap().collect::<Result<_, _>>().unwrap()
     }
 
     #[test]
-    fn migrate_database_rejects_existing_target() {
-        let dir = temp_test_dir("migrate-reject");
+    fn switch_from_empty_library_preserves_external_music_tags_clips_and_wal() {
+        let dir = temp_test_dir("switch-external");
         let source = dir.join("library.db");
-        let conn = Connection::open(&source).unwrap();
-        conn.execute_batch("CREATE TABLE music(id TEXT PRIMARY KEY);").unwrap();
+        let mut current = source.clone();
+        let mut conn = init(&source).unwrap();
+        let external = dir.join("external");
+        fs::create_dir(&external).unwrap();
+        let target = external.join("library.db");
+        let old_library = init(&target).unwrap();
+        old_library.pragma_update(None, "wal_autocheckpoint", 0).unwrap();
+        insert_music(&old_library, "old-music");
+        let tag = add_tag(&old_library, "朋友整理的标签", "情绪", None);
+        old_library.execute("INSERT INTO music_tags VALUES ('old-music', ?1)", [tag]).unwrap();
+        old_library.execute("INSERT INTO clips VALUES ('old-clip', 'old-music', '旧片段', 1, 3, 1, 1)", []).unwrap();
+        old_library.execute("INSERT INTO clip_tags VALUES ('old-clip', ?1)", [tag]).unwrap();
+        old_library.execute("INSERT INTO candidate_entries VALUES ('old-clip', 'clip', 1)", []).unwrap();
+        let wal = target.with_file_name("library.db-wal");
+        assert!(fs::metadata(wal).unwrap().len() > 0);
 
-        let target = dir.join("target.db");
-        std::fs::write(&target, b"occupied").unwrap();
-        let error = migrate_database_file(&conn, &target).unwrap_err();
-        assert!(error.contains("迁移数据库失败"), "{error}");
+        let settings_file = settings_path(&dir);
+        switch_database_location(&mut conn, &mut current, &external, false, |path| save_db_path_to(&settings_file, path)).unwrap();
+        assert_eq!(music_ids(&conn), ["old-music"]);
+        assert_eq!(conn.query_row("SELECT name, start, end FROM clips WHERE id='old-clip'", [], |r| Ok((r.get::<_, String>(0)?, r.get::<_, f64>(1)?, r.get::<_, f64>(2)?))).unwrap(), ("旧片段".into(), 1.0, 3.0));
+        assert_eq!(conn.query_row("SELECT tag_id FROM music_tags WHERE music_id='old-music'", [], |r| r.get::<_, i64>(0)).unwrap(), tag);
+        assert_eq!(conn.query_row("SELECT tag_id FROM clip_tags WHERE clip_id='old-clip'", [], |r| r.get::<_, i64>(0)).unwrap(), tag);
+        assert_eq!(conn.query_row("SELECT target_id FROM candidate_entries", [], |r| r.get::<_, String>(0)).unwrap(), "old-clip");
+        assert_eq!(load_settings(&settings_file).db_path.as_deref(), current.to_str());
+
+        insert_music(&conn, "new-music");
+        assert_eq!(music_ids(&old_library), ["new-music", "old-music"], "新操作应写到外置硬盘的库");
+        assert!(source.exists(), "默认空库必须保留");
+        assert!(music_ids(&Connection::open(&source).unwrap()).is_empty());
+        switch_database_location(&mut conn, &mut current, &dir, false, |_| Ok(())).unwrap();
+        assert!(music_ids(&conn).is_empty(), "切回后应重新打开原库");
+        assert_eq!(music_ids(&old_library), ["new-music", "old-music"]);
         drop(conn);
-        std::fs::remove_dir_all(dir).unwrap();
+        drop(old_library);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn switch_to_empty_directory_creates_empty_library_without_moving_source() {
+        let dir = temp_test_dir("switch-new");
+        let source = dir.join("library.db");
+        let mut current = source.clone();
+        let mut conn = init(&source).unwrap();
+        insert_music(&conn, "source-music");
+        let target_dir = dir.join("empty");
+        fs::create_dir(&target_dir).unwrap();
+        assert!(switch_database_location(&mut conn, &mut current, &target_dir, false, |_| Ok(())).is_err());
+        assert!(!target_dir.join("library.db").exists(), "未确认创建时不能生成空库");
+        assert_eq!(music_ids(&conn), ["source-music"]);
+        switch_database_location(&mut conn, &mut current, &target_dir, true, |_| Ok(())).unwrap();
+        assert!(music_ids(&conn).is_empty(), "创建的是空库，不是原库副本");
+        assert_eq!(music_ids(&Connection::open(&source).unwrap()), ["source-music"]);
+        drop(conn);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn create_confirmation_never_overwrites_a_database_that_appears_later() {
+        let dir = temp_test_dir("switch-race");
+        let source = dir.join("library.db");
+        let mut current = source.clone();
+        let mut conn = init(&source).unwrap();
+        insert_music(&conn, "source-music");
+        let target_dir = dir.join("target");
+        fs::create_dir(&target_dir).unwrap();
+        let target = target_dir.join("library.db");
+        let existing = init(&target).unwrap();
+        insert_music(&existing, "do-not-overwrite");
+        drop(existing);
+        switch_database_location(&mut conn, &mut current, &target_dir, true, |_| Ok(())).unwrap();
+        assert_eq!(music_ids(&conn), ["do-not-overwrite"]);
+        assert_eq!(music_ids(&Connection::open(&source).unwrap()), ["source-music"], "两个库都应保留，不复制或合并");
+        drop(conn);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn invalid_or_unrelated_database_is_not_modified_and_source_stays_active() {
+        let dir = temp_test_dir("switch-invalid");
+        let source = dir.join("library.db");
+        let mut current = source.clone();
+        let mut conn = init(&source).unwrap();
+        insert_music(&conn, "source-music");
+        let target_dir = dir.join("invalid");
+        fs::create_dir(&target_dir).unwrap();
+        let target = target_dir.join("library.db");
+        fs::write(&target, b"not a database").unwrap();
+        assert!(switch_database_location(&mut conn, &mut current, &target_dir, false, |_| panic!("不应保存设置")).is_err());
+        assert_eq!(fs::read(&target).unwrap(), b"not a database");
+        fs::remove_file(&target).unwrap();
+        let other = Connection::open(&target).unwrap();
+        other.execute_batch("CREATE TABLE other_data(value TEXT); INSERT INTO other_data VALUES ('keep');").unwrap();
+        drop(other);
+        let before = fs::read(&target).unwrap();
+        assert!(switch_database_location(&mut conn, &mut current, &target_dir, false, |_| panic!("不应保存设置")).is_err());
+        assert_eq!(fs::read(&target).unwrap(), before);
+        assert_eq!(current, source);
+        assert_eq!(music_ids(&conn), ["source-music"]);
+        assert!(switch_database_location(&mut conn, &mut current, &dir.join("missing-drive"), true, |_| Ok(())).is_err());
+        assert!(!dir.join("missing-drive").exists());
+        drop(conn);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn newer_database_is_rejected_before_any_schema_changes() {
+        let dir = temp_test_dir("switch-newer");
+        let mut current = dir.join("library.db");
+        let mut conn = init(&current).unwrap();
+        let target_dir = dir.join("newer");
+        fs::create_dir(&target_dir).unwrap();
+        let target = target_dir.join("library.db");
+        let newer = init(&target).unwrap();
+        insert_music(&newer, "future-music");
+        newer.execute("UPDATE app_metadata SET value='999' WHERE key='schema_version'", []).unwrap();
+        newer.execute("DROP TABLE album_tags", []).unwrap();
+        drop(newer);
+        let before = fs::read(&target).unwrap();
+        let error = switch_database_location(&mut conn, &mut current, &target_dir, false, |_| panic!("不应保存设置")).unwrap_err();
+        assert!(error.contains("高于当前程序支持"), "{error}");
+        assert_eq!(fs::read(&target).unwrap(), before);
+        assert_eq!(current, dir.join("library.db"));
+        drop(conn);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn settings_failure_keeps_original_connection_and_both_libraries() {
+        let dir = temp_test_dir("switch-settings-failure");
+        let source = dir.join("library.db");
+        let mut current = source.clone();
+        let mut conn = init(&source).unwrap();
+        insert_music(&conn, "source-music");
+        let target_dir = dir.join("target");
+        fs::create_dir(&target_dir).unwrap();
+        let target = target_dir.join("library.db");
+        let existing = init(&target).unwrap();
+        insert_music(&existing, "target-music");
+        drop(existing);
+        let error = switch_database_location(&mut conn, &mut current, &target_dir, false, |_| Err("设置保存失败".into())).unwrap_err();
+        assert!(error.contains("设置保存失败"));
+        assert_eq!(current, source);
+        assert_eq!(music_ids(&conn), ["source-music"]);
+        assert_eq!(music_ids(&Connection::open(&target).unwrap()), ["target-music"]);
+        assert!(switch_database_location(&mut conn, &mut current, &dir, false, |_| Ok(())).unwrap_err().contains("当前数据库位置"));
+        drop(conn);
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

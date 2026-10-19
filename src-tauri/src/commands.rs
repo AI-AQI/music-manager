@@ -1549,58 +1549,17 @@ pub fn set_database_location(
     state: tauri::State<'_, AppState>,
     app: tauri::AppHandle,
     dir: String,
-    overwrite: bool,
+    create_if_missing: bool,
 ) -> Result<String, String> {
-    let dir_path = PathBuf::from(&dir);
-    let old_path = state
+    let mut conn = lock_db!(state);
+    let mut current_path = state
         .db_path
         .lock()
-        .map_err(|e| format!("数据库路径锁获取失败: {e}"))?
-        .clone();
-    if old_path.parent() == Some(dir_path.as_path()) {
-        return Err("新位置与当前位置相同".into());
-    }
-    fs::create_dir_all(&dir_path).map_err(|e| format!("无法创建目标目录: {e}"))?;
-    let probe = dir_path.join(".music-manager-write-test");
-    File::create(&probe).map_err(|e| format!("目标目录不可写: {e}"))?;
-    let _ = fs::remove_file(&probe);
-
-    let target = dir_path.join("library.db");
-    if target.exists() {
-        if !overwrite {
-            return Err("目标位置已有数据库文件".into());
-        }
-        for suffix in ["", "-wal", "-shm"] {
-            let file = dir_path.join(format!("library.db{suffix}"));
-            if file.exists() {
-                fs::remove_file(&file).map_err(|e| format!("无法删除目标位置的旧数据库: {e}"))?;
-            }
-        }
-    }
-
-    {
-        let mut conn = lock_db!(state);
-        crate::db::migrate_database_file(&conn, &target)?;
-        /* 所有数据库访问都经过同一把锁，在锁内换连接：在途命令要么已结束，
-           要么排在锁之后直接用新库，无需重启应用。 */
-        let new_conn = crate::db::open_conn(&target)?;
-        drop(std::mem::replace(&mut *conn, new_conn));
-    }
-
-    crate::db::save_db_path(&app, &target)?;
-
-    let old = old_path.to_string_lossy().into_owned();
-    for file in [old_path.clone(), PathBuf::from(format!("{old}-wal")), PathBuf::from(format!("{old}-shm"))] {
-        if file != target && file.exists() {
-            let _ = fs::remove_file(file);
-        }
-    }
-
-    *state
-        .db_path
-        .lock()
-        .map_err(|e| format!("数据库路径锁获取失败: {e}"))? = target.clone();
-    Ok(target.to_string_lossy().into_owned())
+        .map_err(|e| format!("数据库路径锁获取失败: {e}"))?;
+    crate::db::switch_database_location(
+        &mut conn, &mut current_path, Path::new(&dir), create_if_missing,
+        |target| crate::db::save_db_path(&app, target),
+    )
 }
 
 #[tauri::command]

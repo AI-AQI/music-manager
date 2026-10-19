@@ -51,6 +51,11 @@ jobs:
 
           echo "version=${cargo_version}" >> "$GITHUB_OUTPUT"
 
+      - name: Check frontend database switching
+        run: |
+          node --check frontend/app.js
+          node --test scripts/test-database-switch.cjs
+
   # 按 CPU 架构分两个原生 runner 构建，避免交叉编译的坑
   build:
     needs: validate
@@ -84,6 +89,10 @@ jobs:
       # CI 里没有 cargo-tauri，需要单独装；版本与本地保持一致，必要时升级
       - name: Install Tauri CLI
         run: cargo install tauri-cli --version 2.11.4 --locked
+
+      - name: Run backend regression tests
+        run: cargo test --locked --release --lib --target ${{ matrix.target }}
+        working-directory: src-tauri
 
       - name: Build DMG
         run: cargo tauri build --target ${{ matrix.target }}
@@ -139,7 +148,18 @@ jobs:
           generate_release_notes: true
           # 加了 body 后，它会被放在自动生成的 release notes 之前
           body: |
-            修复旧安装包仅含可执行文件链接器签名、整个 App 签名校验失败的问题。两个 Mac 架构均使用完整的免费 ad-hoc 签名，并在发布前检查 App 签名和 DMG 完整性。
+            ### 本版修复
+
+            修复“更改数据库位置”可能用当前空库覆盖目标旧库的问题，入口改为“切换音乐库”：
+
+            - 选择已有 `library.db` 的文件夹时，直接打开该音乐库，不复制、合并或覆盖数据。
+            - 文件夹中没有数据库时，先确认是否创建空音乐库；原数据库保留。
+            - 切换失败时继续使用原音乐库；切换成功后刷新界面，清除旧库缓存和编辑状态。
+            - 加入已有数据、SQLite WAL、无效库、设置保存失败和异步操作的回归测试，两个架构测试通过后才发布。
+
+            换电脑使用移动硬盘旧库时，请升级到本版，再选择旧 `library.db` 所在文件夹。
+
+            延续 v0.2.3 的完整免费 ad-hoc 签名，发布前检查 App 签名和 DMG 完整性。
 
             ### 下载文件
 

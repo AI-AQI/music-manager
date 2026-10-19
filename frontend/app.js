@@ -5,7 +5,17 @@
 
 const __TAURI__ = window.__TAURI__;
 
-const invoke = __TAURI__.core.invoke;
+let databaseSwitchInProgress = false;
+const pendingCommands = new Set();
+function invoke(command, args) {
+    if (databaseSwitchInProgress && command !== "set_database_location") {
+        return Promise.reject(new Error("正在切换音乐库，请稍候"));
+    }
+    const request = __TAURI__.core.invoke(command, args);
+    pendingCommands.add(request);
+    request.then(() => pendingCommands.delete(request), () => pendingCommands.delete(request));
+    return request;
+}
 const convertFileSrc = __TAURI__.core.convertFileSrc;
 
 const TAG_GROUP_COLLAPSED_STORAGE_KEY = "music-library-tag-groups-collapsed";
@@ -515,41 +525,46 @@ async function revealDatabaseFile() {
 }
 
 async function changeDatabaseLocation() {
+    const button = $("changeDbLocationBtn");
+    if (button.disabled || databaseSwitchInProgress) return;
+    button.disabled = true;
     try {
         const selected = await __TAURI__.dialog.open({
             directory: true,
             multiple: false,
-            title: "选择新的数据库位置"
+            title: "选择音乐库所在文件夹"
         });
         if (!selected) return;
         const dir = String(selected);
 
-        let overwrite = false;
-        if (await invoke("file_exists", { path: `${dir}/library.db` })) {
-            overwrite = await confirm(
-                "目标位置已有数据库文件，覆盖后其中的数据会被当前曲库替换。是否覆盖？",
-                "覆盖数据库文件"
-            );
-            if (!overwrite) return;
-        }
-
+        const exists = await invoke("file_exists", { path: `${dir}/library.db` });
         if (!await confirm(
-            `将把数据库迁移到：\n${dir}\n\n迁移完成后立即生效，无需重启。`,
-            "更改数据库位置"
+            exists
+                ? `打开此文件夹中的音乐库：\n${dir}\n\n当前音乐库会保留，不会复制、合并或覆盖数据。切换后将刷新界面，未保存的编辑会被丢弃。`
+                : `此文件夹中没有 library.db：\n${dir}\n\n是否在这里创建一个空音乐库？当前音乐库会保留，不会搬迁。切换后将刷新界面，未保存的编辑会被丢弃。`,
+            exists ? "打开已有音乐库" : "创建空音乐库"
         )) return;
 
-        showToast("正在迁移数据库…", 60000);
-        await invoke("set_database_location", { dir, overwrite });
-        await setupDatabasePath();
-        showToast("数据库已迁移到新位置");
+        databaseSwitchInProgress = true;
+        document.body.inert = true;
+        showToast("正在切换音乐库…", 60000);
+        // 等在途命令结束，并阻止旧界面的异步后续操作写入新库。
+        await Promise.allSettled([...pendingCommands]);
+        await invoke("set_database_location", { dir, createIfMissing: !exists });
+        // 全量重载，丢弃旧库的音乐、标签、候选、播放器和编辑状态。
+        window.location.reload();
     } catch (error) {
+        databaseSwitchInProgress = false;
+        document.body.inert = false;
         console.error(error);
         $("toast").classList.remove("show");
         await showMessage(
-            `迁移数据库失败：${getErrorMessage(error)}`,
-            "迁移失败",
+            `切换音乐库失败，仍在使用原音乐库：${getErrorMessage(error)}`,
+            "切换失败",
             "error"
         );
+    } finally {
+        if (!databaseSwitchInProgress) button.disabled = false;
     }
 }
 

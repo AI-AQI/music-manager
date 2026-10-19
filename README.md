@@ -49,14 +49,14 @@
 若提示“已损坏”，先重新下载带有完整 ad-hoc 签名的新包。若仍无法安装，或正在使用旧版本，可从同一个 GitHub Release 下载 `install-macos.sh`，然后在终端运行（版本号和 DMG 路径按实际下载位置填写）：
 
 ```bash
-bash "$HOME/Downloads/install-macos.sh" "$HOME/Downloads/music-manager_0.2.3_aarch64.dmg"
+bash "$HOME/Downloads/install-macos.sh" "$HOME/Downloads/music-manager_0.2.4_aarch64.dmg"
 ```
 
 脚本会校验 DMG、复制应用并移除**该应用**的下载隔离标记；它会要求输入 Mac 管理员密码。
 已有旧版本时，在命令末尾加 `--replace`。
 
 ```bash
-bash "$HOME/Downloads/install-macos.sh" "$HOME/Downloads/music-manager_0.2.3_aarch64.dmg" --replace
+bash "$HOME/Downloads/install-macos.sh" "$HOME/Downloads/music-manager_0.2.4_aarch64.dmg" --replace
 ```
 
 > 脚本是小范围测试的备用方式，只用于确认来源的本项目安装包。ad-hoc 签名验证文件完整性，不认证开发者身份，也不能保证 macOS 自动放行。顺畅的正式站外分发仍需要 Apple Developer ID 签名与公证。
@@ -64,6 +64,8 @@ bash "$HOME/Downloads/install-macos.sh" "$HOME/Downloads/music-manager_0.2.3_aar
 ### 数据存在哪里
 
 - 数据库文件:`~/Library/Application Support/com.musicmanager.app/library.db`
+- 底部「切换音乐库」用于打开所选文件夹中的 `library.db`，不会搬迁、复制、合并或覆盖当前音乐库；目录内没有数据库时，会先确认是否创建空音乐库。切换成功后刷新界面并记住位置，原数据库保留。
+- 换电脑时，连接移动硬盘后点击「切换音乐库」，选择旧 `library.db` 所在文件夹即可读取原有音乐、标签和片段。复制数据库到其他设备前，应先关闭使用该库的应用，确保 SQLite WAL 中的数据已写回。
 - **音频文件不复制、不移动**,还在你原来的文件夹里
 - 新导入的音乐会保存 macOS 文件书签。即使随后在 Finder 中移动或重命名文件，下次打开应用或播放前会自动更新库内路径；文件被删除或跨磁盘复制后再删除时才可能需要重新绑定。
 - 若导入时选择「以文件夹名称为准」，每次启动同步路径时也会同步最新父文件夹名称为专辑名。升级前已有音乐会默认迁移为此来源，可在详情中改成 MP3 属性或手动填写；手动填写的音乐不受文件夹改名影响。
@@ -123,6 +125,8 @@ cd src-tauri && cargo tauri dev
 ```
 
 改 `frontend/` 下的文件后,刷新应用即可看到(无热重载,手动刷新窗口)。
+
+数据库切换的回归检查：`node --test scripts/test-database-switch.cjs`；后端测试：`cd src-tauri && cargo test --locked --lib`。覆盖已有库和 WAL 数据保留、空目录确认创建、无效库拒绝、设置保存失败及切换时的在途操作。
 
 ### 打包
 
