@@ -1,89 +1,31 @@
 #!/bin/bash
-# Installs a downloaded macOS DMG for local testing.
-# This script does not make an unsigned application trusted by macOS.
-
+# Compatibility entry point. All replacement and recovery is owned by the GUI installer.
 set -euo pipefail
-
-readonly app_name='声场档案.app'
-readonly default_destination="/Applications/${app_name}"
-
 usage() {
-  cat <<'EOF'
-用法：bash scripts/install-macos.sh /完整路径/music-manager_xxx_(aarch64|x64).dmg [--replace]
-
-将 DMG 中的「声场档案」复制到 /Applications，并仅移除该应用的
-com.apple.quarantine 下载隔离标记。脚本支持 Apple Silicon 和 Intel Mac，
-并会检查所选 DMG 的架构。首次会要求输入 macOS 管理员密码。
-
---replace  若 Applications 中已有「声场档案」，先将其移到废纸篓再安装。
-EOF
+  echo '用法：bash install-macos.sh /path/music-manager_VERSION_ARCH.dmg [--replace]'
+  echo '打开图形化安装与更新窗口；--replace 为兼容旧命令保留，不会直接删除旧版。'
 }
-
-fail() {
-  echo "错误：$*" >&2
-  exit 1
-}
-
 [[ $# -ge 1 && $# -le 2 ]] || { usage; exit 64; }
 [[ "$1" != '--help' && "$1" != '-h' ]] || { usage; exit 0; }
-
-dmg_path="$1"
-replace_existing=false
-if [[ $# -eq 2 ]]; then
-  [[ "$2" == '--replace' ]] || { usage; exit 64; }
-  replace_existing=true
-fi
-
-[[ -f "$dmg_path" ]] || fail "找不到 DMG：$dmg_path"
-[[ "$dmg_path" == *.dmg ]] || fail "请选择 .dmg 文件"
-[[ "$(uname -s)" == 'Darwin' ]] || fail '此脚本只能在 macOS 上运行'
-
-machine_arch="$(uname -m)"
-case "$machine_arch" in
-  arm64)
-    [[ "$dmg_path" == *_aarch64.dmg || "$dmg_path" == *_universal.dmg ]] \
-      || fail 'Apple Silicon Mac 请使用文件名含 aarch64 或 universal 的 DMG'
-    ;;
-  x86_64)
-    [[ "$dmg_path" == *_x64.dmg || "$dmg_path" == *_universal.dmg ]] \
-      || fail 'Intel Mac 请使用文件名含 x64 或 universal 的 DMG'
-    ;;
-  *)
-    fail "不支持的 Mac 架构：$machine_arch"
-    ;;
-esac
-
-# 浏览器下载的 DMG 带有隔离标记；先对输入文件移除它，以免复制时继承。
-xattr -d com.apple.quarantine "$dmg_path" 2>/dev/null || true
-
-mount_point=''
+[[ $# == 1 || "$2" == '--replace' ]] || { usage; exit 64; }
+[[ "$(uname -s)" == 'Darwin' ]] || { echo '此安装入口仅适用于 macOS。' >&2; exit 1; }
+[[ -f "$1" && "$1" == *.dmg ]] || { echo '找不到所选 DMG，请重新下载后再试。' >&2; exit 1; }
+mount_point="$(mktemp -d "${TMPDIR:-/tmp}/music-manager-mount.XXXXXX")"
+mounted=false
 cleanup() {
-  if [[ -n "$mount_point" && -d "$mount_point" ]]; then
-    hdiutil detach "$mount_point" -quiet 2>/dev/null || true
-  fi
+  if [[ "$mounted" == true ]]; then hdiutil detach "$mount_point" -quiet 2>/dev/null || true; fi
+  rmdir "$mount_point" 2>/dev/null || true
 }
 trap cleanup EXIT
-
-echo '正在检查并挂载 DMG…'
-hdiutil verify "$dmg_path" >/dev/null || fail 'DMG 校验失败，请重新下载'
-mount_point="$(hdiutil attach -readonly -nobrowse "$dmg_path" | awk '/\/Volumes\// {print $3; exit}')"
-[[ -n "$mount_point" && -d "$mount_point" ]] || fail '无法挂载 DMG'
-
-source_app="${mount_point}/${app_name}"
-[[ -d "$source_app" ]] || fail "DMG 中未找到 ${app_name}"
-
-if [[ -e "$default_destination" ]]; then
-  if [[ "$replace_existing" != true ]]; then
-    fail "${default_destination} 已存在；确认替换后重新运行并加 --replace"
-  fi
-  echo '正在将旧版本移到废纸篓…'
-  osascript -e 'tell application "Finder" to delete POSIX file "/Applications/声场档案.app"' \
-    || fail '无法移除旧版本，请手动移到废纸篓后重试'
+hdiutil verify "$1" >/dev/null || { echo 'DMG 校验失败，请重新下载。' >&2; exit 1; }
+hdiutil attach -readonly -nobrowse -mountpoint "$mount_point" "$1" >/dev/null
+mounted=true
+installer="$mount_point/安装与更新声场档案.app"
+if [[ ! -d "$installer" ]]; then
+  echo '这个旧安装包没有图形化更新入口。请下载含“安装与更新声场档案”的新安装包。当前应用和音乐库未被替换。' >&2
+  exit 1
 fi
-
-echo '正在复制到 Applications（可能需要管理员密码）…'
-sudo ditto "$source_app" "$default_destination"
-sudo xattr -dr com.apple.quarantine "$default_destination"
-
-echo '安装完成，正在启动「声场档案」。'
-open "$default_destination"
+codesign --verify --deep --strict "$installer" || { echo '安装程序校验失败，请重新下载。' >&2; exit 1; }
+echo '正在打开“安装与更新声场档案”；请在窗口内继续操作。'
+# Wait for the installer to exit before detaching its embedded application payload.
+open -n -W "$installer"

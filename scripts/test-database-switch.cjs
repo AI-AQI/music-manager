@@ -66,6 +66,36 @@ function setup({ exists = true, selected = "/external/music-library", confirmed 
     return { context, calls, messages, confirmations, startupPrompts, libraryChoices, creationPrompts, button, body, reloads: () => reloads };
 }
 
+test("restart preparation drains writes and blocks further commands until released", async () => {
+    let complete;
+    const pending = new Promise(resolve => { complete = resolve; });
+    const app = setup({ retryAnswers: [true], onInvoke: command => command === "create_music" ? pending : undefined });
+    const write = app.context.invoke("create_music");
+    const preparing = app.context.prepareApplicationUpdate();
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(app.body.inert, true);
+    await assert.rejects(app.context.invoke("delete_music"), /准备更新/);
+    complete();
+    await write;
+    const release = await preparing;
+    release();
+    assert.equal(app.body.inert, false);
+    await app.context.invoke("list_music");
+});
+
+test("failed in-flight writes abort restart and restore interaction", async () => {
+    let fail;
+    const pending = new Promise((_resolve, reject) => { fail = reject; });
+    const app = setup({ retryAnswers: [true], onInvoke: () => pending });
+    const write = app.context.invoke("create_music").catch(() => {});
+    const preparing = app.context.prepareApplicationUpdate();
+    await new Promise(resolve => setImmediate(resolve));
+    fail(new Error("disk offline"));
+    await assert.rejects(preparing, /操作未能完成/);
+    await write;
+    assert.equal(app.body.inert, false);
+});
+
 test("existing external library is opened without an overwrite parameter, then UI reloads", async () => {
     const app = setup();
     await app.context.changeDatabaseLocation();
@@ -151,7 +181,7 @@ test("missing drive prompts to connect and retries without selecting or creating
         if (command === "init_db" && attempts++ === 0) throw new Error("无法打开 /Volumes/Music/library.db，请连接硬盘");
     } });
     assert.equal(await app.context.initDB(), true);
-    assert.deepEqual(app.calls.map(c => c.command), ["init_db", "init_db"]);
+    assert.deepEqual(app.calls.map(c => c.command), ["init_db", "report_startup_state", "init_db"]);
     assert.match(app.startupPrompts[0].message, /请先连接硬盘/);
     assert.equal(app.startupPrompts[0].options.okLabel, "重试");
     assert.equal(app.startupPrompts[0].options.cancelLabel, "退出");
@@ -163,7 +193,7 @@ test("cancelling startup exits without loading candidates, rendering or binding 
         if (command === "init_db") throw new Error("请连接硬盘");
     } });
     await app.context.init();
-    assert.deepEqual(app.calls.map(c => c.command), ["init_db", "cancel_database_startup"]);
+    assert.deepEqual(app.calls.map(c => c.command), ["init_db", "report_startup_state", "cancel_database_startup"]);
     assert.equal(app.body.inert, true);
     assert.equal(app.reloads(), 0);
 });
@@ -173,7 +203,7 @@ test("failed retries remain blocked and never fall back to an empty library", as
         if (command === "init_db") throw new Error("音乐库不可用");
     } });
     assert.equal(await app.context.initDB(), false);
-    assert.deepEqual(app.calls.map(c => c.command), ["init_db", "init_db", "cancel_database_startup"]);
+    assert.deepEqual(app.calls.map(c => c.command), ["init_db", "report_startup_state", "init_db", "report_startup_state", "cancel_database_startup"]);
     assert.equal(app.startupPrompts.length, 2);
     assert.equal(app.body.inert, true);
 });
@@ -183,9 +213,9 @@ test("missing configuration requires explicit choice to open an existing library
         if (command === "init_db") return false;
     } });
     assert.equal(await app.context.initDB(), true);
-    assert.deepEqual(app.calls.map(c => c.command), ["init_db", "configure_database_startup"]);
-    assert.equal(app.calls[1].args.createNew, false);
-    assert.equal(app.calls[1].args.dir, "/external/music-library");
+    assert.deepEqual(app.calls.map(c => c.command), ["init_db", "report_startup_state", "configure_database_startup"]);
+    assert.equal(app.calls.find(c => c.command === "configure_database_startup").args.createNew, false);
+    assert.equal(app.calls.find(c => c.command === "configure_database_startup").args.dir, "/external/music-library");
     assert.equal(app.creationPrompts.length, 0);
     assert.equal(app.body.inert, false);
 });
@@ -223,4 +253,23 @@ test("damaged configuration shows an error, never the create-new-library choice"
     assert.equal(await app.context.initDB(), false);
     assert.equal(app.libraryChoices.length, 0);
     assert.equal(app.calls.some(c => c.command === "configure_database_startup"), false);
+});
+
+
+test("installer is told about waiting states, and diagnostic failure does not block startup", async () => {
+    const app = setup({ startupChoices: ["打开已有音乐库"], onInvoke: async command => {
+        if (command === "init_db") return false;
+        if (command === "report_startup_state") throw new Error("diagnostic file unavailable");
+    } });
+    assert.equal(await app.context.initDB(), true);
+    assert.equal(app.calls.find(c => c.command === "report_startup_state").args.state, "waiting_library");
+    assert.equal(app.body.inert, false);
+});
+
+test("library-unavailable is a recoverable startup status, not a crash", async () => {
+    const app = setup({ onInvoke: async command => {
+        if (command === "init_db") throw new Error("offline");
+    } });
+    await app.context.initDB();
+    assert.equal(app.calls.find(c => c.command === "report_startup_state").args.state, "library_unavailable");
 });

@@ -39,27 +39,36 @@
 
 ### 安装与打开
 
-1. 请按 Mac 芯片选择 DMG：M 系列芯片下载文件名含 `aarch64` 的版本；Intel Mac 下载文件名含 `x64` 的版本。
-2. 双击 `.dmg`，把「声场档案」拖进「应用程序」，再从「应用程序」中双击打开。
-3. 若提示无法验证开发者或 Apple 无法检查，请打开 **「系统设置 → 隐私与安全性」**，找到「声场档案」，点击 **「仍要打开」**，再确认「打开」。以后通常可以直接双击。这是 Apple 提供的单应用放行流程，是否可用取决于 macOS 版本和设备策略，详见 [Apple 说明](https://support.apple.com/zh-cn/102445)。
-4. 打开后点击右上角 **「＋ 导入音乐」**，选择或拖入你的音频文件。
+> 从 v0.2.6 开始，DMG 包含图形化安装与更新入口；v0.2.5 及之前的 DMG 仍是拖拽安装包。旧用户安装新版后继续使用原来的数据库，无需重建或重新导入。请勿将新安装脚本与旧 DMG 混用。
 
-### 旧包或仍无法打开时
+1. 按 Mac 芯片选择 DMG：M 系列下载 `aarch64`；Intel 下载 `x64`。
+2. 打开新格式 DMG，双击「安装与更新声场档案」，点击「安装 / 更新」。无需输入命令或安装开发环境。
+3. 首次安装到当前用户的「应用程序」文件夹；已有 `/Applications/声场档案.app` 或 `~/Applications/声场档案.app` 会在原位置更新，必要时系统会请求管理员授权。
+4. 等待安装窗口显示结果。新电脑没有音乐库配置时，在声场档案窗口中选择「打开已有音乐库」或「创建新音乐库」。移动硬盘没有连接时，按提示连接后重试。
 
-若提示“已损坏”，先重新下载带有完整 ad-hoc 签名的新包。若仍无法安装，或正在使用旧版本，可从同一个 GitHub Release 下载 `install-macos.sh`，然后在终端运行（版本号和 DMG 路径按实际下载位置填写）：
+若 macOS 首次阻止安装器打开，请按 **「系统设置 → 隐私与安全性」** 中的单应用允许流程操作，详见 [Apple 说明](https://support.apple.com/zh-cn/102445)。免费的 ad-hoc 签名不等于 Apple Developer ID 签名或公证，不能保证所有系统和设备策略都会允许打开。
 
-```bash
-bash "$HOME/Downloads/install-macos.sh" "$HOME/Downloads/music-manager_0.2.5_aarch64.dmg"
-```
+### 在 App 内升级
 
-脚本会校验 DMG、复制应用并移除**该应用**的下载隔离标记；它会要求输入 Mac 管理员密码。
-已有旧版本时，在命令末尾加 `--replace`。
+首次安装支持应用内更新的版本后，点击右上角 **「更新」→「下载更新」→「重启并更新」**。程序会匹配 Mac 芯片、验证更新包签名，退出后安全替换并重新打开。日常升级无需再次下载 DMG 或运行脚本。
 
-```bash
-bash "$HOME/Downloads/install-macos.sh" "$HOME/Downloads/music-manager_0.2.5_aarch64.dmg" --replace
-```
+v0.2.5 及更早的已发布版本没有此入口，需要先手动安装首个支持更新的版本。发布方需先配置更新签名 Secret，详见 [安装与更新说明](docs/macos-installer.md)。
 
-> 脚本是小范围测试的备用方式，只用于确认来源的本项目安装包。ad-hoc 签名验证文件完整性，不认证开发者身份，也不能保证 macOS 自动放行。顺畅的正式站外分发仍需要 Apple Developer ID 签名与公证。
+**已有音乐库直接沿用**：更新安装只替换应用，保留本机 `settings.json` 和原 `library.db` 路径。新版打开同一份数据库，继续使用原有音乐、标签、片段、专辑标签和候选清单，无需重建或重新导入；数据库在移动硬盘上时，请先连接原硬盘。缺少位置配置的旧默认库只需选择「打开已有音乐库」，指向原 `library.db` 所在文件夹，之后会记住位置。
+
+需要升级数据库结构时，程序先在原库旁生成包含已提交 WAL 数据的 SQLite 备份，再在一个事务中完成迁移和关联校验。失败会撤销整次迁移，保留原数据与备份；重试不会覆盖已有备份，也不会把原库替换为空库。
+
+### 更新失败时
+
+保留 DMG，重新打开其中的安装窗口即可：
+
+- **重新尝试启动**：确认本次启动的实际结果，区分界面就绪、等待选择音乐库、音乐库不可用及启动失败。
+- **恢复旧版**：先退出应用并检查数据库兼容性，再恢复旧应用。音乐库不会被恢复操作复制或覆盖。无法确认兼容性、硬盘未连接、旧版早于 v0.2.5 且缺少安全元数据时，会保留备份并停止恢复。
+- **导出诊断信息**：保存 ZIP 发给开发者，无需自己找日志。每次启动的日志独立保留，重试不会覆盖首次失败信息。不包含数据库、位置配置文件或音频，但日志和崩溃报告可能包含本机路径，请仅发给信任的人。
+
+新版先复制、校验，再退出旧应用并保留备份。替换失败时会尝试恢复原应用；启动失败不会擅自降级。异常断电后可重新打开安装窗口处理未完成的更新。
+
+`scripts/install-macos.sh` 仅保留旧命令的兼容入口，`--replace` 会打开同一个安装窗口，不再直接移除旧应用。旧 DMG 缺少图形化入口时会停止，要求下载新版。
 
 ### 数据存在哪里
 
@@ -131,38 +140,23 @@ cd src-tauri && cargo tauri dev
 
 ### 打包
 
-> **发布新版本前先更新版本号**：在 `src-tauri/Cargo.toml` 中修改 `version`，例如发布 `v0.1.2` 时设为 `version = "0.1.2"`。打包生成的 dmg 会使用这个版本号；GitHub Release 的 Tag 则使用带 `v` 的 `v0.1.2`。
+发布前同步更新 `src-tauri/Cargo.toml`、`Cargo.lock` 与 `src-tauri/tauri.conf.json` 的版本号，再创建相同版本的 `v` 标签。GitHub Actions 分别在 Apple Silicon 和 Intel runner 上测试、构建应用及图形化安装 DMG。
 
-先确保装有两个 Mac 架构的 Rust 目标(仅需执行一次):
-
-```bash
-rustup target add aarch64-apple-darwin x86_64-apple-darwin
-```
-
-我们采用「分架构打两个包」的方式,分别打 Apple Silicon 版和 Intel 版:
+本地从项目根目录构建（以 Apple Silicon 为例）：
 
 ```bash
-# Apple Silicon (M1/M2/M3) 版
-cd src-tauri && cargo tauri build --target aarch64-apple-darwin
-
-# Intel 版
-cd src-tauri && cargo tauri build --target x86_64-apple-darwin
+rustup target add aarch64-apple-darwin
+(cd src-tauri && cargo tauri build --bundles app --target aarch64-apple-darwin)
+bash scripts/build-macos-installer.sh \
+  "$PWD/src-tauri/target/aarch64-apple-darwin/release/bundle/macos/声场档案.app" \
+  "$PWD/music-manager_VERSION_aarch64.dmg"
 ```
 
-产物:
+Intel 使用 `x86_64-apple-darwin`，DMG 文件名后缀使用 `x64`。打包脚本要求输出路径尚不存在，拒绝架构不明确、缺少启动协议或数据库版本元数据不匹配的应用。
 
-| 命令 | app / dmg |
-|---|---|
-| `--target aarch64-apple-darwin` | `target/aarch64-apple-darwin/release/bundle/macos/声场档案.app`<br>`target/aarch64-apple-darwin/release/bundle/dmg/声场档案_0.1.2_aarch64.dmg` |
-| `--target x86_64-apple-darwin` | `target/x86_64-apple-darwin/release/bundle/macos/声场档案.app`<br>`target/x86_64-apple-darwin/release/bundle/dmg/声场档案_0.1.2_x64.dmg` |
+应用和安装器均进行完整 ad-hoc 签名，发布前校验签名与 DMG 完整性。编译 Swift 只发生在开发者/CI 环境，使用者无需安装 Swift、Python、Node 或 Rust。免费签名不能代替 Apple 公证。
 
-发给朋友时说一句:M 芯片的 Mac 装 `aarch64` 版、老 Intel 的装 `x64` 版。
-
-> 备选:也可以打 Universal Binary(一个 dmg 通吃两种 Mac),`cargo tauri build --target universal-apple-darwin`,产物为 `声场档案_0.1.2_universal.dmg`,但体积约大一倍。我们默认用上面的分架构方式。
-
-`tauri.conf.json` 中的 `bundle.macOS.signingIdentity` 设为 `"-"`，让 Tauri 对完整 App 进行免费的 ad-hoc 签名。仅有编译器对可执行文件生成的链接器签名不能替代整个 App 的签名；旧的 0.2.2 安装包在此处校验失败。发布流程会执行 `codesign --verify --deep --strict` 和 DMG 校验，失败则停止发布。该检查通过不代表 Gatekeeper 会自动放行。
-
-发布 GitHub Release 时，同时上传 `aarch64` 和 `x64` 两个 `.dmg`，以及备用的 `scripts/install-macos.sh`。使用者优先按上方图形界面步骤安装；已有 Release 需要重新打包发布才会包含修复。Apple Developer ID 签名与公证需要开发者会员（通常 $99/年），即使完成后首次打开仍可能出现“从互联网下载”的普通确认。
+安装器回归测试：`bash scripts/test-macos-installer.sh`。更多实现细节及测试边界见 [安装器说明](docs/macos-installer.md)。
 
 ### 常用命令(增删改查)
 
@@ -178,9 +172,9 @@ cd src-tauri && cargo tauri build --target x86_64-apple-darwin
 
 ### 数据模型
 
-数据库为 SQLite(文件 `library.db`,WAL 模式、外键开启),当前 schema 版本为 `2`,共 7 张表。所有 `*_at` 时间字段均为毫秒时间戳(INTEGER)。
+数据库为 SQLite(文件 `library.db`,WAL 模式、外键开启)，当前 schema 版本为 `3`。所有 `*_at` 时间字段均为毫秒时间戳(INTEGER)。
 
-旧版 Tag 数据库首次升级时会先通过 SQLite 生成 `library.pre-tag-tree-v1.db` 完整备份，再在事务中迁移。升级后的数据库不支持由旧版程序直接写入；如需降级，请先关闭应用并恢复该备份。程序检测到高于自身支持范围的 schema 版本时会停止写入。
+旧版 Tag 数据库首次升级时会先通过 SQLite 生成 `library.pre-tag-tree-v1.db` 完整备份；其他结构升级或失败后的再次升级使用唯一命名的 `library.pre-schema-3-*.db`，保留已有备份。全部结构与数据迁移在同一个事务中完成，关联校验通过后才提交。恢复旧应用必须先确认它能读取当前数据库，不自动回滚数据库，也不要直接用旧备份覆盖已经继续编辑过的库。程序检测到高于自身支持范围的 schema 版本时会停止写入。
 
 **music**(主键 `id`,音乐元数据;只存路径,不存音频文件本身)
 

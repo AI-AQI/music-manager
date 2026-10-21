@@ -6,8 +6,12 @@
 const __TAURI__ = window.__TAURI__;
 
 let databaseSwitchInProgress = false;
+let applicationUpdateInProgress = false;
 const pendingCommands = new Set();
 function invoke(command, args) {
+    if (applicationUpdateInProgress) {
+        return Promise.reject(new Error("正在准备更新，请稍候"));
+    }
     if (databaseSwitchInProgress && command !== "set_database_location") {
         return Promise.reject(new Error("正在切换音乐库，请稍候"));
     }
@@ -17,6 +21,29 @@ function invoke(command, args) {
     return request;
 }
 const convertFileSrc = __TAURI__.core.convertFileSrc;
+
+async function prepareApplicationUpdate() {
+    if (databaseSwitchInProgress || applicationUpdateInProgress) throw new Error("其他操作尚未完成，请稍后更新");
+    const accepted = await __TAURI__.dialog.ask(
+        "将退出声场档案，安装新版并重新打开。请先保存尚未保存的编辑。\n音乐库和音频会保留。",
+        { title: "重启并更新", kind: "info", okLabel: "重启并更新", cancelLabel: "暂不更新" }
+    );
+    if (!accepted) return null;
+    if (databaseSwitchInProgress || applicationUpdateInProgress) throw new Error("其他操作尚未完成，请稍后更新");
+    applicationUpdateInProgress = true;
+    const previousInert = document.body.inert;
+    document.body.inert = true;
+    const release = () => {
+        applicationUpdateInProgress = false;
+        document.body.inert = previousInert;
+    };
+    const results = await Promise.allSettled([...pendingCommands]);
+    if (results.some(result => result.status === "rejected")) {
+        release();
+        throw new Error("正在进行的操作未能完成，请处理错误后再更新。");
+    }
+    return release;
+}
 
 const TAG_GROUP_COLLAPSED_STORAGE_KEY = "music-library-tag-groups-collapsed";
 const SIDEBAR_TAG_MANAGE_STORAGE_KEY = "music-library-sidebar-tag-manage";
@@ -485,6 +512,7 @@ async function initDB() {
             document.body.inert = false;
             return true;
         } catch (error) {
+            await reportStartupState("library_unavailable");
             const retry = await __TAURI__.dialog.ask(
                 `${getErrorMessage(error)}\n\n如果数据库在移动硬盘，请先连接硬盘并确认它已在 Finder 中显示，再点击“重试”。未打开音乐库前不会创建替代空库。`,
                 { title: "音乐库暂不可用", kind: "warning", okLabel: "重试", cancelLabel: "退出" }
@@ -498,6 +526,7 @@ async function initDB() {
 }
 
 async function configureStartupLibrary() {
+    await reportStartupState("waiting_library");
     const open = "打开已有音乐库";
     const create = "创建新音乐库";
     const choice = await __TAURI__.dialog.message(
@@ -521,6 +550,11 @@ async function configureStartupLibrary() {
     )) return null;
     await invoke("configure_database_startup", { dir: String(selected), createNew });
     return true;
+}
+
+async function reportStartupState(state) {
+    // Diagnostic failure must not prevent opening an otherwise usable music library.
+    try { await invoke("report_startup_state", { state }); } catch (error) { console.error(error); }
 }
 
 async function refreshLocationsAfterFinderChanges() {
@@ -8424,6 +8458,7 @@ function setupEvents() {
 
     document.addEventListener("keydown", event => {
         const isTyping = /INPUT|TEXTAREA|SELECT/.test(document.activeElement?.tagName || "");
+        if (!$("updateModal").classList.contains("hidden")) return;
         const editorOpen = !clipEditorPanel.classList.contains("hidden");
         if (editorOpen && !isTyping) {
             if (event.key === " ") {
@@ -8856,6 +8891,8 @@ async function init() {
 
         await render();
 
+        await reportStartupState("ready");
+
         // 位置同步可能需要逐一解析数千个 macOS 文件书签，不阻塞首屏。
         setTimeout(() => refreshLocationsAfterFinderChanges().catch(console.error), 0);
 
@@ -8866,6 +8903,7 @@ async function init() {
     } catch (error) {
 
         console.error(error);
+        await reportStartupState("failed");
 
         const message = error instanceof Error
             ? error.message

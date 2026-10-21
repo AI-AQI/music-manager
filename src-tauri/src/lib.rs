@@ -1,5 +1,8 @@
 pub mod commands;
 pub mod db;
+pub mod startup_report;
+#[cfg(target_os = "macos")]
+pub mod updater;
 
 use std::sync::Mutex;
 use tauri::Manager;
@@ -38,28 +41,38 @@ pub fn configure_database_startup(app: &tauri::AppHandle, dir: &std::path::Path,
 fn set_dock_icon() {
     use objc2::msg_send;
     use objc2::runtime::{AnyClass, AnyObject};
-    use objc2_foundation::NSString;
+    use objc2_foundation::NSData;
 
-    let path = NSString::from_str(concat!(env!("CARGO_MANIFEST_DIR"), "/icons/icon.png"));
+    // A bundled debug build must not read the developer's source directory at
+    // startup: macOS can block that read behind Documents-folder consent.
+    let data = NSData::with_bytes(include_bytes!("../icons/icon.png"));
     unsafe {
         let ns_image = AnyClass::get(c"NSImage").expect("NSImage class");
         let image: *mut AnyObject = msg_send![ns_image, alloc];
-        let image: *mut AnyObject = msg_send![image, initWithContentsOfFile: &*path];
+        let image: *mut AnyObject = msg_send![image, initWithData: &*data];
         if image.is_null() {
             return;
         }
         let ns_app = AnyClass::get(c"NSApplication").expect("NSApplication class");
         let app: *mut AnyObject = msg_send![ns_app, sharedApplication];
         let _: () = msg_send![app, setApplicationIconImage: image];
+        let _: () = msg_send![image, release];
     }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    startup_report::install_panic_hook();
+    startup_report::write("starting");
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
+            #[cfg(target_os = "macos")]
+            {
+                app.handle().plugin(tauri_plugin_updater::Builder::new().build())?;
+                app.manage(updater::UpdateManager::default());
+            }
             #[cfg(all(target_os = "macos", debug_assertions))]
             set_dock_icon();
 
@@ -69,6 +82,13 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            #[cfg(target_os = "macos")]
+            updater::check_app_update,
+            #[cfg(target_os = "macos")]
+            updater::download_app_update,
+            #[cfg(target_os = "macos")]
+            updater::restart_for_app_update,
+            startup_report::report_startup_state,
             commands::init_db,
             commands::configure_database_startup,
             commands::cancel_database_startup,

@@ -96,6 +96,7 @@
                 <span id="candidateNavCount" class="candidate-trigger-count">0</span>
             </button>
             <button id="shortcutHelpBtn" class="secondary-btn shortcut-help-trigger" type="button" title="快捷键（按 ? 打开）" aria-label="快捷键帮助">?</button>
+            <button id="checkUpdateBtn" class="secondary-btn" type="button" title="检查软件更新">更新</button>
             <button id="importBtn" class="primary-btn">
                 <span class="button-index">01</span> 导入曲目
             </button>
@@ -351,6 +352,26 @@
 <!-- ============================= -->
 <!-- 快捷键速查 -->
 <!-- ============================= -->
+
+<div id="updateModal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="updateTitle">
+    <div class="modal-box small">
+        <div class="modal-header">
+            <h2 id="updateTitle">软件更新</h2>
+            <button id="closeUpdateBtn" class="icon-btn" type="button" aria-label="关闭更新窗口">×</button>
+        </div>
+        <div class="modal-body update-body">
+            <p id="updateVersion">声场档案</p>
+            <p id="updateStatus" role="status" aria-live="polite"></p>
+            <progress id="updateProgress" aria-label="更新下载进度" hidden></progress>
+            <span id="updateProgressLabel" hidden></span>
+            <div id="updateNotes" class="update-notes" hidden></div>
+        </div>
+        <div class="modal-footer">
+            <button id="updateRecheckBtn" class="secondary-btn" type="button" hidden>重新检查</button>
+            <button id="updateActionBtn" class="primary-btn" type="button">检查更新</button>
+        </div>
+    </div>
+</div>
 
 <div id="shortcutsModal" class="modal hidden">
 
@@ -653,6 +674,7 @@
 <script src="turntable.js"></script>
 <script src="vinylwall.js"></script>
 <script src="app.js"></script>
+<script src="updater.js"></script>
 
 </body>
 </html>

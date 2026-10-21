@@ -423,7 +423,10 @@ pub fn configure_database_startup(app: tauri::AppHandle, dir: String, create_new
 
 #[tauri::command]
 pub fn cancel_database_startup(app: tauri::AppHandle) {
-    if app.try_state::<AppState>().is_none() { app.exit(0); }
+    if app.try_state::<AppState>().is_none() {
+        crate::startup_report::write("cancelled");
+        app.exit(0);
+    }
 }
 
 #[tauri::command]

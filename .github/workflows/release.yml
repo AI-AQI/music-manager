@@ -54,7 +54,10 @@ jobs:
       - name: Check frontend database startup and switching
         run: |
           node --check frontend/app.js
+          node --check frontend/updater.js
           node --test scripts/test-database-switch.cjs
+          node --test scripts/test-updater.cjs
+          python3 scripts/test-update-manifest.py
 
   # 按 CPU 架构分两个原生 runner 构建，避免交叉编译的坑
   build:
@@ -78,6 +81,15 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      - name: Require updater signing key
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        run: |
+          if [[ -z "$TAURI_SIGNING_PRIVATE_KEY" ]]; then
+            echo "请先配置仓库 Secret TAURI_SIGNING_PRIVATE_KEY；拒绝发布无法验证的更新。" >&2
+            exit 1
+          fi
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -87,6 +99,9 @@ jobs:
           workspaces: src-tauri
 
       # CI 里没有 cargo-tauri，需要单独装；版本与本地保持一致，必要时升级
+      - name: Test macOS installer and recovery
+        run: bash scripts/test-macos-installer.sh
+
       - name: Install Tauri CLI
         run: cargo install tauri-cli --version 2.11.4 --locked
 
@@ -94,33 +109,34 @@ jobs:
         run: cargo test --locked --release --lib --target ${{ matrix.target }}
         working-directory: src-tauri
 
-      - name: Build DMG
-        run: cargo tauri build --target ${{ matrix.target }}
+      - name: Build application
+        run: cargo tauri build --bundles app --target ${{ matrix.target }}
         working-directory: src-tauri
 
-      # 免费 ad-hoc 签名也必须覆盖整个 App；只有链接器签名的包会在这里失败。
-      # 此检查验证完整性，不代表通过 Gatekeeper 或完成 Apple 公证。
-      - name: Verify app signature and DMG integrity
-        run: |
-          codesign --verify --deep --strict --verbose=2 "src-tauri/target/${{ matrix.target }}/release/bundle/macos/声场档案.app"
-          for dmg in src-tauri/target/${{ matrix.target }}/release/bundle/dmg/*.dmg; do
-            hdiutil verify "$dmg"
-          done
-
-      # 关键一步：把中文名 dmg 重命名成纯 ASCII 名，再上传，避免中文在发布时被“删掉”
-      - name: Rename to ASCII asset name
+      - name: Build graphical installer DMG
         id: rename
         run: |
-          dmg_dir="src-tauri/target/${{ matrix.target }}/release/bundle/dmg"
-          src_dmg="$(ls "$dmg_dir"/*.dmg | head -n 1)"
-          dst="music-manager_${{ needs.validate.outputs.version }}_${{ matrix.arch }}.dmg"
-          cp "$src_dmg" "$dst"
-          echo "asset=${dst}" >> "$GITHUB_OUTPUT"
+          asset="music-manager_${{ needs.validate.outputs.version }}_${{ matrix.arch }}.dmg"
+          bash scripts/build-macos-installer.sh \
+            "$PWD/src-tauri/target/${{ matrix.target }}/release/bundle/macos/声场档案.app" \
+            "$PWD/$asset"
+          echo "asset=${asset}" >> "$GITHUB_OUTPUT"
+
+      - name: Sign and verify update package
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""
+        run: |
+          cargo tauri signer sign "${{ steps.rename.outputs.asset }}"
+          cargo run --locked --release --manifest-path src-tauri/Cargo.toml --example verify-update -- \
+            "${{ steps.rename.outputs.asset }}" "${{ steps.rename.outputs.asset }}.sig"
 
       - uses: actions/upload-artifact@v7
         with:
           name: music-manager-${{ matrix.arch }}
-          path: ${{ steps.rename.outputs.asset }}
+          path: |
+            ${{ steps.rename.outputs.asset }}
+            ${{ steps.rename.outputs.asset }}.sig
           if-no-files-found: error
 
   # 打 tag 时才创建 release；workflow_dispatch 只用来测试构建、不发布
@@ -139,27 +155,43 @@ jobs:
           path: dist
           merge-multiple: true
 
+      - name: Create signed-package update feed
+        run: python3 scripts/create-update-manifest.py --version "${{ needs.validate.outputs.version }}" --directory dist --notes docs/update-notes.txt
+
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v3
         with:
           files: |
             dist/*.dmg
+            dist/*.sig
+            dist/latest.json
             scripts/install-macos.sh
           generate_release_notes: true
           # 加了 body 后，它会被放在自动生成的 release notes 之前
           body: |
-            ### 本版修复
+            ### 旧用户升级：继续使用原来的数据库
 
-            修复移动硬盘未连接时启动可能新建空库的问题：
+            v0.2.6 安装只替换应用，保留本机 `settings.json` 和原 `library.db` 路径。已有音乐、标签、片段、专辑标签、候选清单和音频继续使用，**无需重建音乐库或重新导入**。数据库 schema 保持为 3。
 
-            - 上次使用的音乐库不可用时，停止加载并提示连接硬盘，可重试或退出；不会补建目录、创建替代空库或回退默认库。
-            - 缺少本机位置配置时，明确选择“打开已有音乐库”或“创建新音乐库”，不会推断是首次使用。
-            - 创建新库必须选择目录并再次确认；已有 `library.db` 不会被覆盖。
-            - 配置损坏或数据库缺失时停止加载，保留原配置和数据。
-            - 已在 Apple Silicon Mac 的原生窗口中验证缺配置选择、创建确认、打开旧库、磁盘镜像实际卸载/重挂载后重试、防覆盖和损坏配置退出。镜像用于模拟外置卷，未进行实体硬盘插拔测试。
-            - 两个架构分别运行后端回归测试，前端启动与切换测试通过后才发布。
+            - 有原位置配置时直接打开同一份库；旧版缺少配置时，选择“打开已有音乐库”，指向原 `library.db` 所在文件夹即可。旧默认库位于 `~/Library/Application Support/com.musicmanager.app/library.db`。
+            - 数据库在移动硬盘上时，请先连接原硬盘。未连接或文件缺失时停止并等待重试，不创建替代空库。
+            - 需要升级结构时，先用 SQLite 生成包含已提交 WAL 数据的完整备份，再在单个事务中迁移并校验；失败整体回滚，已有备份不覆盖。
+            - 等待写锁后再次检查数据库版本，防止旧进程改写较新数据库。
+            - 回归覆盖 v0.1.0 至 v0.2.5 全部十个发布版本，在本机目录与模拟外置目录中升级含数据的旧库，并验证升级后继续编辑同一库。两个架构分别通过后端与安装器测试后才发布。
 
-            延续 v0.2.4 的音乐库切换保护和完整免费 ad-hoc 签名，发布前检查 App 签名和 DMG 完整性。
+            ### 安装与更新
+
+            新增应用内更新：在声场档案右上角点击“更新”，检查版本、下载经过数字签名验证的更新包，再点击“重启并更新”。已有 v0.2.5 或更早版本需先手动安装首个支持应用内更新的版本。
+
+            新增图形化“安装与更新”入口，无需输入安装命令：
+
+            - 双击安装窗口，自动检查应用身份、签名完整性、Mac 架构、系统版本及版本号。
+            - 新版先复制到临时位置并校验，再退出旧应用、保留备份并替换；替换失败时恢复原应用。
+            - 检测真实启动状态，区分界面就绪、等待选择音乐库、音乐库不可用和启动失败。
+            - 可重新尝试启动、检查数据库兼容性后恢复旧版、一键导出诊断 ZIP。音乐库和原始音频不被安装器复制或覆盖。
+            - 旧版早于 v0.2.5 且无法确认安全性时，新版替换就位后的自动恢复会被阻止，保留备份供排查；这不影响旧数据库升级使用。启动失败也可安装版本更高的修复包。
+
+            延续移动硬盘未连接时的启动保护。安装器与主应用使用完整免费 ad-hoc 签名，发布前验证签名和 DMG 完整性。
 
             ### 下载文件
 
@@ -174,35 +206,14 @@ jobs:
 
             安装包使用免费的 ad-hoc（临时）签名，未进行 Apple Developer ID 签名或公证。macOS 仍可能要求首次手动允许打开。
 
-            1. 打开 DMG，将「声场档案」拖到「应用程序」。
-            2. 在「应用程序」中双击「声场档案」。
-            3. 若提示无法验证开发者或 Apple 无法检查，请打开「系统设置 → 隐私与安全性」，找到「声场档案」并点击「仍要打开」，再确认「打开」。以后通常可直接双击。
+            1. 打开 DMG，双击“安装与更新声场档案”。
+            2. 点击“安装 / 更新”，等待窗口显示启动结果。首次安装到当前用户的“应用程序”文件夹；已有应用保持原位置，必要时系统会要求管理员授权。
+            3. 若 macOS 首次阻止安装器打开，请在“系统设置 → 隐私与安全性”允许打开。
+            4. 失败时点击“重新尝试启动”“恢复旧版”或“导出诊断信息”。请保留 DMG，后续仍可使用安装窗口。
 
-            「仍要打开」是否出现取决于 macOS 版本和设备策略；修复签名不代表系统会自动放行。
+            免费临时签名不代表完成 Apple 公证；首次打开仍可能需要手动允许。
 
-            ### 旧包或仍无法打开时
-
-            若提示“已损坏”，先重新下载本 Release 的 DMG。仍无法安装时，或正在使用旧版本，可从同一个 Release 下载 `install-macos.sh`，再打开“终端”运行以下命令。不要将此脚本用于来源不明的安装包。
-
-            Apple Silicon Mac：
-
-            ```sh
-            bash "$HOME/Downloads/install-macos.sh" "$HOME/Downloads/music-manager_${{ needs.validate.outputs.version }}_aarch64.dmg"
-            ```
-
-            Intel Mac：
-
-            ```sh
-            bash "$HOME/Downloads/install-macos.sh" "$HOME/Downloads/music-manager_${{ needs.validate.outputs.version }}_x64.dmg"
-            ```
-
-            脚本会校验 DMG、将应用复制到“应用程序”文件夹，并移除该应用的下载隔离标记。首次运行会要求输入 Mac 管理员密码。
-
-            已有旧版本时，在命令最后加上 `--replace`：
-
-            ```sh
-            bash "$HOME/Downloads/install-macos.sh" "$HOME/Downloads/music-manager_${{ needs.validate.outputs.version }}_aarch64.dmg" --replace
-            ```
+            `install-macos.sh` 仅作为旧命令的兼容入口，`--replace` 会打开同一个安装窗口，不再直接删除或覆盖旧应用。旧 DMG 不含图形化入口时会停止并提示下载新版。
 
             ### 注意
 
